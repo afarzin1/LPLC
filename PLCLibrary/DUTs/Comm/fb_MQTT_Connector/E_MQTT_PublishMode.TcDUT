@@ -1,0 +1,21 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_MQTT_PublishMode" Id="{0f07514a-f3b9-43a6-96c7-c400489993e5}">
+    <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// E_MQTT_PublishMode - When to publish
+// ═══════════════════════════════════════════════════════════════════════
+{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_MQTT_PublishMode :
+(
+    DISABLED            := 0,   // Don't publish (subscribe-only signal)
+    CHANGE_OF_STATE     := 1,   // Publish only when value changes
+    PERIODIC            := 2,   // Publish at fixed interval (also publishes on change)
+    TRANSACTION_GROUP_1 := 3,   // Grouped JSON publish (default 100ms period)
+    TRANSACTION_GROUP_2 := 4,   // Grouped JSON publish (default 1s period)
+    TRANSACTION_GROUP_3 := 5    // Grouped JSON publish (default 5s period)
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Pump_SPAL_CAN_Outputs" Id="{587ef2b4-3451-4420-b2e3-88c70b5efa22}">
+    <Declaration><![CDATA[TYPE ST_Pump_SPAL_CAN_Outputs :
+STRUCT
+	MotorStateRequest	: USINT;
+	MotorSetpoint		: LREAL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

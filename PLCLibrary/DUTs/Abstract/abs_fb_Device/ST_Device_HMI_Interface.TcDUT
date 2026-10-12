@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Device_HMI_Interface" Id="{0fd904f3-ca95-49b4-98ab-a07fcc4d3e9b}">
+    <Declaration><![CDATA[TYPE ST_Device_HMI_Interface :
+STRUCT
+	enabled				: BOOL;
+	deviceName			: STRING;
+	interlock			: ST_Interlock_HMI_Interface;
+	stsInAuto			: BOOL;
+	stsFaulted			: BOOL;
+	stsFaultDescription	: STRING;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

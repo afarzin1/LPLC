@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_BannerWLS15Pro_ScrollBounceStyle" Id="{a1d08493-b739-40e3-9191-6decd720dcbf}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+// Run Mode scroll/bounce style, subindex 8 (219132 Rev. A, section 1.3.2).
+// Only read by the Scroll and Bounce animations.
+TYPE E_BannerWLS15Pro_ScrollBounceStyle :
+(
+    eSolid  := 0,
+    eTail   := 1,
+    eRipple := 2
+) BYTE;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

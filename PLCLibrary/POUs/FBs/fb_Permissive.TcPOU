@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Permissive" Id="{9a75ca4f-f276-450d-a1f6-8310b103476b}" SpecialFunc="None">
+    <Declaration><![CDATA[(*
+    fb_Permissive — a set of up to TEN conditions that must ALL be true for something to be
+    ALLOWED to proceed. All-true means satisfied, and unwired slots default TRUE so you wire only
+    what applies.
+
+    SELF-CONTAINED, per CONVENTIONS §5: ten is a literal here, in ST_Permissive's array bounds and
+    in the loops below — this FB references no GVL and reads no global state. Everything it needs
+    arrives through inpConfig. Raising the capacity means editing those together.
+
+    PERMISSIVE vs INTERLOCK — the distinction that decides which one you want:
+      * an INTERLOCK (fb_Interlock) is a condition that must hold for a device to KEEP RUNNING.
+        Breaking one is abnormal: it stops the device and it is a FAULT the operator must clear.
+      * a PERMISSIVE is a condition that must be met for something to START or ADVANCE. Not being
+        met yet is NORMAL — the machine is waiting, not broken. "Chamber not yet at vacuum" is not
+        a fault, it is a Tuesday.
+    So this FB deliberately raises NO fault, has no TcAlarm plumbing and does not extend
+    abs_fb_Device. It answers exactly one question — "may this proceed, and if not, which conditions
+    are not met".
+
+    USAGE
+        VAR
+            PermStart : fb_Permissive;
+        END_VAR
+
+        // describe the slots once (startup or FB_Init of the owner)
+        PermStart.inpConfig.descriptions[1] := 'Chamber door closed';
+        PermStart.inpConfig.descriptions[2] := 'Vacuum below 5 Torr';
+        PermStart.cfgName := 'Start permissive';
+
+        // drive them every scan; leave unused slots alone (they stay TRUE)
+        PermStart.inpConfig.conditions[1] := DoorClosed;
+        PermStart.inpConfig.conditions[2] := Pressure < 5.0;
+        PermStart();
+
+        IF PermStart.stsPermissiveOK THEN ... END_IF
+
+    NO FIRST-OUT, and that is the sharpest line between this and fb_Interlock. An interlock TRIPS:
+    one condition drops, the device faults instantly, and "which one went first" names the cause -
+    the later ones are usually consequences. A permissive never trips. It is simply evaluated at the
+    moment something asks to proceed, and every unmet condition is equally and simultaneously the
+    reason. There is no first, so the FB publishes the SET (stsConditions + stsUnmetCount) and the
+    HMI shows all of them rather than nominating a misleading headline.
+
+    NO BYPASS, either. It is tempting to allow one on the grounds that a permissive was never a
+    safety function — but a bypass is precisely the control that makes an unsatisfied gate report
+    itself satisfied, and a sequence advanced on a forced permissive fails later, somewhere that
+    explains nothing. The conditions hold or they do not. If a condition needs to not apply, do not
+    wire that slot; it defaults TRUE. (fb_Interlock's inpGlobalBypass is a genuinely different
+    case: an interlock STOPS a running machine, so commissioning needs a documented way past it.)
+
+    It is a DISPLAY-and-SEQUENCING aid, not a safety function: real safety lives in the safety PLC /
+    hard wiring, and an interlock that must stop a running device belongs in fb_Interlock.
+
+    Consumers: abs_fb_MachineFlow transition gates — the machine ANDs stsPermissiveOK into
+    setPermissive(t, ...); MachineFlow holds no reference to this FB. Also device start conditions and
+    the shared lhmi PermissiveList component (binds .HMI directly).
+*)
+FUNCTION_BLOCK fb_Permissive
+VAR_INPUT
+    inpConfig   : ST_Permissive;
+END_VAR
+
+VAR_OUTPUT
+    stsPermissiveOK : BOOL;     // TRUE when every condition is met
+    stsUnmetCount   : INT;      // number of unmet conditions
+END_VAR
+
+VAR
+    i   : INT;
+    HMI : ST_Permissive_HMI_Interface;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// Count every unmet slot every scan. The count is wanted even while satisfied, so there is no
+// early exit.
+//
+// NO FIRST-OUT HERE, deliberately - see the header block. First-out is a TEMPORAL question and a
+// permissive has no temporal dimension: nothing tripped, so no condition "went first". Every unmet
+// condition is equally and simultaneously the reason, which is why the consumer shows the SET.
+//
+// 10 is a literal, matching ST_Permissive's array bound - CONVENTIONS §5. fb_Interlock's bound and
+// its loop can drift apart for exactly this reason; keep these two edits together.
+stsUnmetCount := 0;
+
+FOR i := 1 TO 10 DO
+    IF NOT inpConfig.conditions[i] THEN
+        stsUnmetCount := stsUnmetCount + 1;
+    END_IF
+END_FOR
+
+stsPermissiveOK := (stsUnmetCount = 0);
+
+// ── publish to HMI (last section, per CONVENTIONS §3) ──
+HMI.stsPermissiveOK := stsPermissiveOK;
+HMI.stsConditions   := inpConfig.conditions;
+HMI.stsDescriptions := inpConfig.descriptions;
+HMI.stsUnmetCount   := stsUnmetCount;]]></ST>
+    </Implementation>
+    <Method Name="getHMIdata" Id="{b0c19f6f-4dd0-4508-a580-da645616bc13}">
+      <Declaration><![CDATA[METHOD PUBLIC getHMIdata : ST_Permissive_HMI_Interface
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getHMIdata := HMI;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setCondition" Id="{d93931d8-4abc-4f37-8d18-a2a48c3396f2}">
+      <Declaration><![CDATA[// Drive one slot, optionally naming it at the same time. Convenience over poking inpConfig
+// directly: it bounds-checks the slot, so a typo'd index is a no-op instead of a memory scribble,
+// and it keeps a condition and its description together at the call site where they are easiest to
+// keep in step. Pass an empty inpDescription to leave the existing text alone.
+METHOD PUBLIC setCondition : BOOL
+VAR_INPUT
+    inpSlot         : INT;
+    inpMet          : BOOL;
+    inpDescription  : STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpSlot < 1 OR inpSlot > 10 THEN
+    setCondition := FALSE;
+    RETURN;
+END_IF
+
+inpConfig.conditions[inpSlot] := inpMet;
+IF inpDescription <> '' THEN
+    inpConfig.descriptions[inpSlot] := inpDescription;
+END_IF
+setCondition := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="cfgName" Id="{ee53dbe9-a04c-4c73-bca3-e20a825a5fce}">
+      <Declaration><![CDATA[// Operator-facing name for this permissive set, shown as the heading in the HMI list.
+PROPERTY PUBLIC cfgName : STRING]]></Declaration>
+      <Get Name="Get" Id="{eba1314a-471b-451b-9511-ecf37989341c}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgName := HMI.stsPermissiveName;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{87926a5a-80fe-43c5-943a-98e5228cd559}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[HMI.stsPermissiveName := cfgName;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+  </POU>
+</TcPlcObject>

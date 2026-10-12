@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_FaultMonitor" Id="{30cfc45d-77dd-44cb-a06f-ac4cb078fdeb}" SpecialFunc="None">
+    <Declaration><![CDATA[(*
+    fb_FaultMonitor — machine-wide list of the devices that are faulted right now.
+
+    Devices register once (abs_fb_Device / abs_fb_stateDevice call addDeviceFault from setInit with
+    pointers to their own stsFaulted / stsFaultDescription / device name). Every scan the monitor
+    REBUILDS stsFoundFaultDevice / stsFoundFaultDescription from those pointers, so the two lists
+    always line up index for index, a cleared fault disappears the scan it clears, and a fault whose
+    text changes shows the current text. (It used to add and remove entries by matching the
+    description string, which failed once a device blanked its description on reset: the stale
+    text stayed in the list for good.)
+*)
+FUNCTION_BLOCK fb_FaultMonitor
+VAR_INPUT
+END_VAR
+
+VAR_OUTPUT
+    stsFaultActive           : BOOL;
+    stsFaultCount            : UINT;                    // number of entries in the two lists below
+    stsFoundFaultDevice      : ARRAY[1..150] OF STRING;
+    stsFoundFaultDescription : ARRAY[1..150] OF STRING;
+END_VAR
+
+VAR
+    _deviceFaults            : ARRAY[1..150] OF POINTER TO BOOL;
+    _deviceFaultDescriptions : ARRAY[1..150] OF POINTER TO STRING;
+    _deviceNames             : ARRAY[1..150] OF POINTER TO STRING;
+    _lastCount               : UINT;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[scanFaults();
+]]></ST>
+    </Implementation>
+    <Method Name="addDeviceFault" Id="{9ae97243-c69d-4a47-b9ad-461c638a6e66}">
+      <Declaration><![CDATA[METHOD addDeviceFault : BOOL
+VAR_INPUT
+    faultStatus         : POINTER TO BOOL;
+    faultDescription    : POINTER TO STRING;
+    deviceName          : POINTER TO STRING;
+END_VAR
+VAR
+    deviceFaultIndex    : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[addDeviceFault := FALSE;
+IF faultStatus = 0 THEN
+    RETURN;
+END_IF
+
+deviceFaultIndex := getDeviceFaultArrayIndex(faultStatus);
+IF deviceFaultIndex <> 0 THEN
+    _deviceFaults[deviceFaultIndex]            := faultStatus;
+    _deviceFaultDescriptions[deviceFaultIndex] := faultDescription;
+    _deviceNames[deviceFaultIndex]             := deviceName;
+    addDeviceFault := TRUE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="getDeviceFaultArrayIndex" Id="{d56089ea-b737-4948-91f8-4e9b05933faa}">
+      <Declaration><![CDATA[// Slot for a registration: the slot this device already holds (so registering twice, e.g.
+// after an online change re-runs setInit, does not take a second slot), else the first free
+// one. 0 = table full.
+METHOD PRIVATE getDeviceFaultArrayIndex : UINT
+VAR_INPUT
+    faultStatus : POINTER TO BOOL;
+END_VAR
+VAR
+    i           : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getDeviceFaultArrayIndex := 0;
+FOR i := 1 TO 150 DO
+    IF _deviceFaults[i] = faultStatus THEN
+        getDeviceFaultArrayIndex := i;
+        RETURN;
+    END_IF
+END_FOR
+FOR i := 1 TO 150 DO
+    IF _deviceFaults[i] = 0 THEN
+        getDeviceFaultArrayIndex := i;
+        RETURN;
+    END_IF
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="scanFaults" Id="{acdc11b1-a7e3-447b-a3eb-d67d79a7e80c}">
+      <Declaration><![CDATA[METHOD PRIVATE scanFaults : BOOL
+VAR
+    i   : UINT;
+    n   : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[n := 0;
+FOR i := 1 TO 150 DO
+    IF _deviceFaults[i] <> 0 THEN
+        IF _deviceFaults[i]^ THEN
+            n := n + 1;
+            IF _deviceNames[i] <> 0 THEN
+                stsFoundFaultDevice[n] := _deviceNames[i]^;
+            ELSE
+                stsFoundFaultDevice[n] := '';
+            END_IF
+            IF _deviceFaultDescriptions[i] <> 0 THEN
+                stsFoundFaultDescription[n] := _deviceFaultDescriptions[i]^;
+            ELSE
+                stsFoundFaultDescription[n] := '';
+            END_IF
+        END_IF
+    END_IF
+END_FOR
+
+// Blank only the tail the previous scan used, not all 150 entries every scan.
+FOR i := n + 1 TO _lastCount DO
+    stsFoundFaultDevice[i]      := '';
+    stsFoundFaultDescription[i] := '';
+END_FOR
+_lastCount := n;
+
+stsFaultCount  := n;
+stsFaultActive := (n > 0);
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

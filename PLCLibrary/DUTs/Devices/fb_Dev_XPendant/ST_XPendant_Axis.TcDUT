@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_XPendant_Axis" Id="{a039b689-91f5-4de4-aced-5472112661df}">
+    <Declaration><![CDATA[// One analog control broken into a DIRECTION trigger + a SPEED throttle, so it wires
+// straight to a jog: Pos/Neg pick the jog direction, Throttle is the 0..100 % speed
+// override. fb_Dev_XPendant derives one of these per stick axis and per trigger.
+//   Sticks (bidirectional): Pos = up/right, Neg = down/left.
+//   Triggers (one-sided):   Pos = pulled,   Neg always FALSE.
+TYPE ST_XPendant_Axis :
+STRUCT
+    Value    : LREAL;   // raw gated deflection: sticks -1..1 (neg = down/left), triggers 0..1
+    Pos      : BOOL;    // deflected + past cfgActivateThreshold (stick up/right; trigger pulled)
+    Neg      : BOOL;    // deflected - past cfgActivateThreshold (stick down/left); FALSE for triggers
+    Throttle : LREAL;   // 0..100 % speed = magnitude of deflection; 0 whenever neither Pos nor Neg
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

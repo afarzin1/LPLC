@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ITECH_SoftwareFaults" Id="{1675e045-2990-46ac-90ba-52aba679d688}">
+    <Declaration><![CDATA[TYPE ST_ITECH_SoftwareFaults :
+STRUCT
+	overVoltageProtection 				: BOOL;
+	positiveOverCurrentProtection 		: BOOL;
+	negativeOverCurrentProtection 		: BOOL;
+	positiveOverPowerProtection	 		: BOOL;
+	negativeOverPowerProtection  		: BOOL;
+	underCurrentProtection		 		: BOOL;
+	underVoltageProtection				: BOOL;
+	overTemperatureProtection			: BOOL;
+	senseAbnormal						: BOOL;
+	senseReverseProtection 				: BOOL;
+	outputReverseProtection 			: BOOL;
+	multiMasterUnitsAbnormal			: BOOL;
+	opticalFiberUnlocked_multiMaster	: BOOL;
+	opticalFiberUnlocked_singleMaster	: BOOL;
+	moduleCheckingFailure				: BOOL;
+	unevenCurrentProtection				: BOOL;
+	hardwareProtection					: BOOL;
+	masterUnitPowerFailureProtection 	: BOOL;
+	inhibit_latchmode					: BOOL;
+	inhibit_livingMode					: BOOL;
+	capacitorOverCurrentprotection		: BOOL;
+	slaveUnitPowerFailureProtection		: BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

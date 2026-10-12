@@ -1,0 +1,987 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_CamTeach" Id="{1919343f-0bef-4ccd-a8c6-9e247713640a}" SpecialFunc="None">
+    <Declaration><![CDATA[// fb_CamTeach - reusable, machine-agnostic teach/manage engine for ONE NC cam table
+// (the master->slave relationship of a single slave). It records raw taught points,
+// persists them to file (source of truth), post-processes + converts them into an NC
+// motion function, downloads that function to a pre-created NC table and read-back
+// verifies it, and exposes a per-table 'verified' flag that gates downstream coupling
+// (fb_CamCoupler). It NEVER issues axis motion - its job ends at a verified table.
+//
+// Standalone library primitive: does NOT extend abs_fb_Device. It carries its OWN error
+// model (stsError / stsErrorText, via the private setError) - never setFault, which does
+// not exist here. Teach-by-value: cmdRecord takes scalar master/slave, not an AXIS_REF,
+// so the caller decides where the values come from (real axis, virtual master, accumulator).
+//
+// Async work (file I/O, download, verify, online edit) is multi-scan. File I/O is isolated
+// in the sub-FB fb_CamTeachFile, driven every scan with the working point array. Convert is
+// SYNCHRONOUS (a pure, bounded compute). Download/verify + online edit are ASYNCHRONOUS
+// state machines driven cyclically in the body.
+//
+// Convert is intentionally in-place: post-processing zeroes/compacts/smooths the working set
+// (the design doc's "compact the array"), so raw points should be SAVED BEFORE convert (or
+// reloaded) if the untouched raw values are needed - the file is the raw source of truth.
+//
+// NOTE: cfgMasterUnit is NOT in the design doc's cfg list; it is added here because the CSV
+// header carries a machine-specific master unit that fb_CamTeachFile.cmdSave requires. See report.
+FUNCTION_BLOCK fb_CamTeach
+VAR_INPUT
+    inpReset : BOOL;                 // level: while TRUE, hold the FB reset to E_CamTeach_State.eIdle (mirrors cmdReset)
+END_VAR
+
+VAR_OUTPUT
+    stsState     : E_CamTeach_State;  // lifecycle state (mirror of _state)
+    stsNumPoints : INT;               // number of raw points in the working set
+    stsVerified  : BOOL;              // table downloaded AND read-back-verified - gates fb_CamCoupler
+    stsBusy      : BOOL;              // file / download / verify / online edit in progress
+    stsError     : BOOL;              // an operation failed; latched until reset
+    stsErrorText : STRING;            // human-readable reason for stsError
+END_VAR
+
+VAR
+    // Public HMI interface - the struct an HMI (e.g. lhmi) binds
+    HMI      : ST_CamTeach_HMI_Interface;
+
+    // Raw taught points (working set) + count and lifecycle state
+    _points  : ARRAY[1..MAX_CAM_POINTS] OF ST_CamTeach_Point;
+    _n       : INT;
+    _state   : E_CamTeach_State;
+
+    // NC motion-function table this instance owns (pre-created under Motion -> Tables).
+    _tableId   : UDINT;               // NC cam-table id, set via cfgTableId / FB_Init (0 = unbound)
+    // VERIFY against installed Tc2_MC2_Camming / TF5050: the struct name MC_MotionFunctionPoint
+    // and ALL of its field names/types are library-version dependent (see cmdConvert).
+    _mfPoints  : ARRAY[1..MAX_CAM_POINTS] OF MC_MotionFunctionPoint;   // VERIFY (struct name)
+    _mcWrite   : MC_WriteMotionFunction;         // VERIFY (block name + I/O) - bulk table download
+    _mcRead    : MC_ReadMotionFunctionPoint;     // VERIFY (block name + I/O) - per-point read-back
+    _mcWritePt : MC_WriteMotionFunctionPoint;    // VERIFY (block name + I/O) - online single-point edit
+    _mcOnline  : MC_SetCamOnlineChangeMode;      // VERIFY (block name + I/O + mode enum) - online change timing
+    _readPt    : MC_MotionFunctionPoint;         // read-back target for MC_ReadMotionFunctionPoint (VAR_IN_OUT Point)
+    _camWriteRef : MC_CAM_REF;                   // table descriptor for MC_WriteMotionFunction (pArray -> _mfPoints)
+
+    _file : fb_CamTeachFile;          // isolated async CSV persistence sub-FB
+
+    // Configuration backing (FB_Init + cfg* properties, per the fb_Axis pattern)
+    _slaveName    : STRING;
+    _periodic     : BOOL;
+    _interp       : E_CamTeach_Interp;
+    _smoothWindow : INT;                              // moving-average window on master column (0 = off)
+    _fileDir      : STRING := 'C:\_MachineConfig\CamTables';
+    _masterUnit   : STRING := 'mm';                  // CSV header master unit (added cfg - see header note)
+
+    // Download / verify async sub-steps
+    _dlStep    : INT;                                // sub-step inside eVerifying (0 = reading, 1 = advance)
+    _verifyIdx : INT := 1;                           // point index being read back / compared
+    _verifyEps : LREAL := 0.001;                     // read-back comparison tolerance (absolute)
+
+    // Online-edit async sequence
+    _onlineStep     : INT;                           // 0 idle; 10 set change-mode; 20 write pt; 30 advance
+    _onlineIdx      : INT := 1;                       // point being edited online
+    _onlineWriteIdx : INT := 1;                       // cursor over affected points (idx-1 .. idx+1)
+    _onlineHi       : INT := 1;                       // last affected point index (min(_n, idx+1))
+    _onlineSaveReq  : BOOL;                           // re-save the file after the online write completes
+
+    // HMI readouts
+    _lastMaster : LREAL;                             // master of the most recent recorded point
+    _lastSlave  : LREAL;                             // slave  of the most recent recorded point
+    _fileName   : STRING;                            // file name of the last save/load
+
+    _returnState  : E_CamTeach_State;                // resting state to return to after eSaving
+    _hmiCfgLoaded : BOOL;                            // HMI.Config seeded from cfg once
+
+    _previewCount : INT;                             // valid entries in HMI.Status.stsPreview (0..32)
+    _i            : INT;                             // loop index (body only)
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ── 1. Drive the persistence sub-FB every scan ───────────────────────────────
+// It reads/writes the shared working buffer via VAR_IN_OUT; cmd* on _file only ARM ops.
+_file(points := _points);
+
+// ── 2. Reset handling ────────────────────────────────────────────────────────
+// inpReset is level-driven: hold reset while TRUE (idempotent - clears error, returns to idle).
+IF inpReset THEN
+    cmdReset();
+END_IF
+
+// ── 3. HMI commands ──────────────────────────────────────────────────────────
+// Seed the HMI.Config mirror once from the configured defaults; thereafter operator edits
+// to the tuning mirrors flow back into the cfg backing so the next convert/save uses them
+// (same seed-once-then-track convention as fb_Axis). 'created' is read live in cmdSave.
+IF NOT _hmiCfgLoaded THEN
+    HMI.Config.slaveName    := _slaveName;
+    HMI.Config.periodic     := _periodic;
+    HMI.Config.interp       := _interp;
+    HMI.Config.smoothWindow := _smoothWindow;
+    HMI.Config.fileName     := _fileName;
+    _hmiCfgLoaded := TRUE;
+ELSE
+    _slaveName := HMI.Config.slaveName;
+    _periodic  := HMI.Config.periodic;
+    _interp    := HMI.Config.interp;
+    IF HMI.Config.smoothWindow >= 0 THEN
+        _smoothWindow := HMI.Config.smoothWindow;
+    END_IF
+END_IF
+
+// Self-clearing one-shot command dispatch (same convention as fb_Axis section 3):
+// on seeing an ocmd* flag, immediately write it back FALSE, then call the matching method.
+IF HMI.Commands.ocmdReset THEN
+    HMI.Commands.ocmdReset := FALSE;
+    cmdReset();
+END_IF
+
+IF HMI.Commands.ocmdRecord THEN
+    HMI.Commands.ocmdRecord := FALSE;
+    cmdRecord(HMI.Commands.ocmdRecordMaster, HMI.Commands.ocmdRecordSlave);
+END_IF
+
+IF HMI.Commands.ocmdDeleteLast THEN
+    HMI.Commands.ocmdDeleteLast := FALSE;
+    cmdDeleteLast();
+END_IF
+
+IF HMI.Commands.ocmdEditPoint THEN
+    HMI.Commands.ocmdEditPoint := FALSE;
+    cmdEditPoint(HMI.Commands.ocmdEditIndex, HMI.Commands.ocmdEditMaster, HMI.Commands.ocmdEditSlave);
+END_IF
+
+IF HMI.Commands.ocmdClear THEN
+    HMI.Commands.ocmdClear := FALSE;
+    cmdClear();
+END_IF
+
+IF HMI.Commands.ocmdSave THEN
+    HMI.Commands.ocmdSave := FALSE;
+    HMI.Config.fileName := HMI.Commands.ocmdFileName;   // ocmdFileName seeds/echoes Config.fileName
+    cmdSave(HMI.Commands.ocmdFileName);
+END_IF
+
+IF HMI.Commands.ocmdLoad THEN
+    HMI.Commands.ocmdLoad := FALSE;
+    cmdLoad(HMI.Commands.ocmdFileName);
+END_IF
+
+IF HMI.Commands.ocmdConvert THEN
+    HMI.Commands.ocmdConvert := FALSE;
+    cmdConvert();
+END_IF
+
+IF HMI.Commands.ocmdDownload THEN
+    HMI.Commands.ocmdDownload := FALSE;
+    cmdDownload();
+END_IF
+
+IF HMI.Commands.ocmdEditOnline THEN
+    HMI.Commands.ocmdEditOnline := FALSE;
+    cmdEditOnline(HMI.Commands.ocmdEditOnlineIndex, HMI.Commands.ocmdEditOnlineSlave);
+END_IF
+
+// ── 4. Async state machine progression ───────────────────────────────────────
+// Reacts to the results (from LAST scan's block calls) of the file sub-FB and the MC blocks,
+// then section 4c drives the blocks for THIS scan. Convert is synchronous (in cmdConvert).
+CASE _state OF
+
+    eSaving:
+        IF _file.stsError THEN
+            setError(CONCAT('File save failed: ', _file.stsErrorText));
+        ELSIF _file.stsDone THEN
+            _state := _returnState;                 // save leaves the data unchanged -> prior state
+        END_IF
+
+    eLoading:
+        IF _file.stsError THEN
+            setError(CONCAT('File load failed: ', _file.stsErrorText));
+        ELSIF _file.stsDone THEN
+            _n          := _file.stsNumPointsLoaded;
+            stsVerified := FALSE;                    // loaded points need re-convert + re-download
+            IF _n < 2 THEN
+                setError('Loaded file has too few points (need >= 2)');
+            ELSE
+                _state := eTeaching;
+            END_IF
+        END_IF
+
+    eDownloading:
+        IF _mcWrite.Error THEN
+            setError(CONCAT('Table write error: ', UDINT_TO_STRING(_mcWrite.ErrorID)));
+        ELSIF _mcWrite.Done THEN
+            _verifyIdx := 1;
+            _dlStep    := 0;
+            _state     := eVerifying;
+        END_IF
+
+    eVerifying:
+        CASE _dlStep OF
+            0:  // waiting for the read-back of point _verifyIdx (compare within _verifyEps)
+                IF _mcRead.Error THEN
+                    stsVerified := FALSE;
+                    setError(CONCAT('Table read error: ', UDINT_TO_STRING(_mcRead.ErrorID)));
+                ELSIF _mcRead.Done THEN
+                    // Read-back point is delivered via the VAR_IN_OUT Point (-> _readPt), compared within _verifyEps.
+                    IF   ABS(_readPt.MasterPos - _mfPoints[_verifyIdx].MasterPos) > _verifyEps
+                      OR ABS(_readPt.SlavePos  - _mfPoints[_verifyIdx].SlavePos)  > _verifyEps THEN
+                        stsVerified := FALSE;
+                        setError(CONCAT('Verify mismatch at point ', INT_TO_STRING(_verifyIdx)));
+                    ELSE
+                        _dlStep := 1;               // point OK -> deassert one scan, then advance
+                    END_IF
+                END_IF
+            1:  // deassert scan complete: step to the next point, or finish
+                _verifyIdx := _verifyIdx + 1;
+                IF _verifyIdx > _n THEN
+                    stsVerified := TRUE;            // downloaded AND read-back-verified -> gates coupling
+                    _state      := eVerified;
+                ELSE
+                    _dlStep := 0;
+                END_IF
+        END_CASE
+
+END_CASE
+
+// ── 4b. Online-edit write sequence (MC_SetCamOnlineChangeMode + MC_WriteMotionFunctionPoint) ─
+// Runs independently of _state (a live edit while the table is in use); stsBusy reflects it.
+CASE _onlineStep OF
+    10:  // configure the online-change mode (apply at a defined master position, not immediately)
+        IF _mcOnline.Error THEN
+            setError(CONCAT('Online change-mode error: ', UDINT_TO_STRING(_mcOnline.ErrorID)));
+        ELSIF _mcOnline.Done THEN
+            _onlineStep := 20;
+        END_IF
+    20:  // writing affected point _onlineWriteIdx
+        IF _mcWritePt.Error THEN
+            setError(CONCAT('Online point write error: ', UDINT_TO_STRING(_mcWritePt.ErrorID)));
+        ELSIF _mcWritePt.Done THEN
+            _onlineStep := 30;                       // deassert one scan, then advance
+        END_IF
+    30:  // advance to the next affected point (idx-1 .. idx+1), or finish + re-save
+        _onlineWriteIdx := _onlineWriteIdx + 1;
+        IF _onlineWriteIdx > _onlineHi THEN
+            _onlineStep     := 0;
+            _onlineWriteIdx := 1;                    // keep the cursor in-bounds (4c reads _mfPoints[cursor])
+            IF _onlineSaveReq AND _fileName <> '' THEN
+                _onlineSaveReq := FALSE;
+                cmdSave(_fileName);                  // keep the file truthful after a live edit
+            END_IF
+        ELSE
+            _onlineStep := 20;
+        END_IF
+END_CASE
+
+// ── 4c. Drive the Tc2_MC2_Camming blocks (called every scan; Execute gated by state) ─────
+// Download: bulk-write _mfPoints[1.._n] to the pre-created NC table.
+// VERIFY against installed Tc2_MC2_Camming / TF5050: block name, input names (CamTableID /
+// points pointer / size) and whether the size is BYTES (SIZEOF) or a point COUNT.
+// MC_CAM_REF must FULLY describe the source buffer, not just pArray (an unset TableType -> write
+// error 19249). Motion function = 1 column; NoOfRows = point count; ArraySize = buffer bytes.
+_camWriteRef.pArray      := ADR(_mfPoints[1]);
+_camWriteRef.ArraySize   := SIZEOF(_mfPoints);
+_camWriteRef.TableType   := MC_TABLETYPE_MOTIONFUNCTION;
+_camWriteRef.NoOfColumns := 1;
+_camWriteRef.NoOfRows    := INT_TO_UDINT(_n);
+_mcWrite(
+    Execute    := (_state = eDownloading),
+    CamTableID := _tableId,                                              // VERIFY: MC_CAM_ID type
+    PointID    := 0,                                                     // start at the first point
+    NumPoints  := INT_TO_UDINT(_n),                                     // number of points to write
+    CamTable   := _camWriteRef                                          // fully-described MC_CAM_REF
+);
+
+// Verify: per-point read-back of point _verifyIdx (Execute pulses low between points).
+// VERIFY: block name, CamTableID/PointIndex input names, and the MotionFunctionPoint output.
+_mcRead(
+    Execute    := (_state = eVerifying) AND (_dlStep = 0),
+    CamTableID := _tableId,                                              // VERIFY: MC_CAM_ID type
+    PointID    := INT_TO_UDINT(_verifyIdx),                             // point-index input (MC_MotionFunctionPoint_ID)
+    Point      := _readPt                                                // VAR_IN_OUT: read-back point lands here
+);
+
+// Online single-point edit: write the changed/affected point live.
+// VERIFY: block name + MotionFunctionPoint input struct name.
+_mcWritePt(
+    Execute    := (_onlineStep = 20),
+    CamTableID := _tableId,                                              // VERIFY: MC_CAM_ID type
+    PointID    := _mfPoints[_onlineWriteIdx].PointIndex,                // MC_MotionFunctionPoint_ID of the edited point
+    Point      := _mfPoints[_onlineWriteIdx]                             // VAR_IN_OUT: point data to write
+);
+
+// Online change mode: apply the live edit at a DEFINED master position (not immediately),
+// so editing the segment the slave is currently traversing does not step the setpoint.
+// VERIFY: block name, mode enum name/value, and how the defined master position is specified -
+// some versions apply "on next cam cycle" (the period seam) instead of an explicit MasterPos.
+_mcOnline(
+    Execute            := (_onlineStep = 10),
+    CamTableID         := _tableId,                                     // VERIFY: MC_CAM_ID type
+    ActivationMode     := MC_CAMACTIVATION_ATMASTERAXISPOS,             // apply at a defined master axis position
+    ActivationPosition := 0.0                                           // table origin / seam
+);
+
+// ── 5. Outputs + HMI status ──────────────────────────────────────────────────
+stsState     := _state;
+stsNumPoints := _n;
+stsBusy      := _file.stsBusy
+                OR (_state = eSaving) OR (_state = eLoading)
+                OR (_state = eDownloading) OR (_state = eVerifying)
+                OR (_onlineStep <> 0);
+// stsVerified / stsError / stsErrorText are maintained by the command + verify logic above.
+
+// Bounded preview: the most-recent tail of the working set (<= 32 points) for HMI spot-checks.
+_previewCount := _n;
+IF _previewCount > 32 THEN
+    _previewCount := 32;
+END_IF
+FOR _i := 1 TO 32 DO
+    IF _i <= _previewCount THEN
+        HMI.Status.stsPreview[_i] := _points[_n - _previewCount + _i];
+    ELSE
+        HMI.Status.stsPreview[_i].rMaster := 0.0;
+        HMI.Status.stsPreview[_i].rSlave  := 0.0;
+    END_IF
+END_FOR
+
+HMI.Status.stsState        := _state;
+HMI.Status.stsNumPoints    := _n;
+HMI.Status.stsVerified     := stsVerified;
+HMI.Status.stsBusy         := stsBusy;
+HMI.Status.stsError        := stsError;
+HMI.Status.stsErrorText    := stsErrorText;
+HMI.Status.stsFileBusy     := _file.stsBusy;
+HMI.Status.stsFileName     := _fileName;
+HMI.Status.stsLastMaster   := _lastMaster;
+HMI.Status.stsLastSlave    := _lastSlave;
+HMI.Status.stsSlaveName    := _slaveName;         // config echo (read-back of cfg*/Config)
+HMI.Status.stsPeriodic     := _periodic;
+HMI.Status.stsInterp       := _interp;
+HMI.Status.stsSmoothWindow := _smoothWindow;
+HMI.Status.stsTableId      := _tableId;
+HMI.Status.stsPreviewCount := _previewCount;
+]]></ST>
+    </Implementation>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         PUBLIC COMMAND METHODS
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Method Name="cmdRecord" Id="{169dc337-7b25-45f6-ae24-dae8654de7e3}">
+      <Declaration><![CDATA[// Append one raw taught point (caller supplies BOTH scalars - teach by value, not by axis).
+// Bounds-checked against MAX_CAM_POINTS. Recording invalidates any verified table and moves
+// to eTeaching. Rejected QUIETLY while an async op is running or while errored.
+METHOD PUBLIC cmdRecord : BOOL
+VAR_INPUT
+    rMaster : LREAL;   // [master unit]
+    rSlave  : LREAL;   // [slave unit]
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdRecord := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+IF _n >= MAX_CAM_POINTS THEN
+    setError('Record: cam point buffer full');
+    RETURN;
+END_IF
+
+_n := _n + 1;
+_points[_n].rMaster := rMaster;
+_points[_n].rSlave  := rSlave;
+_lastMaster := rMaster;
+_lastSlave  := rSlave;
+stsVerified := FALSE;                 // editing/recording clears verified
+_state      := eTeaching;
+cmdRecord   := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdDeleteLast" Id="{fbe0bdf2-0513-4c0e-bdb1-37aa3177a41f}">
+      <Declaration><![CDATA[// Remove the most recently recorded point. Clears verified. Rejected QUIETLY while busy/errored.
+METHOD PUBLIC cmdDeleteLast : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdDeleteLast := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+IF _n > 0 THEN
+    _n          := _n - 1;
+    stsVerified := FALSE;
+    IF _n = 0 THEN
+        _state := E_CamTeach_State.eIdle;
+    ELSE
+        _state := eTeaching;
+    END_IF
+END_IF
+cmdDeleteLast := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdEditPoint" Id="{f36eada8-b1b6-4611-9fb6-31e9eb81b5cb}">
+      <Declaration><![CDATA[// Spot-edit one existing point (offline, before convert/download). Clears verified.
+// Faults on an out-of-range index. Rejected QUIETLY while busy/errored.
+METHOD PUBLIC cmdEditPoint : BOOL
+VAR_INPUT
+    idx     : INT;     // 1..stsNumPoints
+    rMaster : LREAL;   // [master unit] new master value
+    rSlave  : LREAL;   // [slave unit]  new slave value
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdEditPoint := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+IF idx < 1 OR idx > _n THEN
+    setError('Edit point: index out of range');
+    RETURN;
+END_IF
+
+_points[idx].rMaster := rMaster;
+_points[idx].rSlave  := rSlave;
+stsVerified  := FALSE;
+_state       := eTeaching;
+cmdEditPoint := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdClear" Id="{7fc08418-ab49-4b2f-8466-6a893e0669ec}">
+      <Declaration><![CDATA[// Empty the working set (returns toward E_CamTeach_State.eIdle). Clears verified. Rejected QUIETLY while busy/errored.
+METHOD PUBLIC cmdClear : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdClear := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+_n          := 0;
+stsVerified := FALSE;
+_state      := E_CamTeach_State.eIdle;
+cmdClear    := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdSave" Id="{fc164637-72cf-4593-8084-20d48fe49e5b}">
+      <Declaration><![CDATA[// Persist the raw points -> file (async, via fb_CamTeachFile). The directory is cfgFileDir;
+// the caller passes just a bare file name. Metadata (slaveName/created/periodic/interp/masterUnit)
+// is taken from the cfg backing except 'created', which the HMI stamps (wall clock not in-scan).
+// Rejected QUIETLY while busy/errored or with nothing to save.
+METHOD PUBLIC cmdSave : BOOL
+VAR_INPUT
+    fileName : STRING;   // bare file name, e.g. '<pattern>_<slaveName>.csv'
+END_VAR
+VAR
+    sInterp : STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdSave := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+IF _n < 1 THEN
+    setError('Save: nothing to save');
+    RETURN;
+END_IF
+
+// string form of the interpolation strategy for the CSV '#' header
+sInterp := SEL(_interp = E_CamTeach_Interp.eCubicC1, 'linear', 'cubicC1');
+
+IF _file.cmdSave(
+        dir        := _fileDir,
+        fileName   := fileName,
+        numPoints  := _n,
+        slaveName  := _slaveName,
+        created    := HMI.Config.created,
+        periodic   := _periodic,
+        interp     := sInterp,
+        masterUnit := _masterUnit) THEN
+    _fileName    := fileName;
+    _returnState := _state;         // resting state to return to once the write completes
+    _state       := eSaving;
+    cmdSave      := TRUE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdLoad" Id="{f5c46e95-503f-4c03-a291-cd9ca58f3197}">
+      <Declaration><![CDATA[// File -> raw points (async, via fb_CamTeachFile). On completion _n is taken from
+// _file.stsNumPointsLoaded and validated (>= 2) in the eLoading branch of the body.
+// Loading invalidates any verified table. Rejected QUIETLY while busy/errored.
+METHOD PUBLIC cmdLoad : BOOL
+VAR_INPUT
+    fileName : STRING;   // bare file name to load (directory is cfgFileDir)
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdLoad := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+IF _file.cmdLoad(dir := _fileDir, fileName := fileName) THEN
+    _fileName := fileName;
+    _state    := eLoading;
+    cmdLoad   := TRUE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdConvert" Id="{94ed9ee8-a0f3-4022-9c3a-3bfdafd3f23d}">
+      <Declaration><![CDATA[// SYNCHRONOUS: post-process the raw points then build the NC motion function _mfPoints[].
+// Pure and bounded by MAX_CAM_POINTS (no I/O), so it completes in one scan -> eConverted.
+// Post-processing is IN PLACE (design doc "compact the array"): it zeroes the master offset,
+// deletes non-monotonic points, and optionally smooths the master column, updating _n. Save
+// the raw points BEFORE converting if the untouched values are needed. A (re)convert also
+// invalidates any prior download (stsVerified := FALSE). Rejected QUIETLY while busy/errored.
+METHOD PUBLIC cmdConvert : BOOL
+VAR
+    base : LREAL;   // master offset removed in step 1
+    i    : INT;     // point loop index
+    j    : INT;     // compaction write cursor
+    w2   : INT;     // smoothing half-window
+    lo   : INT;     // smoothing window low bound
+    hi   : INT;     // smoothing window high bound
+    k    : INT;     // smoothing inner index
+    sum  : LREAL;   // smoothing accumulator
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdConvert := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+IF _n < 2 THEN
+    setError('Convert: need at least 2 taught points');
+    RETURN;
+END_IF
+
+// A (re)convert invalidates any previously downloaded/verified table.
+stsVerified := FALSE;
+
+// ── Post-processing 1: zero the master offset (table starts at master = 0) ──
+base := _points[1].rMaster;
+FOR i := 1 TO _n DO
+    _points[i].rMaster := _points[i].rMaster - base;
+END_FOR
+
+// ── Post-processing 2: enforce strict-monotonic master (compact the array in place) ──
+// Keep point 1; keep each later point only if its master exceeds the last kept point's.
+j := 1;
+FOR i := 2 TO _n DO
+    IF _points[i].rMaster > _points[j].rMaster THEN
+        j := j + 1;
+        _points[j] := _points[i];
+    END_IF
+END_FOR
+_n := j;
+IF _n < 2 THEN
+    setError('Convert: too few monotonic points');
+    RETURN;
+END_IF
+
+// ── Post-processing 3: optional moving-average smoothing of the MASTER column ──
+// Odd window (>= 3); the window shrinks at the endpoints. _mfPoints[].MasterPos is used as
+// scratch so each average is taken from the ORIGINAL masters (an in-place average would feed
+// already-smoothed neighbours into later points). 0/1/2 disable smoothing.
+IF _smoothWindow >= 3 THEN
+    w2 := (_smoothWindow - 1) / 2;
+    FOR i := 1 TO _n DO
+        lo := i - w2;  IF lo < 1  THEN lo := 1;  END_IF
+        hi := i + w2;  IF hi > _n THEN hi := _n; END_IF
+        sum := 0.0;
+        FOR k := lo TO hi DO
+            sum := sum + _points[k].rMaster;
+        END_FOR
+        _mfPoints[i].MasterPos := sum / INT_TO_LREAL(hi - lo + 1);   // scratch (overwritten below)
+    END_FOR
+    FOR i := 1 TO _n DO
+        _points[i].rMaster := _mfPoints[i].MasterPos;
+    END_FOR
+END_IF
+
+// ── Build the NC motion function (C1-smooth cubic from position-only teaching) ──
+// VERIFY every field name + enum below against the installed Tc2_MC2_Camming / TF5050 version.
+FOR i := 1 TO _n DO
+    _mfPoints[i].PointIndex        := INT_TO_UDINT(i);       // VERIFY: MC_MotionFunctionPoint.PointIndex
+    _mfPoints[i].RelIndexNextPoint := 1;                     // VERIFY: MC_MotionFunctionPoint.RelIndexNextPoint
+    _mfPoints[i].MasterPos         := _points[i].rMaster;    // VERIFY: MC_MotionFunctionPoint.MasterPos
+    _mfPoints[i].SlavePos          := _points[i].rSlave;     // VERIFY: MC_MotionFunctionPoint.SlavePos
+    _mfPoints[i].SlaveVelo         := slaveSlope(i);         // VERIFY: MC_MotionFunctionPoint.SlaveVelo
+    _mfPoints[i].SlaveAcc          := 0.0;                   // VERIFY: MC_MotionFunctionPoint.SlaveAcc
+    IF i = _n THEN
+        _mfPoints[i].FunctionType := MOTIONFUNCTYPE_NOTDEF;        // VERIFY: terminator enum (last point)
+    ELSE
+        _mfPoints[i].FunctionType := MOTIONFUNCTYPE_POLYNOM3;    // VERIFY: cubic-segment enum
+    END_IF
+END_FOR
+
+_state     := eConverted;
+cmdConvert := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdDownload" Id="{ecdae21f-c80e-4ed9-9c41-f4b204389c71}">
+      <Declaration><![CDATA[// Start the async download -> verify state machine (MC_WriteMotionFunction, then per-point
+// MC_ReadMotionFunctionPoint read-back). On success -> eVerified + stsVerified := TRUE. Requires
+// eConverted and a bound cfgTableId. Rejected QUIETLY while busy/errored.
+METHOD PUBLIC cmdDownload : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdDownload := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+IF _state <> eConverted THEN
+    setError('Download: convert first (must be in eConverted)');
+    RETURN;
+END_IF
+
+IF _tableId = 0 THEN
+    setError('Download: no NC cam table id configured');
+    RETURN;
+END_IF
+
+IF _n < 2 THEN
+    setError('Download: nothing to download');
+    RETURN;
+END_IF
+
+stsVerified := FALSE;               // clears any prior verify until this download re-verifies
+_dlStep     := 0;
+_state      := eDownloading;
+cmdDownload := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdEditOnline" Id="{9dfe28b2-4b65-46c0-a503-e576026b4649}">
+      <Declaration><![CDATA[// Live single-point slave edit while the table is in use. Updates _points[idx].rSlave, rebuilds
+// the affected motion-function points (the edited point's SlavePos + the slopes of it and its
+// immediate neighbours), then kicks the async sequence: set the online-change mode (apply at a
+// defined master position, NOT immediately) and write the affected points via
+// MC_WriteMotionFunctionPoint. The file is re-saved so it stays truthful. A live edit clears
+// stsVerified (a full re-convert + re-download is required before coupling is allowed again).
+// Rejected QUIETLY while busy/errored, on a bad index, or with no bound table.
+METHOD PUBLIC cmdEditOnline : BOOL
+VAR_INPUT
+    idx    : INT;     // 1..stsNumPoints target point index
+    rSlave : LREAL;   // [slave unit] new slave value for the live edit
+END_VAR
+VAR
+    k  : INT;
+    lo : INT;
+    hi : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdEditOnline := FALSE;
+IF isBusy() OR stsError THEN
+    RETURN;
+END_IF
+
+IF _n < 2 THEN
+    setError('Online edit: table too small');
+    RETURN;
+END_IF
+
+IF idx < 1 OR idx > _n THEN
+    setError('Online edit: index out of range');
+    RETURN;
+END_IF
+
+IF _tableId = 0 THEN
+    setError('Online edit: no NC cam table id configured');
+    RETURN;
+END_IF
+
+// 1) update the working point and rebuild the affected motion-function points
+//    (only the slave changed; recompute SlavePos of idx and the slopes of idx-1..idx+1).
+_onlineIdx := idx;
+_points[idx].rSlave := rSlave;
+
+lo := idx - 1;  IF lo < 1  THEN lo := 1;  END_IF
+hi := idx + 1;  IF hi > _n THEN hi := _n; END_IF
+FOR k := lo TO hi DO
+    _mfPoints[k].SlavePos  := _points[k].rSlave;    // VERIFY: MC_MotionFunctionPoint.SlavePos
+    _mfPoints[k].SlaveVelo := slaveSlope(k);        // VERIFY: MC_MotionFunctionPoint.SlaveVelo
+END_FOR
+
+// 2) + 3) arm the async write sequence: change-mode first, then write points lo..hi.
+_onlineWriteIdx := lo;
+_onlineHi       := hi;
+_onlineStep     := 10;
+_onlineSaveReq  := TRUE;
+
+// 4) a live edit invalidates the verified permission; report the updated-but-unverified state.
+stsVerified := FALSE;
+_state      := eConverted;
+
+cmdEditOnline := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdReset" Id="{60aacc33-aa08-4d3f-be64-fda57ef59c06}">
+      <Declaration><![CDATA[// Clear the FB's own error, reset the file sub-FB, and return to E_CamTeach_State.eIdle. Also aborts any in-flight
+// download/verify/online sequence. stsVerified is cleared so a fresh convert + download + verify
+// is required after a reset. Called from inpReset, ocmdReset, and directly.
+METHOD PUBLIC cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stsError     := FALSE;
+stsErrorText := '';
+_file.cmdReset();
+
+_state          := E_CamTeach_State.eIdle;
+_dlStep         := 0;
+_verifyIdx      := 1;
+_onlineStep     := 0;
+_onlineWriteIdx := 1;
+_onlineSaveReq  := FALSE;
+stsVerified     := FALSE;
+cmdReset        := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         PRIVATE HELPERS
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Method Name="slaveSlope" Id="{96f75920-a5ad-4fc4-9a09-eb6c1ca43db4}">
+      <Declaration><![CDATA[// Central-difference slave slope d(slave)/d(master) at point idx, used for the cubic SlaveVelo.
+// Interior points use the central difference; the endpoints use one-sided differences. For a
+// PERIODIC table the seam (point 1 == point _n phase) wraps so the slope is continuous across
+// the period boundary. Assumes masters are strictly monotonic (post-processed); guards dM = 0.
+METHOD PRIVATE slaveSlope : LREAL
+VAR_INPUT
+    idx : INT;     // 1.._n
+END_VAR
+VAR
+    dM     : LREAL;
+    dS     : LREAL;
+    period : LREAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[slaveSlope := 0.0;
+IF _n < 2 OR idx < 1 OR idx > _n THEN
+    RETURN;
+END_IF
+
+IF _periodic AND _n >= 3 AND (idx = 1 OR idx = _n) THEN
+    // Seam wrap: _points[1] (master 0) and _points[_n] (master = period) are the SAME phase,
+    // so idx=1 and idx=_n get the SAME (continuous) slope. period = the zeroed master span.
+    period := _points[_n].rMaster - _points[1].rMaster;
+    dS     := _points[2].rSlave - _points[_n - 1].rSlave;
+    dM     := (_points[2].rMaster + period) - _points[_n - 1].rMaster;
+ELSIF idx = 1 THEN
+    // one-sided forward difference at the start
+    dS := _points[2].rSlave  - _points[1].rSlave;
+    dM := _points[2].rMaster - _points[1].rMaster;
+ELSIF idx = _n THEN
+    // one-sided backward difference at the end
+    dS := _points[_n].rSlave  - _points[_n - 1].rSlave;
+    dM := _points[_n].rMaster - _points[_n - 1].rMaster;
+ELSE
+    // interior central difference
+    dS := _points[idx + 1].rSlave  - _points[idx - 1].rSlave;
+    dM := _points[idx + 1].rMaster - _points[idx - 1].rMaster;
+END_IF
+
+IF dM <> 0.0 THEN
+    slaveSlope := dS / dM;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="setError" Id="{00d6ea09-e167-4580-8dfb-8aae05da66c4}">
+      <Declaration><![CDATA[// Latch the FB's own error (this FB does NOT extend abs_fb_Device - never setFault, which would
+// gate MC_Power on a real axis). Moves to E_CamTeach_State.eError and aborts any in-flight download/verify/online
+// sub-steps so the MC blocks de-assert next scan. Cleared only by cmdReset / inpReset.
+METHOD PRIVATE setError : BOOL
+VAR_INPUT
+    text : STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stsError     := TRUE;
+stsErrorText := text;
+_state       := E_CamTeach_State.eError;
+_dlStep      := 0;
+_onlineStep  := 0;
+setError     := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="isBusy" Id="{28488460-c58b-40ae-8102-abc39f5066cf}">
+      <Declaration><![CDATA[// TRUE while any async operation is in progress (file save/load, download, verify, or online
+// edit). Command methods use this to reject re-entrant requests without disturbing the running op.
+METHOD PRIVATE isBusy : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[isBusy := _file.stsBusy
+    OR (_state = eSaving) OR (_state = eLoading)
+    OR (_state = eDownloading) OR (_state = eVerifying)
+    OR (_onlineStep <> 0);
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="getHMIdata" Id="{798174cc-1833-4274-a34a-9a329a3573bd}">
+      <Declaration><![CDATA[// Return the full HMI interface struct (the one an HMI binds).
+METHOD PUBLIC getHMIdata : ST_CamTeach_HMI_Interface
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getHMIdata := HMI;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         FB_INIT
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Method Name="FB_Init" Id="{3c8f1314-dc74-40a6-a1ed-4f55ada5c0fc}">
+      <Declaration><![CDATA[METHOD FB_Init : BOOL
+VAR_INPUT
+    bInitRetains    : BOOL;
+    bInCopyCode     : BOOL;
+    cfgTableId      : UDINT;              // NC motion-function table id bound to this instance
+    cfgSlaveName    : STRING;             // name of the slave this table teaches (file header)
+    cfgPeriodic     : BOOL;              // TRUE = periodic table (velocity wraps at the seam)
+    cfgInterp       : E_CamTeach_Interp;  // interpolation strategy for cmdConvert
+    cfgSmoothWindow : INT;               // moving-average window on master column (0 = off)
+    cfgFileDir      : STRING;            // save/load directory ('' = keep default C:\_MachineConfig\CamTables)
+    cfgMasterUnit   : STRING;            // CSV header master unit ('' = keep default 'mm')
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_tableId   := cfgTableId;
+_slaveName := cfgSlaveName;
+_periodic  := cfgPeriodic;
+_interp    := cfgInterp;
+IF cfgSmoothWindow >= 0 THEN _smoothWindow := cfgSmoothWindow; END_IF
+IF cfgFileDir    <> '' THEN _fileDir    := cfgFileDir;    END_IF
+IF cfgMasterUnit <> '' THEN _masterUnit := cfgMasterUnit; END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         CONFIGURATION PROPERTIES
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Property Name="cfgTableId" Id="{180e9990-96dc-4552-82e2-7b15748f9cf6}">
+      <Declaration><![CDATA[// NC motion-function table id this instance downloads to (pre-created under Motion -> Tables).
+PROPERTY PUBLIC cfgTableId : UDINT]]></Declaration>
+      <Get Name="Get" Id="{9f2bdbef-9309-4150-bc8f-39e0a5750ec3}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgTableId := _tableId;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{b729f71d-1d00-4cc6-93cb-4e916e4b5b48}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_tableId := cfgTableId;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgSlaveName" Id="{8c927a8e-ca79-41a1-a228-b0fa1b6e6055}">
+      <Declaration><![CDATA[// Name of the slave this table teaches; written into the CSV '#' metadata header.
+PROPERTY PUBLIC cfgSlaveName : STRING]]></Declaration>
+      <Get Name="Get" Id="{24a1af77-4383-4e55-a240-a1c7982ed58a}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgSlaveName := _slaveName;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{62fa4fdd-5f6c-4c25-9184-d057689fc925}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_slaveName := cfgSlaveName;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgPeriodic" Id="{94835479-bad8-4c82-a48e-f0357ad3cd6d}">
+      <Declaration><![CDATA[// TRUE = periodic table: the conversion wraps the central-difference slope at the seam so the
+// slave velocity is continuous across the period boundary.
+PROPERTY PUBLIC cfgPeriodic : BOOL]]></Declaration>
+      <Get Name="Get" Id="{52c58d22-b2e7-4d9d-a708-60b8a256cbb5}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgPeriodic := _periodic;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{7a5bc77c-23ea-48a7-8be7-507585bf0584}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_periodic := cfgPeriodic;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgInterp" Id="{e07bed75-74b3-481c-9074-5af1d98eec09}">
+      <Declaration><![CDATA[// Interpolation strategy used by cmdConvert (eLinear / eCubicC1). eCubicC1 = POLYNOM3 +
+// central-difference slope -> C1-smooth cubic from position-only teaching.
+PROPERTY PUBLIC cfgInterp : E_CamTeach_Interp]]></Declaration>
+      <Get Name="Get" Id="{76b4a02b-e4c6-4500-b64e-a93fea3e0229}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgInterp := _interp;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{79eaf1ec-f19d-401e-969d-a0640835767e}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_interp := cfgInterp;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgSmoothWindow" Id="{fc1d4d9f-1b36-42dd-a003-1efcf5ac6b18}">
+      <Declaration><![CDATA[// Moving-average window applied to the master column in cmdConvert (odd, 3-5; 0 = off).
+// A value < 0 is rejected; 1/2 act as off (the convert only smooths for windows >= 3).
+PROPERTY PUBLIC cfgSmoothWindow : INT]]></Declaration>
+      <Get Name="Get" Id="{a570a30d-6212-4791-b19d-85dae4c70e02}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgSmoothWindow := _smoothWindow;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{94d6c81a-aa84-4fb6-8cec-c21084b17cbc}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgSmoothWindow >= 0 THEN _smoothWindow := cfgSmoothWindow; END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgFileDir" Id="{808e4793-5056-4b6b-bf0f-ed697f90b3bd}">
+      <Declaration><![CDATA[// Save/load directory (the caller passes only a bare file name). Default C:\_MachineConfig\CamTables.
+PROPERTY PUBLIC cfgFileDir : STRING]]></Declaration>
+      <Get Name="Get" Id="{4baedac2-b883-4553-8de5-9b9b1c80b482}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgFileDir := _fileDir;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{8bfc0b26-11ec-45c2-b581-c4c943edcf9e}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgFileDir <> '' THEN _fileDir := cfgFileDir; END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgMasterUnit" Id="{5cb3bc2c-783e-4f7c-94a5-62a7a5c9b321}">
+      <Declaration><![CDATA[// Master unit label written into the CSV '#' header (e.g. 'mm' / 'deg'). Default 'mm'.
+// Added beyond the design doc's cfg list because the file header needs a machine-specific
+// master unit that fb_CamTeachFile.cmdSave requires (see the FB header note / report).
+PROPERTY PUBLIC cfgMasterUnit : STRING]]></Declaration>
+      <Get Name="Get" Id="{008dca3d-5f50-4b90-b389-ab2ac9201163}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgMasterUnit := _masterUnit;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{82bc8d83-62b0-4485-9cb7-7841776a16a4}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgMasterUnit <> '' THEN _masterUnit := cfgMasterUnit; END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+  </POU>
+</TcPlcObject>

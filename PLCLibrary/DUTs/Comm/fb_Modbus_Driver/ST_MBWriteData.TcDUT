@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="ST_MBWriteData" Id="{aa2a6e20-373d-4e6d-94ef-8c7041d5a87d}">
+    <Declaration><![CDATA[TYPE ST_MBWriteData :
+STRUCT
+    valueReal           : REAL;
+    valueDint           : DINT;
+    valueUdint          : UDINT;
+    valueInt            : INT;
+    valueUint           : UINT;
+    valueWord           : WORD;
+    valueBool           : BOOL;
+
+    writeSuccess        : BOOL;
+    writeError          : BOOL;
+    writeCount          : UDINT;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

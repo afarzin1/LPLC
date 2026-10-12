@@ -1,0 +1,37 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Banner_TL503Pro" Id="{278f4339-677f-4295-beae-692acc6f2585}">
+    <Declaration><![CDATA[TYPE ST_Banner_TL503Pro:
+STRUCT
+	Segment1Color1 			: U_USINT;
+	Segment1Color1Intensity : U_USINT;
+	Segment1AnimationType	: U_USINT;
+	Segment1Speed			: U_USINT;
+	Segment1PulsePattern	: U_USINT;
+	Segment1Color2			: U_USINT;
+	Segment1Color2Intensity : U_USINT;
+	Segment1RotationDir		: BOOL;
+	
+	Segment2Color1 			: U_USINT;
+	Segment2Color1Intensity : U_USINT;
+	Segment2AnimationType	: U_USINT;
+	Segment2Speed			: U_USINT;
+	Segment2PulsePattern	: U_USINT;
+	Segment2Color2			: U_USINT;
+	Segment2Color2Intensity : U_USINT;
+	Segment2RotationDir		: BOOL;
+	
+	Segment3Color1 			: U_USINT;
+	Segment3Color1Intensity : U_USINT;
+	Segment3AnimationType	: U_USINT;
+	Segment3Speed			: U_USINT;
+	Segment3PulsePattern	: U_USINT;
+	Segment3Color2			: U_USINT;
+	Segment3Color2Intensity : U_USINT;
+	Segment3RotationDir	: BOOL;
+	
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

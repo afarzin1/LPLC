@@ -1,0 +1,30 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_IsoMon_MBIF" Id="{9ddb24c5-30fe-467a-bdfe-f4bd9217d05d}">
+    <Declaration><![CDATA[TYPE ST_IsoMon_MBIF :
+STRUCT
+    insulationResistance      : U_ByteToLReal;   // 0x2000: Insulation resistance in Ω
+    minInsulationValue        : U_ByteToLReal;   // 0x2002: Minimum insulation resistance in Ω
+    systemLeakageCapacitance  : U_ByteToLReal;   // 0x2004: System leakage capacitance in F
+    voltageL1L2               : U_ByteToLReal;   // 0x2006: Voltage from phase L1 to phase L2 in V
+    voltageL1L3               : U_ByteToLReal;   // 0x2008: Voltage from phase L1 to phase L3 in V
+    voltageL2L3               : U_ByteToLReal;   // 0x200A: Voltage from phase L2 to phase L3 in V
+    voltageL1PE               : U_ByteToLReal;   // 0x200C: Voltage from phase L1 to earth PE in V
+    voltageL2PE               : U_ByteToLReal;   // 0x200E: Voltage from phase L2 to earth PE in V
+    voltageL3PE               : U_ByteToLReal;   // 0x2010: Voltage from phase L3 to earth PE in V
+    systemFrequency           : U_ByteToLReal;   // 0x2012: System frequency in Hz
+    couplingToSystem          : U_ByteToLReal;   // 0x2014: Coupling to system (0 = O.K., 101 = fault)
+    couplingToEarth           : U_ByteToLReal;   // 0x2016: Coupling to earth (0 = O.K., 102 = fault)
+    deviceError               : U_ByteToLReal;   // 0x2018: Device error number (example: 750 -> 750 communication CAN)
+    deviceInactive            : U_ByteToLReal;   // 0x201A: Device inactive (0 = active, 1 = inactive)
+    dcOffset                  : U_ByteToLReal;   // 0x201C: DC offset in the system (0..100%) in %
+    measurementQuality        : U_ByteToLReal;   // 0x201E: Measured value quality (0% = bad, 100% = good) in %
+    symmetricalAlarm          : U_ByteToLReal;   // 0x2020: Symmetrical alarm (see 0x1121)
+    dcMinusAlarm              : U_ByteToLReal;   // 0x2022: DC- alarm (see 0x1121)
+    dcPlusAlarm               : U_ByteToLReal;   // 0x2024: DC+ alarm (see 0x1121)
+    durationMeasuringPulse    : U_ByteToLReal;   // 0x2026: Duration of the measuring pulse (0% = short, 100% = long) in %
+    voltageDCPE               : U_ByteToLReal;   // 0x2028: DC offset voltage to earth in V
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>

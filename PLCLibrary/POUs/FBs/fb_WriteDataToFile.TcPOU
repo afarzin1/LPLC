@@ -1,0 +1,158 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_WriteDataToFile" Id="{c5fad768-c2df-4d5e-91b5-6cb8b86fef3f}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK  fb_WriteDataToFile
+VAR_INPUT
+    inpFilePath   : STRING(255);
+    inpFileName   : STRING(255);
+    data          : POINTER TO STRING;
+	len			  : UDINT;
+END_VAR
+VAR_OUTPUT
+    bBusy         : BOOL;
+    bDone         : BOOL;
+    bError        : BOOL;
+    hrErrorId     : HRESULT;
+END_VAR
+VAR
+    nState        : INT;
+    trigExecute   : R_TRIG;
+    bExecute      : BOOL;
+    sFullFilePath : STRING(255);
+    hFile         : UINT := 0;
+    fbFileOpen    : FB_FileOpen;
+    fbFileWrite   : FB_FileWrite;
+    fbFileClose   : FB_FileClose;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[trigExecute(CLK:=bExecute);
+
+IF NOT bExecute THEN
+    bDone := FALSE;
+END_IF;
+
+CASE nState OF
+    0:
+        bBusy := FALSE;
+        bError := FALSE;
+        hrErrorId := 0;
+		
+
+        IF trigExecute.Q THEN
+            bBusy := TRUE;
+            bDone := FALSE;
+            bError := FALSE;
+            sFullFilePath := '';
+            nState := 10;
+        END_IF;
+
+    10:
+        sFullFilePath := CONCAT(inpFilePath, '\');
+		sFullFilePath := CONCAT(sFullFilePath, inpFileName);
+        fbFileOpen(
+            bExecute    := TRUE,
+            sNetId      := '',
+            sPathName   := sFullFilePath,
+            nMode       := FOPEN_MODEWRITE,
+            ePath       := PATH_GENERIC,
+            tTimeout    := T#5S
+        );
+        nState := 20;
+
+    20:
+        fbFileOpen(bExecute := FALSE);
+
+        IF NOT fbFileOpen.bBusy THEN
+            IF fbFileOpen.bError THEN
+                hrErrorId := TO_DINT(fbFileOpen.nErrId);
+                nState := 99;
+            ELSE
+                hFile := fbFileOpen.hFile;
+                nState := 30;
+            END_IF;
+        END_IF;
+
+    30:
+        fbFileWrite(
+            bExecute    := TRUE,
+            sNetId      := '',
+            hFile       := hFile,
+            pWriteBuff  := data,
+            cbWriteLen  := len,
+            tTimeout    := T#5S
+        );
+        nState := 40;
+
+    40:
+        fbFileWrite(bExecute := FALSE);
+
+        IF NOT fbFileWrite.bBusy THEN
+            IF fbFileWrite.bError THEN
+                hrErrorId := TO_DINT(fbFileWrite.nErrId);
+                nState := 80;
+            ELSE
+                nState := 50;
+            END_IF;
+        END_IF;
+
+    50:
+        fbFileClose(
+            bExecute    := TRUE,
+            sNetId      := '',
+            hFile       := hFile,
+            tTimeout    := T#5S
+        );
+        nState := 60;
+
+    60:
+        fbFileClose(bExecute := FALSE);
+
+        IF NOT fbFileClose.bBusy THEN
+            IF fbFileClose.bError THEN
+                hrErrorId := TO_DINT(fbFileClose.nErrId);
+                nState := 99;
+            ELSE
+                bDone := TRUE;
+                bExecute := FALSE;
+                nState := 0;
+            END_IF;
+        END_IF;
+
+    80:
+        fbFileClose(bExecute := TRUE, hFile := hFile);
+        IF NOT fbFileClose.bBusy THEN
+             nState := 99;
+        END_IF;
+
+    99:
+        bError := TRUE;
+        bBusy := FALSE;
+        bExecute := FALSE;
+
+        fbFileOpen(bExecute := FALSE);
+        fbFileWrite(bExecute := FALSE);
+        fbFileClose(bExecute := FALSE);
+
+        IF NOT trigExecute.Q THEN
+            nState := 0;
+        END_IF;
+
+END_CASE;]]></ST>
+    </Implementation>
+    <Method Name="write" Id="{8d39a029-0dc8-414e-91e1-c0e908dd079d}">
+      <Declaration><![CDATA[METHOD write : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF nState = 0 THEN
+    bExecute := TRUE;
+    Write := TRUE;
+ELSE
+    Write := FALSE;
+END_IF;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

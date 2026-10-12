@@ -1,0 +1,244 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_WebRelay" Id="{93923ad3-0d84-4df7-b275-7ff60711a9ca}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_WebRelay EXTENDS abs_fb_Device
+
+VAR_INPUT
+	inpRelayCmd	: BOOL;
+END_VAR
+
+VAR
+	_commFault				: BOOL;
+	_modbus_IF				: ST_Modbus_Commands;
+	_modbus_cfg				: ST_Modbus_Device_Config;
+	_modbus_WC_state		: INT;
+	_modbus_RC_state		: INT;
+	_DIReadDelay			: TON;
+	_DIReadDelayTrig		: BOOL;
+	_DIState				: BOOL;
+	_DOWriteDelay			: TON;
+	_DOWriteDelayTrig		: BOOL;
+	_setDO					: BOOL;
+
+END_VAR
+
+VAR_OUTPUT
+	stsDI	: BOOL;
+	stsDO	: BOOL;
+END_VAR
+
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+Interlock.name := _DeviceName;
+Interlock(inpConfig := _dataInterlock);
+
+//Set device config for WriteSingleCoil
+_modbus_IF.WriteSingleCoil.sIPAddr 		:= _modbus_cfg.cfgIP_address;
+_modbus_IF.WriteSingleCoil.nTCPPort 	:= _modbus_cfg.cfgTCPPort;
+_modbus_IF.WriteSingleCoil.nUnitID		:= _modbus_cfg.cfgUnitID;
+_modbus_IF.WriteSingleCoil.tTimeout 	:= _modbus_cfg.cfgTimeout;
+_modbus_IF.WriteSingleCoil.nMBAddr		:= 1;
+
+_modbus_IF.ReadInputs.sIPAddr			:= _modbus_cfg.cfgIP_address;
+_modbus_IF.ReadInputs.nTCPPort			:= _modbus_cfg.cfgTCPPort;
+_modbus_IF.ReadInputs.nUnitID			:= _modbus_cfg.cfgUnitID;
+_modbus_IF.ReadInputs.tTimeout			:= _modbus_cfg.cfgTimeout;
+_modbus_IF.ReadInputs.nMBAddr			:= 0;
+
+_DIReadDelay(IN:=_DIReadDelayTrig, PT:=T#250MS);
+_DOWriteDelay(IN:=_DOWriteDelayTrig, PT:=T#250MS);
+_modbus_IF.ReadInputs();
+_modbus_IF.WriteSingleCoil();
+
+// Read the DI alue
+cmdReadDI();
+
+FaultHandler();
+
+// Set the relay based on fb input unless it's faulted
+IF NOT stsFaulted THEN
+	_setDO := inpRelayCmd;
+ELSE
+	_setDO := FALSE;
+END_IF
+
+cmdSetDO(_setDO);
+
+stsDI := _DIState;
+stsDO := _setDO;
+
+
+
+
+]]></ST>
+    </Implementation>
+    <Folder Name="Privates" Id="{5d1b6088-741d-4746-ba81-0b5f37fefe6e}" />
+    <Property Name="cfgDeviceName" Id="{5cb140d5-5c42-4900-b76a-1935ef48d181}">
+      <Declaration><![CDATA[PROPERTY cfgDeviceName : string]]></Declaration>
+      <Get Name="Get" Id="{fd18b208-7e49-46bc-ab05-9ae570713929}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgDeviceName := _devicename;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{4aaed937-1c6f-45cd-812d-75423db7dc9a}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_devicename := cfgDeviceName;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgEnable" Id="{edad16e8-07e4-4123-900e-1947e0ada583}">
+      <Declaration><![CDATA[PROPERTY cfgEnable : bool]]></Declaration>
+      <Get Name="Get" Id="{f8c81af5-7cea-448b-9af4-69776c760751}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgEnable := _enabled;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a6e2c12b-f15d-47e9-b7ca-0e2f06f15827}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_enabled := cfgEnable;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgModbusConfig" Id="{1741ef67-c259-4c4a-a6aa-f8fc75e5ce0a}">
+      <Declaration><![CDATA[PROPERTY cfgModbusConfig : ST_Modbus_Device_Config]]></Declaration>
+      <Get Name="Get" Id="{51d2b961-7a40-49b3-a3ed-c2700ca4b1f9}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgModbusConfig := _modbus_cfg;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{017f409a-0410-495d-bbab-fe38e623120d}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_modbus_cfg := cfgModbusConfig;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdReadDI" Id="{caaf94e6-11fc-483c-bb9c-25e41fdeb926}">
+      <Declaration><![CDATA[METHOD cmdReadDI : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE _modbus_RC_state OF
+	0:
+		_modbus_IF.ReadInputs.nQuantity := SIZEOF(_DIState);
+		_modbus_IF.ReadInputs.cbLength  := SIZEOF(_DIState);
+		_modbus_IF.ReadInputs.pDestAddr := ADR(_DIState);
+		_modbus_IF.ReadInputs.bExecute  := TRUE;
+		_modbus_RC_state := 1;
+	1:
+		_modbus_IF.ReadInputs.bExecute := FALSE;
+		_DIReadDelayTrig := TRUE;
+		IF _DIReadDelay.Q THEN
+			_DIReadDelayTrig := FALSE;
+			_modbus_RC_state := 0;
+		END_IF
+END_CASE]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{6e5b785e-5d6b-4e68-9f98-615522945602}">
+      <Declaration><![CDATA[METHOD cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsFaulted THEN
+	setFault(0,'');
+	IF _commFault = TRUE THEN
+		_commFault := FALSE;
+		_modbus_IF.WriteSingleCoil.bExecute:= FALSE;
+		_modbus_WC_state  := 0;
+	END_IF
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdSetDO" Id="{7424d672-3595-446f-8555-5aa06803936e}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdSetDO : BOOL
+VAR_INPUT
+	setRequest	: Bool;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE _modbus_WC_state OF
+	0:
+		IF setRequest = TRUE THEN
+			_modbus_IF.WriteSingleCoil.nValue := 65280;
+		ELSE
+			_modbus_IF.WriteSingleCoil.nValue := 0;
+		END_IF
+		
+		_modbus_IF.WriteSingleCoil.bExecute := TRUE;
+		IF _modbus_IF.WriteSingleCoil.bBusy = TRUE THEN
+			_modbus_WC_state := 1;
+		END_IF
+	1:
+		_modbus_IF.WriteSingleCoil.bExecute := FALSE;
+		_DOWriteDelayTrig := TRUE;
+		IF _DOWriteDelay.Q THEN
+			_DOWriteDelayTrig := FALSE;
+			_modbus_WC_state := 0;
+		END_IF
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FaultHandler" Id="{86944e71-c628-45b9-8f22-50eca9947c99}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD FaultHandler : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _modbus_IF.WriteSingleCoil.bError THEN
+	setFault(1,'Comms. Write Fault');
+	_commFault := TRUE;
+END_IF
+
+IF _modbus_IF.ReadInputs.bError THEN
+	setFault(1,'Comms. Read Fault');
+	_commFault := TRUE;
+END_IF
+
+IF NOT interlock.outInterlockOK THEN
+	setFault(1,CONCAT('I_NOK - ',Interlock.stsFirstOut));
+END_IF
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{f92d27e4-c898-4d5c-b910-7eb474cdf105}" FolderPath="Privates\">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init: BOOL
+VAR_INPUT
+    bInitRetains		: BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode			: BOOL;  // TRUE: the instance will be copied to the copy code afterward (online change)  
+	cfgDeviceName		: STRING;
+	cfgEnable			: BOOL; 
+	cfgInitEventClass	: BOOL;    
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 		:= 		cfgDeviceName; 		
+THIS^.cfgEnable 			:= 	    cfgEnable;
+THIS^.cfgInitEventClass		:= 		cfgInitEventClass;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

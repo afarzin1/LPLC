@@ -1,0 +1,1413 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Axis" Id="{17b8c9d0-e1f2-3456-0167-456789000006}" SpecialFunc="None">
+    <Declaration><![CDATA[// Single-axis wrapper. Extends abs_fb_Device for fault/interlock/event infrastructure.
+// Axis-level interlocks are set externally via cmdSetInterlock (inherited).
+// Move-level interlocks live in each move's ST_Interlock field; a parallel array of
+// fb_Interlock instances (one per slot) evaluates them every scan.
+FUNCTION_BLOCK fb_Axis EXTENDS abs_fb_Device
+VAR_INPUT
+    // Inherited from abs_fb_Device:
+    //   inpAuto            : BOOL  -- machine in automatic mode
+    //   inpReset           : BOOL  -- machine-level reset (resets axis)
+    //   inpInterlockBypass : BOOL  -- bypass axis-level interlock
+    //   faultMonitor       : POINTER TO fb_FaultMonitor
+    inpSTO  : BOOL;     // Safe Torque Off feedback - TRUE = STO not active (normal), FALSE = STO active
+                        // Safety program provides ~350ms between STP drop and STO activation.
+                        // Falling edge immediately triggers MC_Stop for graceful decel in that window.
+    // Global velocity override (machine-wide). Wire from a machine-level source (e.g. a shared
+    // GVL) so one control can drive many axes. When inpGlobalOverrideEnable is TRUE the effective
+    // velocity override is inpGlobalOverride [%]; otherwise the axis-local override set from the
+    // HMI. Reported via stsVelocityOverride (effective value) + stsGlobalOverrideActive.
+    inpGlobalOverrideEnable : BOOL;   // TRUE = follow the global override; FALSE = use local
+    inpGlobalOverride       : INT;    // [%] global velocity override, clamped 0..100 (0 = axis held)
+
+    // Physical teach-pendant jog (hardware-wired, level-triggered like the HMI jog). Routed
+    // through the SAME _mcJog and the same safety gating as HMI jog — never a second motion
+    // source. inpPendantEnable is the dead-man/arbiter: while held the pendant OWNS the jog and
+    // the HMI jog buttons are locked out, so the two can't command opposite directions. Manual
+    // mode only, same as HMI jog. Reported via HMI.Status.stsJogSource.
+    inpPendantEnable   : BOOL;    // dead-man / enable - must be held for pendant jog (and to take ownership)
+    inpPendantJogPos   : BOOL;    // jog forward  (level: held = jog)
+    inpPendantJogNeg   : BOOL;    // jog backward (level: held = jog)
+    inpPendantJogVelo  : LREAL;   // [unit/s]  pendant jog velocity     (<= 0 = use configured jog velocity)
+    inpPendantJogAccel : LREAL;   // [unit/s²] pendant jog acceleration (<= 0 = use configured jog accel)
+END_VAR
+
+VAR_IN_OUT
+    Axis  : AXIS_REF;
+END_VAR
+
+VAR_OUTPUT
+    stsEnabled    : BOOL;   // drive powered (MC_Power.Status)
+    stsMoving     : BOOL;   // axis in motion
+    stsStandstill : BOOL;   // powered and at rest
+    stsInTarget   : BOOL;   // within position target window
+    stsMoveDone   : BOOL;   // last position/velocity move reached setpoint
+    stsCurrentMove: INT;    // index of current/last executed move (0 = none)
+    // Live process values, also exposed as direct outputs (not just via HMI.Status) so the
+    // calling program can wire them to charts / data logging / other logic. Sourced from Axis.NcToPlc.
+    stsActualPosition : LREAL;   // [unit]   actual position (Axis.NcToPlc.ActPos)
+    stsActualVelocity : LREAL;   // [unit/s] actual velocity (Axis.NcToPlc.ActVelo)
+    stsActualTorque   : LREAL;   // [% or Nm] actual torque (Axis.NcToPlc.ActTorque)
+    // Setpoints (paired with the actuals above). Position/velocity come from the NC
+    // setpoint generator (Axis.NcToPlc.Set*). There is NO NC torque setpoint — torque is
+    // commanded straight to the drive — so stsSetTorque is the torque this FB is commanding
+    // (active move's torque, torque-jog value, or 0).
+    stsSetPosition    : LREAL;   // [unit]   commanded position (Axis.NcToPlc.SetPos)
+    stsSetVelocity    : LREAL;   // [unit/s] commanded velocity (Axis.NcToPlc.SetVelo)
+    stsSetTorque      : LREAL;   // [% or Nm] commanded torque (FB-tracked; no NC setpoint exists)
+END_VAR
+
+VAR
+    // Public HMI interface - the struct an HMI (e.g. lhmi) binds
+    HMI             : ST_Axis_HMI_Interface;
+
+    // Per-move interlock FBs (parallel to moves array; cannot embed FB in struct)
+    _moveInterlocks : ARRAY[1..20] OF fb_Interlock;
+
+    // MC Function Blocks
+    _mcPower        : MC_Power;
+    _mcReset        : MC_Reset;
+    _mcStop         : MC_Stop;
+    _mcHalt         : MC_Halt;
+    _mcMoveAbs      : MC_MoveAbsolute;
+    _mcMoveRel      : MC_MoveRelative;
+    _mcMoveVel      : MC_MoveVelocity;
+    _mcTorque       : MC_TorqueControl;     // Tc2_MC2 torque mode with continuous setpoint updates
+    _mcTorqueJog    : MC_TorqueControl;     // dedicated instance for interactive torque-jog (dead-man)
+    _mcJog          : MC_Jog;
+    _mcHome         : MC_Home;          // MC_Direct: sets position only (does NOT set calibrated flag)
+    _mcForceCal     : MC_Home;          // MC_ForceCalibration: sets the calibrated/Homed flag without moving
+    _mcOverride     : MC_SetOverride;
+    _mcJogGoto      : MC_MoveAbsolute;   // position jog ("go to position") - dedicated instance, section 12c
+
+    // Internal state
+    _isEnabled          : BOOL;
+    _externalControl    : BOOL;
+    _currentMoveIndex   : INT;
+    _activeMoveMode     : E_Axis_Mode;
+    _moveExecState      : INT;          // 0=idle, 1=abort-scan, 2=executing
+    _startMoveReq       : BOOL;
+    _pendingIndex       : INT;
+    _pendingMode        : E_Axis_Mode;
+
+    _stopCmd            : BOOL;         // MC_Stop active - locked until cmdReset
+    _haltCmd            : BOOL;         // MC_Halt active - auto-clears on done
+    _resetCmd           : BOOL;
+    _homeCmd            : BOOL;
+    _homeStep           : INT;          // 0=idle, 1=MC_Direct (set pos), 2=MC_ForceCalibration (set Homed)
+    _homePosition       : LREAL;
+
+    // --- Home diagnostics: MC_Direct/MC_ForceCalibration finish in ~1 scan (no motion),
+    //     so Done/Busy/Active pulses are invisible online. These LATCH so you can eyeball
+    //     what happened after a home. All reset at the start of each cmdHome. ---
+    _dbgHomeMaxStep     : INT;          // highest _homeStep reached (want 2)
+    _dbgHomeDirectDone  : BOOL;         // MC_Direct (step 1) reported Done
+    _dbgHomeCalDone     : BOOL;         // MC_ForceCalibration (step 2) reported Done
+    _dbgHomeCalError    : BOOL;         // MC_ForceCalibration reported Error
+    _dbgHomeCalErrID    : UDINT;        // ...its ErrorID
+
+    _jogPositive        : BOOL;
+    _jogNegative        : BOOL;
+    _jogVelocity        : LREAL := 10.0;
+    _jogAccel           : LREAL := 100.0;
+    _jogSource          : E_Axis_JogSource;    // which input owns the jog this scan (HMI vs pendant)
+    _jogVeloEff         : LREAL := 10.0;        // effective jog velocity fed to _mcJog (pendant speed when it owns; else _jogVelocity)
+    _jogAccelEff        : LREAL := 100.0;       // effective jog accel    fed to _mcJog
+    // Position jog ("go to position"): discrete absolute move, jog subvariant (see section 12c).
+    _jogGotoTarget      : LREAL;            // [unit] operator-entered absolute target (angle or mm)
+    _jogGotoBusy        : BOOL;             // go-to move in progress - mutually exclusive with jog / moves / home
+    _jogTorqueLimit     : LREAL;            // [Nm or %] global overtorque trip for position jog (0 = no limit).
+                                            //   Exceed → locked MC_Stop + fault 'Overtorque limit: jog'.
+                                            //   Applies to position jog only; torque-jog is bounded by _torqueJogMaxLimit.
+
+    // Torque jog (dead-man interactive torque). Held → command the entered torque; released
+    // → command 0 (ramps down) and disengage once actual torque ~0 (stays enabled, no MC_Stop).
+    _torqueJogActive    : BOOL;             // button held this scan (gated) → apply torque
+    _torqueJogEngaged   : BOOL;             // block active: held, or ramping back to 0 after release
+    _torqueJogValue     : LREAL;            // clamped live torque setpoint [% rated]
+    _torqueJogRamp      : LREAL := 500.0;   // [% rated/s] ramp for torque changes / release
+    _torqueJogMaxLimit  : LREAL := 100.0;   // [% rated] absolute clamp on the entered torque
+    _tjMaxVelInit       : BOOL;             // FALSE until the retained _tjMaxVel is echoed to the HMI once (re-armed each restart)
+
+    _velocityOverride   : LREAL := 100.0;   // [%] 0-100 (axis-local, set from HMI)
+    _accelOverride      : LREAL := 100.0;   // [%] 0-100
+    _activeVelocityOverride : LREAL := 100.0;   // [%] effective override actually applied (global if enabled, else local)
+    _stopDecel          : LREAL := 1000.0;  // [unit/s²] decel for MC_Stop
+    _haltDecel          : LREAL := 100.0;   // [unit/s²] decel for MC_Halt
+
+    // [% rated] |ActTorque| below this = torque released → torque-jog disengages
+    // (see section 12b). Also the "torque is back to ~0" threshold after a released dead-man.
+    _stopTorqueThreshold : LREAL := 1.0;
+
+    _axisType           : E_Axis_UnitType := E_Axis_UnitType.eLinear;  // HMI: linear vs rotary
+    _unit               : STRING := 'mm';   // HMI position unit label (velocity = unit + '/s')
+    // TRUE = the NC axis is configured as modulo. NC config carries no runtime "modulo on/off"
+    // flag in the cyclic image, so it's declared here (like _axisType/_unit). Drives which
+    // position the HMI shows: modulo (Axis.NcToPlc.ModuloActPos, wrapped into one period) vs the
+    // accumulated Axis.NcToPlc.ActPos. Orthogonal to _axisType — a rotary axis need not be modulo.
+    _isModulo           : BOOL;
+
+    _selectedMove       : INT;          // HMI move staged for confirmation
+    _confirmPending     : BOOL;
+    _hmiMoveConfigLoaded: BOOL;
+    _moveConfigApplyError: BOOL;
+    _moveConfigErrorText : STRING;
+
+    _stoFallingEdge     : F_TRIG;       // detects STO drop for graceful stop initiation
+
+    _i                  : INT;          // loop index
+    _moveConfigValid    : BOOL;
+END_VAR
+
+VAR PERSISTENT
+    // FB-owned live move table. HMI.Config.moves is an edit buffer; accepted
+    // edits are copied here and retained with the fb_Axis instance.
+    moves : ARRAY[1..20] OF ST_Axis_MoveDefinition;
+    // Torque-jog overspeed trip [unit/s], 0 = off. Retained across restart; edited live
+    // from HMI.Commands.ocmdTorqueJogMaxVel (see the torque-jog section, ~12b).
+    _tjMaxVel : LREAL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ── 1. Base device logic ─────────────────────────────────────────────────────
+// Processes axis-level interlock, raises/clears fault events, updates HMIbasedevice.
+// Also calls cmdReset() if inpReset is TRUE (machine reset resets axis).
+DeviceLogic();
+
+// Refresh the decoded AXIS_REF.Status snapshot from the cyclic NcToPlc data BEFORE
+// anything reads Axis.Status.* this scan. Without this, Status fields (notably
+// .Homed/calibrated) can lag the real NC state even though the NC faceplate shows
+// it correctly — Status is only guaranteed current right after ReadStatus().
+Axis.ReadStatus();
+
+// ── 2. Evaluate all move interlocks each scan ─────────────────────────────────
+FOR _i := 1 TO 20 DO
+    _moveInterlocks[_i].name := CONCAT(moves[_i].moveName, '_ILK');
+    _moveInterlocks[_i](inpConfig := moves[_i].interlock);
+END_FOR
+
+IF NOT _hmiMoveConfigLoaded THEN
+    FOR _i := 1 TO 20 DO
+        HMI.Config.moves[_i] := moves[_i];
+    END_FOR
+    _hmiMoveConfigLoaded := TRUE;
+END_IF
+
+// ── 3. HMI commands ───────────────────────────────────────────────────────────
+// Reset is accepted in both auto and manual.
+IF HMI.Commands.ocmdReset THEN
+    HMI.Commands.ocmdReset := FALSE;
+    cmdReset();
+END_IF
+
+IF NOT _inAuto THEN
+
+    IF HMI.Commands.ocmdEnable THEN
+        HMI.Commands.ocmdEnable := FALSE;
+        cmdEnable();
+    END_IF
+
+    IF HMI.Commands.ocmdDisable THEN
+        HMI.Commands.ocmdDisable := FALSE;
+        cmdDisable();
+    END_IF
+
+    IF HMI.Commands.ocmdStop THEN
+        HMI.Commands.ocmdStop := FALSE;
+        cmdStop();
+    END_IF
+
+    IF HMI.Commands.ocmdHome THEN
+        HMI.Commands.ocmdHome := FALSE;
+        cmdHome(HMI.Config.homePosition);
+    END_IF
+
+    // Position jog ("go to position"): run a discrete absolute move to the entered target.
+    IF HMI.Commands.ocmdJogGoto THEN
+        HMI.Commands.ocmdJogGoto := FALSE;
+        cmdJogGoto(HMI.Commands.ocmdJogGotoPos);
+    END_IF
+
+    // Move selection: two-step - select then confirm
+    IF HMI.Commands.ocmdSelectMove >= 1 AND HMI.Commands.ocmdSelectMove <= 20 THEN
+        _selectedMove   := HMI.Commands.ocmdSelectMove;
+        _confirmPending := TRUE;
+        HMI.Commands.ocmdSelectMove := 0;
+    END_IF
+
+    IF HMI.Commands.ocmdCancelSelect THEN
+        HMI.Commands.ocmdCancelSelect := FALSE;
+        _selectedMove   := 0;
+        _confirmPending := FALSE;
+    END_IF
+
+    IF HMI.Commands.ocmdReloadMoveConfig THEN
+        HMI.Commands.ocmdReloadMoveConfig := FALSE;
+        FOR _i := 1 TO 20 DO
+            HMI.Config.moves[_i] := moves[_i];
+        END_FOR
+        _moveConfigApplyError := FALSE;
+        _moveConfigErrorText  := '';
+    END_IF
+
+    IF HMI.Commands.ocmdApplyMoveConfig THEN
+        HMI.Commands.ocmdApplyMoveConfig := FALSE;
+
+        IF _moveExecState <> 0 OR Axis.Status.DiscreteMotion OR Axis.Status.ContinuousMotion OR Axis.Status.Stopping THEN
+            _moveConfigApplyError := TRUE;
+            _moveConfigErrorText  := 'Cannot apply move config while axis is active';
+        ELSE
+            _moveConfigValid := TRUE;
+            _moveConfigErrorText := '';
+
+            FOR _i := 1 TO 20 DO
+                IF HMI.Config.moves[_i].velocity < 0.0 THEN
+                    _moveConfigValid := FALSE;
+                    _moveConfigErrorText := CONCAT('Move velocity < 0 at index ', INT_TO_STRING(_i));
+                ELSIF HMI.Config.moves[_i].acceleration < 0.0 THEN
+                    _moveConfigValid := FALSE;
+                    _moveConfigErrorText := CONCAT('Move acceleration < 0 at index ', INT_TO_STRING(_i));
+                ELSIF HMI.Config.moves[_i].deceleration < 0.0 THEN
+                    _moveConfigValid := FALSE;
+                    _moveConfigErrorText := CONCAT('Move deceleration < 0 at index ', INT_TO_STRING(_i));
+                ELSIF HMI.Config.moves[_i].jerk < 0.0 THEN
+                    _moveConfigValid := FALSE;
+                    _moveConfigErrorText := CONCAT('Move jerk < 0 at index ', INT_TO_STRING(_i));
+                ELSIF HMI.Config.moves[_i].torqueRamp < 0.0 THEN
+                    _moveConfigValid := FALSE;
+                    _moveConfigErrorText := CONCAT('Move torque ramp < 0 at index ', INT_TO_STRING(_i));
+                ELSIF HMI.Config.moves[_i].cfgTorqueLimit < 0.0 THEN
+                    _moveConfigValid := FALSE;
+                    _moveConfigErrorText := CONCAT('Move torque limit < 0 at index ', INT_TO_STRING(_i));
+                END_IF
+            END_FOR
+
+            IF _moveConfigValid THEN
+                FOR _i := 1 TO 20 DO
+                    moves[_i] := HMI.Config.moves[_i];
+                END_FOR
+                _selectedMove := 0;
+                _confirmPending := FALSE;
+                _moveConfigApplyError := FALSE;
+                _moveConfigErrorText  := '';
+            ELSE
+                _moveConfigApplyError := TRUE;
+            END_IF
+        END_IF
+    END_IF
+
+    // Always self-clear ocmdRunMove when seen — otherwise a Run pressed with nothing staged
+    // (or after reset/disable cleared _confirmPending) latches TRUE and auto-fires the NEXT
+    // Select. Only actually start a move when one is staged.
+    IF HMI.Commands.ocmdRunMove THEN
+        HMI.Commands.ocmdRunMove := FALSE;
+        IF _confirmPending THEN
+            _confirmPending := FALSE;
+            cmdStart(_selectedMove);
+        END_IF
+    END_IF
+
+    // Jog arbitration: physical teach pendant vs HMI. Level-triggered - hold to jog. Both feed the
+    // ONE _mcJog (section 12); they are never two motion sources. The pendant's dead-man
+    // (inpPendantEnable) is the arbiter: while held the pendant OWNS jog and the HMI jog buttons are
+    // ignored, so the two can't fight over direction. Within a source, forward AND backward together
+    // is contradictory -> no request (no motion). Blocked while homing / mid-move / torque-jogging.
+    IF _externalControl OR _jogGotoBusy THEN
+        // Yielded to a coordinator (e.g. fb_CamCoupler) or a go-to move is running - no speed jog.
+        _jogSource   := E_Axis_JogSource.eNone;
+        _jogPositive := FALSE;
+        _jogNegative := FALSE;
+    ELSIF inpPendantEnable THEN
+        _jogSource   := E_Axis_JogSource.ePendant;
+        _jogPositive := inpPendantJogPos AND NOT inpPendantJogNeg AND NOT _homeCmd AND (_moveExecState = 0);
+        _jogNegative := inpPendantJogNeg AND NOT inpPendantJogPos AND NOT _homeCmd AND (_moveExecState = 0);
+    ELSIF HMI.Commands.ocmdJogPositive AND NOT HMI.Commands.ocmdJogNegative AND NOT HMI.Commands.ocmdTorqueJog AND NOT _homeCmd AND (_moveExecState = 0) THEN
+        _jogSource   := E_Axis_JogSource.eHMI;
+        _jogVelocity := SEL(HMI.Commands.ocmdJogVelocity     > 0.0, _jogVelocity, HMI.Commands.ocmdJogVelocity);
+        _jogAccel    := SEL(HMI.Commands.ocmdJogAcceleration > 0.0, _jogAccel,    HMI.Commands.ocmdJogAcceleration);
+        _jogPositive := TRUE;
+        _jogNegative := FALSE;
+    ELSIF HMI.Commands.ocmdJogNegative AND NOT HMI.Commands.ocmdJogPositive AND NOT HMI.Commands.ocmdTorqueJog AND NOT _homeCmd AND (_moveExecState = 0) THEN
+        _jogSource   := E_Axis_JogSource.eHMI;
+        _jogVelocity := SEL(HMI.Commands.ocmdJogVelocity     > 0.0, _jogVelocity, HMI.Commands.ocmdJogVelocity);
+        _jogAccel    := SEL(HMI.Commands.ocmdJogAcceleration > 0.0, _jogAccel,    HMI.Commands.ocmdJogAcceleration);
+        _jogNegative := TRUE;
+        _jogPositive := FALSE;
+    ELSE
+        _jogSource   := E_Axis_JogSource.eNone;
+        _jogPositive := FALSE;
+        _jogNegative := FALSE;
+    END_IF
+
+    // Torque jog: dead-man. Held = command the entered torque; gated the same as jog
+    // (no home, no running move, no position jog). Release/engage + ramp handled in section 12b.
+    _torqueJogActive := HMI.Commands.ocmdTorqueJog
+        AND NOT _externalControl AND NOT _jogGotoBusy
+        AND NOT _jogPositive AND NOT _jogNegative
+        AND NOT _homeCmd AND (_moveExecState = 0);
+    IF _torqueJogActive THEN
+        _torqueJogValue := LIMIT(-_torqueJogMaxLimit, HMI.Commands.ocmdTorqueJogValue, _torqueJogMaxLimit);
+    END_IF
+
+    IF HMI.Commands.ocmdVelocityOverride > 0.0 AND HMI.Commands.ocmdVelocityOverride <= 100.0 THEN
+        _velocityOverride := HMI.Commands.ocmdVelocityOverride;
+    END_IF
+
+ELSE
+    // AUTO: no operator jogging. The jog arbitration above runs only in manual, so a jog or
+    // torque-jog button held across the manual -> auto switch would otherwise stay latched and
+    // keep the axis jogging (or applying torque) in Auto. Drop any jog an OPERATOR source owns;
+    // a jog started by PLC code through cmdJogPositive/cmdJogNegative has _jogSource = eNone and
+    // is left alone. Torque jog is operator-only, so it always stops (section 12b ramps it to 0).
+    IF _jogSource <> E_Axis_JogSource.eNone THEN
+        _jogSource   := E_Axis_JogSource.eNone;
+        _jogPositive := FALSE;
+        _jogNegative := FALSE;
+    END_IF
+    _torqueJogActive := FALSE;
+END_IF
+
+// ── 4. STO handling ──────────────────────────────────────────────────────────
+// STO active (inpSTO FALSE) is treated as a SOFT operational inhibit, not a fault:
+// MC_Power.Enable is gated by inpSTO at the level (section 6) so the drive can't be
+// powered while STO is active, and stsSafetyInhibited annunciates it. A semi-auto
+// sequence can open the guard, do a manual step, close it, and resume WITHOUT a reset.
+//
+// A fault is raised ONLY when STO drops while the axis was actually moving/commanded —
+// an uncommanded stop mid-motion must be acknowledged. In that case fire MC_Stop for a
+// graceful decel within the ~350ms window before hardware cuts torque, and latch a fault
+// (cleared by a deliberate cmdReset). No automatic restart: pending moves are always
+// dropped here, so motion never resumes on its own — a new cmdStart is required either way.
+_stoFallingEdge(CLK := inpSTO);
+IF _stoFallingEdge.Q THEN
+    // Cancel any pending / held motion commands regardless of case.
+    _haltCmd       := FALSE;
+    _jogPositive   := FALSE;
+    _jogNegative   := FALSE;
+    _homeCmd       := FALSE;
+    _startMoveReq  := FALSE;
+    _jogGotoBusy   := FALSE;
+    // Abnormal only: was moving / mid-move / applying torque → graceful stop + latched fault.
+    // (Jog and position moves show up as NC Discrete/ContinuousMotion; torque paths via
+    // _moveExecState / _torqueJogEngaged.) Evaluate BEFORE zeroing _moveExecState below.
+    IF    Axis.Status.DiscreteMotion OR Axis.Status.ContinuousMotion OR Axis.Status.Stopping
+       OR (_moveExecState <> 0) OR _torqueJogEngaged THEN
+        _stopCmd := TRUE;
+        setFault(TRUE, 'STO during motion');
+    END_IF
+    _moveExecState := 0;
+END_IF
+
+// ── 5. Axis interlock loss during motion → forced stop ────────────────────────
+// Safety event: use MC_Stop (locked standstill, not interruptible).
+IF _mcPower.Status AND NOT Interlock.outInterlockOK THEN
+    IF Axis.Status.DiscreteMotion OR Axis.Status.ContinuousMotion OR Axis.Status.Stopping THEN
+        _stopCmd       := TRUE;
+        _haltCmd       := FALSE;
+        _jogPositive   := FALSE;
+        _jogNegative   := FALSE;
+        _homeCmd       := FALSE;
+        _startMoveReq  := FALSE;
+        _jogGotoBusy   := FALSE;
+        _moveExecState := 0;
+        IF NOT stsFaulted THEN
+            setFault(TRUE, CONCAT('I_NOK during motion: ', Interlock.stsFirstOut));
+        END_IF
+    END_IF
+END_IF
+
+// ── 6. MC_Power ───────────────────────────────────────────────────────────────
+// inpSTO gates Enable at the level: drive cannot be powered while STO is active,
+// regardless of software enable state or fault clear.
+_mcPower(
+    Axis            := Axis,
+    Enable          := _isEnabled AND NOT stsFaulted AND inpSTO,
+    Enable_Positive := TRUE,
+    Enable_Negative := TRUE,
+    Override        := 1.0,
+    BufferMode      := 0
+);
+
+// ── 7. MC_Reset ───────────────────────────────────────────────────────────────
+_mcReset(Axis := Axis, Execute := _resetCmd);
+IF _mcReset.Done OR _mcReset.Error THEN
+    _resetCmd := FALSE;
+END_IF
+
+// ── 8. MC_Stop (forced standstill) ───────────────────────────────────────────
+// _stopCmd remains TRUE until cmdReset clears it.
+_mcStop(
+    Axis         := Axis,
+    Execute      := _stopCmd,
+    Deceleration := _stopDecel,
+    Jerk         := 0.0
+);
+
+// ── 9. MC_Halt (interruptible stop) ──────────────────────────────────────────
+// Auto-clears when standstill reached; new cmdStart can resume.
+_mcHalt(
+    Axis         := Axis,
+    Execute      := _haltCmd,
+    Deceleration := _haltDecel,
+    Jerk         := 0.0
+);
+IF _mcHalt.Done THEN
+    _haltCmd := FALSE;
+END_IF
+
+// ── 10. Home ─────────────────────────────────────────────────────────────────
+// Two-step home: MC_Direct sets the actual position, but does NOT raise the axis
+// calibrated/Homed flag. MC_ForceCalibration then sets that flag (no motion, no
+// position change). _homeCmd stays TRUE across both steps so all "home active"
+// gates (jog/move blocking, fault) remain valid for the whole sequence.
+IF NOT _homeCmd THEN
+    _homeStep := 0;                     // sequence aborted elsewhere (stop/reset) → reset step
+END_IF
+
+// Step 1: set position
+_mcHome(
+    Axis       := Axis,
+    Execute    := _homeCmd AND (_homeStep = 1),
+    Position   := _homePosition,
+    HomingMode := MC_Direct
+);
+IF _mcHome.Done THEN
+    _homeStep          := 2;            // position set → now flag the axis as calibrated
+    _dbgHomeDirectDone := TRUE;         // latch (diagnostic)
+END_IF
+IF _mcHome.Error THEN
+    _homeCmd  := FALSE;
+    _homeStep := 0;
+    setFault(TRUE, CONCAT('Home error: ', UDINT_TO_STRING(_mcHome.ErrorID)));
+END_IF
+IF _homeStep > _dbgHomeMaxStep THEN _dbgHomeMaxStep := _homeStep; END_IF
+
+// Step 2: set calibrated/Homed flag
+_mcForceCal(
+    Axis       := Axis,
+    Execute    := _homeCmd AND (_homeStep = 2),
+    HomingMode := MC_ForceCalibration
+);
+IF _mcForceCal.Done THEN
+    _homeCmd        := FALSE;
+    _homeStep       := 0;
+    _dbgHomeCalDone := TRUE;            // latch (diagnostic)
+END_IF
+IF _mcForceCal.Error THEN
+    _homeCmd         := FALSE;
+    _homeStep        := 0;
+    _dbgHomeCalError := TRUE;           // latch (diagnostic)
+    _dbgHomeCalErrID := _mcForceCal.ErrorID;
+    setFault(TRUE, CONCAT('Home cal error: ', UDINT_TO_STRING(_mcForceCal.ErrorID)));
+END_IF
+
+// ── 11. Move execution state machine ──────────────────────────────────────────
+// _moveExecState: 0=idle, 1=one-scan-abort (all Execute FALSE), 2=executing
+// While yielded to an external coordinator (e.g. fb_CamCoupler), keep the state machine idle
+// so every move block is driven Execute:=FALSE and never fights the external coupling.
+IF _externalControl THEN
+    _moveExecState := 0;
+END_IF
+// Arm new move request (set by cmdStart)
+IF _startMoveReq AND NOT _stopCmd AND NOT _externalControl THEN
+    _startMoveReq     := FALSE;
+    _currentMoveIndex := _pendingIndex;
+    _activeMoveMode   := _pendingMode;
+    stsMoveDone       := FALSE;
+    _haltCmd          := FALSE;
+    _jogPositive      := FALSE;
+    _jogNegative      := FALSE;
+    IF _moveExecState = 2 THEN
+        _moveExecState := 1; // one clear scan before rising edge on new block
+    ELSE
+        _moveExecState := 2;
+    END_IF
+END_IF
+
+CASE _moveExecState OF
+
+    0, 1: // Idle or abort-scan: drive all move blocks with Execute FALSE
+        _mcMoveAbs(Axis := Axis, Execute := FALSE, Position := 0.0,     Velocity := 1.0, Acceleration := 1.0, Deceleration := 1.0, Jerk := 0.0);
+        _mcMoveRel(Axis := Axis, Execute := FALSE, Distance := 0.0,     Velocity := 1.0, Acceleration := 1.0, Deceleration := 1.0, Jerk := 0.0);
+        _mcMoveVel(Axis := Axis, Execute := FALSE);
+        _mcTorque( Axis := Axis, Execute := FALSE);
+        IF _moveExecState = 1 THEN
+            _moveExecState := 2; // transition to executing next scan
+        END_IF
+
+    2: // Executing - drive only the active mode block; others get Execute FALSE
+        CASE _activeMoveMode OF
+
+            E_Axis_Mode.eAbsolute:
+                _mcMoveAbs(
+                    Axis         := Axis,
+                    Execute      := TRUE,
+                    Position     := moves[_currentMoveIndex].position,
+                    Velocity     := moves[_currentMoveIndex].velocity,
+                    Acceleration := moves[_currentMoveIndex].acceleration,
+                    Deceleration := moves[_currentMoveIndex].deceleration,
+                    Jerk         := moves[_currentMoveIndex].jerk
+                );
+                _mcMoveRel(Axis := Axis, Execute := FALSE, Distance := 0.0,     Velocity := 1.0, Acceleration := 1.0, Deceleration := 1.0, Jerk := 0.0);
+                _mcMoveVel(Axis := Axis, Execute := FALSE);
+                _mcTorque( Axis := Axis, Execute := FALSE);
+                IF _mcMoveAbs.Done THEN
+                    stsMoveDone    := TRUE;
+                    _moveExecState := 0;
+                END_IF
+                IF _mcMoveAbs.Error THEN
+                    _moveExecState := 0;
+                    setFault(TRUE, CONCAT(CONCAT('Move [', CONCAT(moves[_currentMoveIndex].moveName, '] error: ')), UDINT_TO_STRING(_mcMoveAbs.ErrorID)));
+                END_IF
+
+            E_Axis_Mode.eRelative:
+                _mcMoveRel(
+                    Axis         := Axis,
+                    Execute      := TRUE,
+                    Distance     := moves[_currentMoveIndex].position,
+                    Velocity     := moves[_currentMoveIndex].velocity,
+                    Acceleration := moves[_currentMoveIndex].acceleration,
+                    Deceleration := moves[_currentMoveIndex].deceleration,
+                    Jerk         := moves[_currentMoveIndex].jerk
+                );
+                _mcMoveAbs(Axis := Axis, Execute := FALSE, Position := 0.0,     Velocity := 1.0, Acceleration := 1.0, Deceleration := 1.0, Jerk := 0.0);
+                _mcMoveVel(Axis := Axis, Execute := FALSE);
+                _mcTorque( Axis := Axis, Execute := FALSE);
+                IF _mcMoveRel.Done THEN
+                    stsMoveDone    := TRUE;
+                    _moveExecState := 0;
+                END_IF
+                IF _mcMoveRel.Error THEN
+                    _moveExecState := 0;
+                    setFault(TRUE, CONCAT(CONCAT('Move [', CONCAT(moves[_currentMoveIndex].moveName, '] error: ')), UDINT_TO_STRING(_mcMoveRel.ErrorID)));
+                END_IF
+
+            E_Axis_Mode.eVelocity:
+                _mcMoveVel(
+                    Axis         := Axis,
+                    Execute      := TRUE,
+                    Velocity     := moves[_currentMoveIndex].velocity,
+                    Acceleration := moves[_currentMoveIndex].acceleration,
+                    Deceleration := moves[_currentMoveIndex].deceleration,
+                    Jerk         := moves[_currentMoveIndex].jerk,
+                    Direction    := moves[_currentMoveIndex].direction
+                );
+                _mcMoveAbs(Axis := Axis, Execute := FALSE, Position := 0.0,     Velocity := 1.0, Acceleration := 1.0, Deceleration := 1.0, Jerk := 0.0);
+                _mcMoveRel(Axis := Axis, Execute := FALSE, Distance := 0.0,     Velocity := 1.0, Acceleration := 1.0, Deceleration := 1.0, Jerk := 0.0);
+                _mcTorque( Axis := Axis, Execute := FALSE);
+                IF _mcMoveVel.InVelocity THEN
+                    stsMoveDone := TRUE; // velocity setpoint reached; block stays active
+                END_IF
+                IF _mcMoveVel.Error THEN
+                    _moveExecState := 0;
+                    setFault(TRUE, CONCAT(CONCAT('Move [', CONCAT(moves[_currentMoveIndex].moveName, '] error: ')), UDINT_TO_STRING(_mcMoveVel.ErrorID)));
+                END_IF
+
+            E_Axis_Mode.eTorque:
+                // Direction in torque mode is the SIGN of Torque (MC_TorqueControl has
+                // no Direction input). moves[].direction is unused here.
+                _mcTorque(
+                    Axis             := Axis,
+                    Execute          := TRUE,
+                    ContinuousUpdate := TRUE,
+                    Torque           := moves[_currentMoveIndex].torque,
+                    TorqueRamp       := moves[_currentMoveIndex].torqueRamp
+                );
+                _mcMoveAbs(Axis := Axis, Execute := FALSE, Position := 0.0,     Velocity := 1.0, Acceleration := 1.0, Deceleration := 1.0, Jerk := 0.0);
+                _mcMoveRel(Axis := Axis, Execute := FALSE, Distance := 0.0,     Velocity := 1.0, Acceleration := 1.0, Deceleration := 1.0, Jerk := 0.0);
+                _mcMoveVel(Axis := Axis, Execute := FALSE);
+                IF _mcTorque.InTorque THEN
+                    stsMoveDone := TRUE; // torque setpoint reached; block stays active
+                END_IF
+                IF _mcTorque.Error THEN
+                    _moveExecState := 0;
+                    setFault(TRUE, CONCAT(CONCAT('Move [', CONCAT(moves[_currentMoveIndex].moveName, '] error: ')), UDINT_TO_STRING(_mcTorque.ErrorID)));
+                END_IF
+                // Software velocity limit: MC_TorqueControl has no velocity clamp and this
+                // drive can't enforce one, so torque mode could run away (e.g. wire break).
+                // moves[].velocity is reused as the max |velocity| permitted during torque.
+                // Trip a locked MC_Stop + fault if exceeded. (Tune with margin/debounce if it
+                // nuisance-trips on transients.)
+                IF moves[_currentMoveIndex].velocity > 0.0
+                   AND ABS(Axis.NcToPlc.ActVelo) > moves[_currentMoveIndex].velocity THEN
+                    _stopCmd       := TRUE;
+                    _moveExecState := 0;
+                    setFault(TRUE, CONCAT('Torque velo limit: ', moves[_currentMoveIndex].moveName));
+                END_IF
+
+        END_CASE
+
+        // Overtorque limit: fault if |actual torque| exceeds this move's configured limit
+        // during execution. Unlike the torque-mode velocity watchdog (above), this applies to
+        // EVERY mode — a jam/collision on a position or velocity move shows up as excess torque
+        // just as on a torque move. moves[].cfgTorqueLimit = 0 disables the check. Trip → locked
+        // MC_Stop + fault (cmdReset required), matching the velocity watchdog. Guarded on
+        // _moveExecState = 2 so a move that just completed/errored this scan can't also trip.
+        // (Add a debounce TON here if it nuisance-trips on accel transients.)
+        IF _moveExecState = 2
+           AND moves[_currentMoveIndex].cfgTorqueLimit > 0.0
+           AND ABS(Axis.NcToPlc.ActTorque) > moves[_currentMoveIndex].cfgTorqueLimit THEN
+            _stopCmd       := TRUE;
+            _moveExecState := 0;
+            setFault(TRUE, CONCAT('Overtorque limit: ', moves[_currentMoveIndex].moveName));
+        END_IF
+
+END_CASE
+
+// ── 12. Jog ──────────────────────────────────────────────────────────────────
+// Level-triggered: hold = continuous jog. Requires axis interlock met (req. 4).
+// Effective jog dynamics: when the pendant owns the jog it supplies its own speed/accel
+// (falling back to the configured jog values if <= 0); HMI jog always uses the configured
+// values. Computed here so the pendant never overwrites the HMI's configured _jogVelocity.
+_jogVeloEff  := _jogVelocity;
+_jogAccelEff := _jogAccel;
+IF _jogSource = E_Axis_JogSource.ePendant THEN
+    IF inpPendantJogVelo  > 0.0 THEN _jogVeloEff  := inpPendantJogVelo;  END_IF
+    IF inpPendantJogAccel > 0.0 THEN _jogAccelEff := inpPendantJogAccel; END_IF
+END_IF
+
+_mcJog(
+    Axis         := Axis,
+    Mode         := MC_JOGMODE_CONTINOUS,
+    JogForward   := _jogPositive AND NOT _externalControl AND NOT _jogGotoBusy AND _mcPower.Status AND Interlock.outInterlockOK AND NOT stsFaulted AND NOT _stopCmd AND NOT _homeCmd AND NOT _torqueJogEngaged AND (_moveExecState = 0),
+    JogBackwards := _jogNegative AND NOT _externalControl AND NOT _jogGotoBusy AND _mcPower.Status AND Interlock.outInterlockOK AND NOT stsFaulted AND NOT _stopCmd AND NOT _homeCmd AND NOT _torqueJogEngaged AND (_moveExecState = 0),
+    Velocity     := _jogVeloEff,
+    Acceleration := _jogAccelEff
+);
+
+// Overtorque limit for position jog: global analogue of the per-move cfgTorqueLimit.
+// While jogging, trip a locked MC_Stop + fault if |actual torque| exceeds _jogTorqueLimit
+// (0 = disabled). Excludes torque-jog, which deliberately commands torque and is bounded by
+// its own _torqueJogMaxLimit clamp. MC_Stop reacts next scan (same 1-scan latency as the
+// STO / interlock-loss trips), and clearing the jog flags stops MC_Jog commanding.
+IF (_jogPositive OR _jogNegative)
+   AND _jogTorqueLimit > 0.0
+   AND ABS(Axis.NcToPlc.ActTorque) > _jogTorqueLimit THEN
+    _jogPositive := FALSE;
+    _jogNegative := FALSE;
+    _stopCmd     := TRUE;
+    IF NOT stsFaulted THEN
+        setFault(TRUE, 'Overtorque limit: jog');
+    END_IF
+END_IF
+
+// ── 12b. Torque jog (dead-man interactive torque) ─────────────────────────────
+// Engage on first press (while powered/safe/idle). Stay engaged while held OR until the
+// released torque has ramped back to ~0, so letting go RAMPS down instead of snapping.
+// Held → command the entered torque; released → command 0.0 (ramps at _torqueJogRamp).
+// Ends FREE at 0 torque, axis stays enabled — no MC_Stop, so no NC 0x4268. A max-velocity
+// trip cuts the torque command (ramps to 0) if the axis runs away, since torque control has
+// no speed clamp of its own. NOT safety-rated — the PLC interlocks/STO are.
+IF _torqueJogActive AND NOT _jogGotoBusy AND _mcPower.Status AND Interlock.outInterlockOK AND NOT stsFaulted AND NOT _stopCmd THEN
+    _torqueJogEngaged := TRUE;
+END_IF
+// Torque-jog overspeed trip [unit/s], 0 = disabled. PERSISTENT: the operator's value is
+// retained across PLC restart (backed by VAR PERSISTENT _tjMaxVel). On the first scan after
+// a (re)start, push the retained value OUT to the HMI field so the HMI shows it instead of
+// clobbering it with its power-up 0; from then on the HMI field is the live editor and its
+// value (including 0 = disable) is copied back into the persistent store. Assumes the HMI
+// reads the seeded value on (re)connect rather than immediately re-writing a cached one.
+IF NOT _tjMaxVelInit THEN
+    HMI.Commands.ocmdTorqueJogMaxVel := _tjMaxVel;   // seed HMI from retained value
+    _tjMaxVelInit := TRUE;
+ELSE
+    _tjMaxVel := HMI.Commands.ocmdTorqueJogMaxVel;   // operator edits → persist
+END_IF
+IF _torqueJogEngaged AND _tjMaxVel > 0.0 AND ABS(Axis.NcToPlc.ActVelo) > _tjMaxVel THEN
+    _torqueJogActive := FALSE;   // overspeed → stop commanding torque (ramp to 0)
+    setFault(TRUE, 'Torque-jog overspeed');
+END_IF
+_mcTorqueJog(
+    Axis             := Axis,
+    Execute          := _torqueJogEngaged AND NOT _externalControl AND NOT _jogGotoBusy AND _mcPower.Status AND Interlock.outInterlockOK AND NOT stsFaulted AND NOT _stopCmd,
+    ContinuousUpdate := TRUE,
+    Torque           := SEL(_torqueJogActive, 0.0, _torqueJogValue),   // held → value; released → 0
+    TorqueRamp       := _torqueJogRamp
+);
+// Release complete: not held and torque back to ~0 → disengage (drop Execute; drive holds 0/free).
+IF _torqueJogEngaged AND NOT _torqueJogActive AND ABS(Axis.NcToPlc.ActTorque) < _stopTorqueThreshold THEN
+    _torqueJogEngaged := FALSE;
+END_IF
+
+// ── 12c. Position jog ("go to position") ──────────────────────────────────────
+// Discrete absolute move to an operator-entered target (angle or mm) at the jog velocity/accel -
+// a jog subvariant selected on the HMI. Started by cmdJogGoto (via ocmdJogGoto). Mutually exclusive
+// with speed-jog / torque-jog / configured moves / home (gated here and in cmdJogGoto). Same safety
+// chain as jog: a stop / fault / STO / interlock loss aborts it via MC_Stop and clears _jogGotoBusy.
+// For a modulo axis this goes to the absolute target; shortest-path would use MC_MoveModulo (future).
+_mcJogGoto(
+    Axis         := Axis,
+    Execute      := _jogGotoBusy AND NOT _externalControl AND _mcPower.Status AND Interlock.outInterlockOK
+                    AND NOT stsFaulted AND NOT _stopCmd AND NOT _homeCmd AND (_moveExecState = 0)
+                    AND NOT _jogPositive AND NOT _jogNegative AND NOT _torqueJogEngaged,
+    Position     := _jogGotoTarget,
+    Velocity     := _jogVeloEff,
+    Acceleration := _jogAccelEff,
+    Deceleration := _jogAccelEff,
+    Jerk         := 0.0
+);
+IF _mcJogGoto.Done THEN
+    _jogGotoBusy := FALSE;               // reached target
+END_IF
+IF _mcJogGoto.CommandAborted THEN
+    _jogGotoBusy := FALSE;               // superseded by a stop / other command
+END_IF
+IF _mcJogGoto.Error THEN
+    _jogGotoBusy := FALSE;
+    setFault(TRUE, CONCAT('Jog goto error: ', UDINT_TO_STRING(_mcJogGoto.ErrorID)));
+END_IF
+
+// ── 13. Velocity override (local or global) ──────────────────────────────────
+// Effective velocity override = the machine-global value when inpGlobalOverrideEnable is set,
+// otherwise the axis-local _velocityOverride (set from HMI). The global INT [%] is clamped to
+// 0..100 (0 = axis held at 0%). Only the effective value is applied and reported. AccFactor
+// always tracks the local accel override.
+// VelFactor and AccFactor are 0.0 to 1.0 (MC_SetOverride convention).
+IF inpGlobalOverrideEnable THEN
+    _activeVelocityOverride := LIMIT(0.0, INT_TO_LREAL(inpGlobalOverride), 100.0);
+ELSE
+    _activeVelocityOverride := _velocityOverride;
+END_IF
+_mcOverride(
+    Axis      := Axis,
+    Enable    := _isEnabled,
+    VelFactor := _activeVelocityOverride / 100.0,
+    AccFactor := _accelOverride / 100.0
+);
+
+// ── 14. NC-level axis error detection ────────────────────────────────────────
+IF Axis.Status.Error AND NOT stsFaulted THEN
+    setFault(TRUE, CONCAT('Axis error: ', UDINT_TO_STRING(Axis.NcToPlc.ErrorCode)));
+END_IF
+
+// ── 15. Status outputs ───────────────────────────────────────────────────────
+stsEnabled    := _mcPower.Status;
+stsMoving     := Axis.Status.DiscreteMotion OR Axis.Status.ContinuousMotion;
+stsStandstill := Axis.Status.Standstill;
+stsInTarget   := Axis.Status.InTargetPosition;
+stsCurrentMove:= _currentMoveIndex;
+
+// ── 16. HMI status update ────────────────────────────────────────────────────
+// Inherited base-device HMI values (deviceName, enabled, stsInAuto, fault, interlock).
+// DeviceLogic() filled the inherited HMIbaseDevice VAR at the top of this scan.
+HMI.HMIbaseDevice              := HMIbaseDevice;
+HMI.Status.stsEnabled          := stsEnabled;
+HMI.Status.stsHomed            := Axis.Status.Homed;       // referenced/calibrated
+HMI.Status.stsStandstill       := stsStandstill;
+HMI.Status.stsMoving           := stsMoving;
+HMI.Status.stsInTargetPos      := stsInTarget;
+HMI.Status.stsError            := Axis.Status.Error;
+HMI.Status.stsErrorID          := Axis.NcToPlc.ErrorCode;
+// Full AXIS_REF.Status snapshot - exposes every status flag this lib version has
+HMI.Status.stsAxisStatus       := Axis.Status;
+// Live process values → outputs (single source), then mirror into HMI.Status.
+stsActualPosition := Axis.NcToPlc.ActPos;
+stsActualVelocity := Axis.NcToPlc.ActVelo;
+stsActualTorque   := Axis.NcToPlc.ActTorque;   // actual torque from drive
+HMI.Status.stsActualPosition   := stsActualPosition;
+HMI.Status.stsActualVelocity   := stsActualVelocity;
+HMI.Status.stsActualTorque     := stsActualTorque;
+// Modulo position: NC-computed, wrapped into one period. Always populated; the HMI shows it
+// instead of stsActualPosition only when stsIsModulo (set below). ActPos above is un-wrapped.
+HMI.Status.stsModuloActPos     := Axis.NcToPlc.ModuloActPos;
+HMI.Status.stsModuloActTurns   := Axis.NcToPlc.ModuloActTurns;
+// Setpoints → outputs (single source), then mirror into HMI.Status.
+stsSetPosition := Axis.NcToPlc.SetPos;
+stsSetVelocity := Axis.NcToPlc.SetVelo;
+// Commanded torque — no NC setpoint exists; report what the FB is feeding the drive.
+IF _torqueJogEngaged THEN
+    stsSetTorque := SEL(_torqueJogActive, 0.0, _torqueJogValue);          // held → value, releasing → 0
+ELSIF _moveExecState = 2 AND _activeMoveMode = E_Axis_Mode.eTorque THEN
+    stsSetTorque := moves[_currentMoveIndex].torque;                       // active torque move
+ELSE
+    stsSetTorque := 0.0;                                                   // idle / non-torque
+END_IF
+HMI.Status.stsSetPosition      := stsSetPosition;
+HMI.Status.stsSetVelocity      := stsSetVelocity;
+HMI.Status.stsSetTorque        := stsSetTorque;
+HMI.Status.stsFollowingError   := Axis.NcToPlc.SetPos - Axis.NcToPlc.ActPos;
+HMI.Status.stsHomeBusy         := _homeCmd;                              // whole 2-step sequence in progress
+HMI.Status.stsHomeDone         := _mcForceCal.Done;                      // sequence complete = calibrated flag set
+HMI.Status.stsHomeError        := _mcHome.Error OR _mcForceCal.Error;
+HMI.Status.stsHomeErrorID      := SEL(_mcForceCal.Error, _mcHome.ErrorID, _mcForceCal.ErrorID);
+HMI.Status.stsHomePosition     := _homePosition;
+HMI.Status.stsCurrentMoveIndex := _currentMoveIndex;
+IF _currentMoveIndex >= 1 AND _currentMoveIndex <= 20 THEN
+    HMI.Status.stsCurrentMoveName := moves[_currentMoveIndex].moveName;
+ELSE
+    HMI.Status.stsCurrentMoveName := '';
+END_IF
+HMI.Status.stsSelectedMove     := _selectedMove;
+HMI.Status.stsConfirmPending   := _confirmPending;
+HMI.Status.stsMoveConfigLoaded     := _hmiMoveConfigLoaded;
+HMI.Status.stsMoveConfigApplyError := _moveConfigApplyError;
+HMI.Status.stsMoveConfigErrorText  := _moveConfigErrorText;
+HMI.Status.stsMoveDone         := stsMoveDone;
+HMI.Status.stsMoveBusy         := (_moveExecState = 2);
+HMI.Status.stsActiveMoveMode   := _activeMoveMode;
+HMI.Status.stsExternalControl  := _externalControl;
+HMI.Status.stsAxisType         := _axisType;
+HMI.Status.stsUnit             := _unit;
+HMI.Status.stsIsModulo         := _isModulo;
+HMI.Status.stsVelocityOverride     := _activeVelocityOverride;   // effective: global if active, else local
+HMI.Status.stsGlobalOverrideActive := inpGlobalOverrideEnable;
+HMI.Status.stsJogVelocity      := _jogVeloEff;   // effective (pendant speed when it owns, else configured)
+HMI.Status.stsJogAcceleration  := _jogAccelEff;
+HMI.Status.stsJogSource        := _jogSource;    // none / HMI / pendant (which input owns the jog)
+HMI.Status.stsJogTorqueLimit   := _jogTorqueLimit;
+HMI.Status.stsTorqueJogActive  := _torqueJogEngaged;
+HMI.Status.stsTorqueJogMaxVel  := _tjMaxVel;
+HMI.Status.stsJogGotoBusy      := _jogGotoBusy;
+HMI.Status.stsJogGotoDone      := _mcJogGoto.Done;
+HMI.Status.stsJogGotoPos       := _jogGotoTarget;
+HMI.Status.stsSTO              := inpSTO;
+HMI.Status.stsSafetyInhibited  := NOT inpSTO;   // motion inhibited by safety (STO active) - not a fault
+FOR _i := 1 TO 20 DO
+    HMI.Status.moves[_i]          := moves[_i];
+    HMI.Status.moveInterlocks[_i] := _moveInterlocks[_i].getHMIdata();
+END_FOR
+]]></ST>
+    </Implementation>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         PUBLIC COMMAND METHODS
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Method Name="cmdStart" Id="{21c9d0e1-f2a3-4567-1278-567890000107}">
+      <Declaration><![CDATA[// Execute a pre-defined move by index (1-20).
+// Checks axis-level interlock then move-level interlock before arming.
+// Fault description format: "I_NOK: <description>" or "Move I_NOK: <description>"
+METHOD PUBLIC cmdStart : BOOL
+VAR_INPUT
+    moveIndex : INT;  // 1-20
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF moveIndex < 1 OR moveIndex > 20 THEN
+    RETURN;
+END_IF
+
+// Yielded to a coordinator - reject quietly. Do NOT setFault: a fault gates MC_Power (section 6)
+// and would drop the axis and break any active cam coupling.
+IF _externalControl THEN
+    cmdStart := FALSE;
+    RETURN;
+END_IF
+
+IF NOT _mcPower.Status THEN
+    setFault(TRUE, 'Axis not enabled');
+    RETURN;
+END_IF
+
+IF _homeCmd THEN
+    setFault(TRUE, 'Home active');
+    RETURN;
+END_IF
+
+IF _jogPositive OR _jogNegative THEN
+    setFault(TRUE, 'Cannot start move while jogging');
+    RETURN;
+END_IF
+
+IF _torqueJogEngaged THEN
+    setFault(TRUE, 'Cannot start move while torque-jogging');
+    RETURN;
+END_IF
+
+IF _jogGotoBusy THEN
+    setFault(TRUE, 'Cannot start move while going to position');
+    RETURN;
+END_IF
+
+IF NOT Interlock.outInterlockOK THEN
+    setFault(TRUE, CONCAT('I_NOK: ', Interlock.stsFirstOut));
+    RETURN;
+END_IF
+
+// Re-evaluate this move's interlock immediately (also runs in main body each scan)
+_moveInterlocks[moveIndex](inpConfig := moves[moveIndex].interlock);
+IF NOT _moveInterlocks[moveIndex].outInterlockOK THEN
+    setFault(TRUE, CONCAT('Move I_NOK: ', _moveInterlocks[moveIndex].stsFirstOut));
+    RETURN;
+END_IF
+
+_pendingIndex := moveIndex;
+_pendingMode  := moves[moveIndex].mode;
+_startMoveReq := TRUE;
+cmdStart      := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdHome" Id="{872f0647-f809-0123-78ef-000000000712}">
+      <Declaration><![CDATA[// Assign the axis home/reference position using MC_Home with HomingMode := MC_Direct.
+// This does not move the axis. It is accepted only while powered, safe, and idle.
+METHOD PUBLIC cmdHome : BOOL
+VAR_INPUT
+    homePosition : LREAL; // [unit]
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Yielded to a coordinator - reject quietly (a fault would drop power and break any coupling).
+IF _externalControl THEN
+    cmdHome := FALSE;
+    RETURN;
+END_IF
+
+IF NOT _mcPower.Status THEN
+    setFault(TRUE, 'Axis not enabled');
+    RETURN;
+END_IF
+
+IF _stopCmd THEN
+    setFault(TRUE, 'Stop active - reset required before homing');
+    RETURN;
+END_IF
+
+IF stsFaulted THEN
+    RETURN;
+END_IF
+
+IF NOT Interlock.outInterlockOK THEN
+    setFault(TRUE, CONCAT('I_NOK: ', Interlock.stsFirstOut));
+    RETURN;
+END_IF
+
+IF _moveExecState <> 0 OR _jogGotoBusy OR Axis.Status.DiscreteMotion OR Axis.Status.ContinuousMotion OR Axis.Status.Stopping THEN
+    setFault(TRUE, 'Cannot home while axis is active');
+    RETURN;
+END_IF
+
+_jogPositive      := FALSE;
+_jogNegative      := FALSE;
+_startMoveReq     := FALSE;
+_selectedMove     := 0;
+_confirmPending   := FALSE;
+_currentMoveIndex := 0;
+_homePosition     := homePosition;
+_homeCmd          := TRUE;
+_homeStep         := 1;             // start at step 1 (MC_Direct set position)
+// reset home diagnostics for this run
+_dbgHomeMaxStep    := 0;
+_dbgHomeDirectDone := FALSE;
+_dbgHomeCalDone    := FALSE;
+_dbgHomeCalError   := FALSE;
+_dbgHomeCalErrID   := 0;
+stsMoveDone       := FALSE;
+cmdHome           := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdEnable" Id="{32dae1f2-a3b4-5678-2389-678900000208}">
+      <Declaration><![CDATA[// Power on the axis. Blocked if axis-level interlock not met.
+METHOD PUBLIC cmdEnable : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF NOT inpSTO THEN
+    // STO active is a soft safety inhibit (see section 4), not a fault. Reject the enable
+    // quietly; stsSafetyInhibited tells the operator why. Enable succeeds once STO is restored.
+    cmdEnable := FALSE;
+    RETURN;
+END_IF
+
+IF NOT Interlock.outInterlockOK THEN
+    setFault(TRUE, CONCAT('I_NOK: ', Interlock.stsFirstOut));
+    cmdEnable := FALSE;
+    RETURN;
+END_IF
+
+_isEnabled := TRUE;
+cmdEnable  := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdDisable" Id="{43ebf203-b4c5-6789-34ab-789000000309}">
+      <Declaration><![CDATA[// Power off the axis. Clears jog and pending moves.
+METHOD PUBLIC cmdDisable : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_isEnabled     := FALSE;
+_jogPositive   := FALSE;
+_jogNegative   := FALSE;
+_homeCmd       := FALSE;
+_startMoveReq  := FALSE;
+_jogGotoBusy   := FALSE;
+_moveExecState := 0;
+cmdDisable     := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdStop" Id="{54fcf314-c5d6-7890-45bc-890000000410}">
+      <Declaration><![CDATA[// Forced standstill via MC_Stop. Axis stays locked until cmdReset is called.
+// Immediate for every case (idle, jog, position/velocity/torque move, already stopping).
+// NOTE: for a torque (CST) move this locks the axis into position hold while it was
+// applying torque; to instead release a torque hold cleanly, DISABLE the axis
+// (cmdDisable → MC_Power off drops torque). A graceful zero-then-stop was prototyped and
+// abandoned (couldn't reliably exit CST mode — NC 0x4268, setpoint generator inactive).
+METHOD PUBLIC cmdStop : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_jogPositive   := FALSE;
+_jogNegative   := FALSE;
+_homeCmd       := FALSE;
+_startMoveReq  := FALSE;
+_jogGotoBusy   := FALSE;
+
+_stopCmd       := TRUE;
+_haltCmd       := FALSE;
+_moveExecState := 0;
+cmdStop        := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdHalt" Id="{650df425-d6e7-8901-56cd-900000000511}">
+      <Declaration><![CDATA[// Interruptible stop via MC_Halt. Clears automatically when standstill reached.
+// A new cmdStart can resume motion after halt completes.
+METHOD PUBLIC cmdHalt : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_haltCmd       := TRUE;
+_jogPositive   := FALSE;
+_jogNegative   := FALSE;
+_homeCmd       := FALSE;
+_startMoveReq  := FALSE;
+_jogGotoBusy   := FALSE;
+_moveExecState := 0;
+cmdHalt        := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdReset" Id="{761ef536-e7f8-9012-67de-000000000612}">
+      <Declaration><![CDATA[// Clear PLC fault, release MC_Stop, trigger MC_Reset for NC errors.
+// Called automatically by DeviceLogic when inpReset (machine reset) is TRUE.
+METHOD cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[setFault(FALSE, '');
+_stopCmd          := FALSE;
+_haltCmd          := FALSE;
+_resetCmd         := TRUE;
+_homeCmd          := FALSE;
+_startMoveReq     := FALSE;
+_jogGotoBusy      := FALSE;
+_moveExecState    := 0;
+stsMoveDone       := FALSE;
+_selectedMove     := 0;
+_confirmPending   := FALSE;
+_currentMoveIndex := 0;
+cmdReset          := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdJogPositive" Id="{872f0647-f809-0123-78ef-000000000713}">
+      <Declaration><![CDATA[// Start positive-direction jog. Requires axis interlock met (enforced in main body).
+// Level: call once, axis jogs until cmdJogStop or button released from HMI.
+METHOD PUBLIC cmdJogPositive : BOOL
+VAR_INPUT
+    velocity    : LREAL;    // [unit/s]  - 0 = use cfgJogVelocity
+    acceleration: LREAL;    // [unit/s²] - 0 = use cfgJogAcceleration
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _homeCmd OR _moveExecState <> 0 OR _externalControl OR _jogGotoBusy THEN
+    RETURN;
+END_IF
+
+IF velocity     > 0.0 THEN _jogVelocity := velocity;     END_IF
+IF acceleration > 0.0 THEN _jogAccel    := acceleration; END_IF
+_jogPositive    := TRUE;
+_jogNegative    := FALSE;
+cmdJogPositive  := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdJogNegative" Id="{983a1758-091a-1234-890f-000000000814}">
+      <Declaration><![CDATA[// Start negative-direction jog. Requires axis interlock met (enforced in main body).
+METHOD PUBLIC cmdJogNegative : BOOL
+VAR_INPUT
+    velocity    : LREAL;    // [unit/s]  - 0 = use cfgJogVelocity
+    acceleration: LREAL;    // [unit/s²] - 0 = use cfgJogAcceleration
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _homeCmd OR _moveExecState <> 0 OR _externalControl OR _jogGotoBusy THEN
+    RETURN;
+END_IF
+
+IF velocity     > 0.0 THEN _jogVelocity := velocity;     END_IF
+IF acceleration > 0.0 THEN _jogAccel    := acceleration; END_IF
+_jogNegative    := TRUE;
+_jogPositive    := FALSE;
+cmdJogNegative  := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdJogStop" Id="{a04b2869-1a2b-2345-9a10-000000000915}">
+      <Declaration><![CDATA[// Stop jog. Axis decelerates via MC_Jog's internal decel (drive default).
+METHOD PUBLIC cmdJogStop : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_jogPositive := FALSE;
+_jogNegative := FALSE;
+cmdJogStop   := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdJogGoto" Id="{c37e5b9c-4d5e-6789-cd43-0000000010ff}">
+      <Declaration><![CDATA[// Position jog: "go to position". A discrete absolute move to an operator-entered target
+// (angle or mm) at the jog velocity/accel - the third jog subvariant (speed / torque / position).
+// Started from the HMI via ocmdJogGoto + ocmdJogGotoPos; executed by _mcJogGoto in section 12c.
+// Rejects QUIETLY (no fault) if not idle/safe, consistent with the other cmdJog* methods.
+METHOD PUBLIC cmdJogGoto : BOOL
+VAR_INPUT
+    position : LREAL;   // [unit] absolute target (angle or mm)
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _homeCmd OR _moveExecState <> 0 OR _externalControl
+   OR _jogPositive OR _jogNegative OR _torqueJogEngaged OR _jogGotoBusy
+   OR _stopCmd OR stsFaulted OR NOT _mcPower.Status OR NOT Interlock.outInterlockOK THEN
+    RETURN;
+END_IF
+
+_jogGotoTarget := position;
+_jogGotoBusy   := TRUE;
+cmdJogGoto     := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdSetExternalControl" Id="{b15c397a-2b3c-3456-ab21-000000001016}">
+      <Declaration><![CDATA[// Yield axis to an external coordinator (camming/gearing layer, e.g. fb_CamCoupler).
+// On enable, an interruptible cmdHalt() brings the axis to rest before the coordinator takes over.
+// While yielded (_externalControl): MC_Power / MC_Reset / MC_SetOverride / status keep running so the
+// axis stays powered and reportable, but ALL of the FB's own motion is suppressed - moves, jog,
+// pendant jog, torque-jog and home are gated off in the scan body, and cmdStart/cmdHome/cmdJog*
+// reject QUIETLY (never setFault: a fault gates MC_Power and would drop the coupling). This lets the
+// coordinator command the shared AXIS_REF (MC_CamIn, etc.) without fighting the FB.
+// Clearing external control does NOT re-enable motion - call cmdStart or cmdJog explicitly.
+METHOD PUBLIC cmdSetExternalControl : BOOL
+VAR_INPUT
+    enable : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_externalControl := enable;
+IF enable THEN
+    cmdHalt(); // interruptible stop before yielding
+END_IF
+cmdSetExternalControl := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="getHMIdata" Id="{c26d4a8b-3c4d-4567-bc32-000000001117}">
+      <Declaration><![CDATA[// Return the full HMI interface struct for linking to an HMI symbol.
+METHOD PUBLIC getHMIdata : ST_Axis_HMI_Interface
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getHMIdata := HMI;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         FB_INIT
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Method Name="FB_Init" Id="{d37e5b9c-4d5e-5678-cd43-000000001218}">
+      <Declaration><![CDATA[METHOD FB_Init : BOOL
+VAR_INPUT
+    bInitRetains        : BOOL;
+    bInCopyCode         : BOOL;
+    cfgDeviceName       : STRING;
+    cfgEnable           : BOOL;
+    cfgInitEventClass   : BOOL;
+    cfgJogVelocity      : LREAL;    // [unit/s]
+    cfgJogAcceleration  : LREAL;    // [unit/s²]
+    cfgStopDecel        : LREAL;    // [unit/s²] decel for MC_Stop
+    cfgHaltDecel        : LREAL;    // [unit/s²] decel for MC_Halt
+    cfgAxisType         : E_Axis_UnitType;  // eLinear / eRotary (HMI unit display)
+    cfgUnit             : STRING;   // position unit label ('mm','deg',...); '' = keep default 'mm'
+    cfgIsModulo         : BOOL;     // TRUE = NC axis is modulo; HMI shows modulo position (ModuloActPos)
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName     := cfgDeviceName;
+THIS^.cfgEnable         := cfgEnable;
+THIS^.cfgInitEventClass := cfgInitEventClass;
+IF cfgJogVelocity     > 0.0 THEN _jogVelocity := cfgJogVelocity;     END_IF
+IF cfgJogAcceleration > 0.0 THEN _jogAccel    := cfgJogAcceleration; END_IF
+IF cfgStopDecel       > 0.0 THEN _stopDecel   := cfgStopDecel;       END_IF
+IF cfgHaltDecel       > 0.0 THEN _haltDecel   := cfgHaltDecel;       END_IF
+_axisType := cfgAxisType;
+IF cfgUnit <> '' THEN _unit := cfgUnit; END_IF
+_isModulo := cfgIsModulo;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         CONFIGURATION PROPERTIES
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Property Name="cfgJogVelocity" Id="{e48f6cad-5e6f-6789-de54-000000001319}">
+      <Declaration><![CDATA[PROPERTY PUBLIC cfgJogVelocity : LREAL]]></Declaration>
+      <Get Name="Get" Id="{f59a7dbe-6f70-7890-ef65-000000001420}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgJogVelocity := _jogVelocity;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{006b8ecf-7081-8901-f076-000000001521}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgJogVelocity > 0.0 THEN _jogVelocity := cfgJogVelocity; END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgJogAcceleration" Id="{117c9fd0-8192-9012-0187-000000001622}">
+      <Declaration><![CDATA[PROPERTY PUBLIC cfgJogAcceleration : LREAL]]></Declaration>
+      <Get Name="Get" Id="{228dafe1-9203-0123-1298-000000001723}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgJogAcceleration := _jogAccel;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{339ebff2-a314-1234-23a9-000000001824}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgJogAcceleration > 0.0 THEN _jogAccel := cfgJogAcceleration; END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgJogTorqueLimit" Id="{aa053669-1a8b-8901-9a10-0000000025c1}">
+      <Declaration><![CDATA[// [Nm or %] global overtorque trip during position jog. If |actual torque| exceeds
+// this while jogging, the axis faults ('Overtorque limit: jog') and locks via MC_Stop
+// (cmdReset required). 0 disables the check. Same units as Axis.NcToPlc.ActTorque.
+// Does not affect torque-jog, which is bounded by its own clamp.
+PROPERTY PUBLIC cfgJogTorqueLimit : LREAL]]></Declaration>
+      <Get Name="Get" Id="{bb16477a-2b9c-9012-ab21-0000000026c2}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgJogTorqueLimit := _jogTorqueLimit;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{cc27588b-3cad-0123-bc32-0000000027c3}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[// >= 0: a value of 0 is valid and disables the trip.
+IF cfgJogTorqueLimit >= 0.0 THEN _jogTorqueLimit := cfgJogTorqueLimit; END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgStopDecel" Id="{44afd003-b425-2345-34ba-000000001925}">
+      <Declaration><![CDATA[PROPERTY PUBLIC cfgStopDecel : LREAL]]></Declaration>
+      <Get Name="Get" Id="{55b0e114-c536-3456-45cb-000000002026}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgStopDecel := _stopDecel;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{66c1f225-d647-4567-56dc-000000002127}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgStopDecel > 0.0 THEN _stopDecel := cfgStopDecel; END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgHaltDecel" Id="{77d20336-e758-5678-67ed-000000002228}">
+      <Declaration><![CDATA[PROPERTY PUBLIC cfgHaltDecel : LREAL]]></Declaration>
+      <Get Name="Get" Id="{88e31447-f869-6789-78fe-000000002329}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgHaltDecel := _haltDecel;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{99f42558-097a-7890-890f-000000002430}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgHaltDecel > 0.0 THEN _haltDecel := cfgHaltDecel; END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgVelocityOverride" Id="{aa053669-1a8b-8901-9a10-000000002531}">
+      <Declaration><![CDATA[PROPERTY PUBLIC cfgVelocityOverride : LREAL]]></Declaration>
+      <Get Name="Get" Id="{bb16477a-2b9c-9012-ab21-000000002632}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgVelocityOverride := _velocityOverride;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{cc27588b-3cad-0123-bc32-000000002733}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgVelocityOverride >= 0.0 AND cfgVelocityOverride <= 100.0 THEN
+    _velocityOverride := cfgVelocityOverride;
+END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgAccelOverride" Id="{dd38699c-4dbe-1234-cd43-000000002834}">
+      <Declaration><![CDATA[PROPERTY PUBLIC cfgAccelOverride : LREAL]]></Declaration>
+      <Get Name="Get" Id="{ee497aad-5ecf-2345-de54-000000002935}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgAccelOverride := _accelOverride;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{ff5a8bbe-6fd0-3456-ef65-000000003036}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[IF cfgAccelOverride >= 0.0 AND cfgAccelOverride <= 100.0 THEN
+    _accelOverride := cfgAccelOverride;
+END_IF]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgDeviceName" Id="{006bcccf-70e1-4567-f076-000000003137}">
+      <Declaration><![CDATA[PROPERTY cfgDeviceName : STRING]]></Declaration>
+      <Get Name="Get" Id="{117cdde0-81f2-5678-0187-000000003238}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgDeviceName := _deviceName;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{228deef1-9203-6789-1298-000000003339}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_deviceName := cfgDeviceName;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgAxisType" Id="{c3d4e5f6-a7b8-9012-cd03-000000004001}">
+      <Declaration><![CDATA[// Linear vs rotary - for HMI unit display only (NC has no kinematic type).
+PROPERTY PUBLIC cfgAxisType : E_Axis_UnitType]]></Declaration>
+      <Get Name="Get" Id="{d4e5f6a7-b8c9-0123-de04-000000004002}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgAxisType := _axisType;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{e5f6a7b8-c9d0-1234-ef05-000000004003}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_axisType := cfgAxisType;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgUnit" Id="{f6a7b8c9-d0e1-2345-f006-000000004004}">
+      <Declaration><![CDATA[// Engineering unit label for position (e.g. 'mm', 'deg', 'rev'). HMI shows
+// velocity as this + '/s'.
+PROPERTY PUBLIC cfgUnit : STRING]]></Declaration>
+      <Get Name="Get" Id="{a7b8c9d0-e1f2-3456-0107-000000004005}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgUnit := _unit;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{b8c9d0e1-f2a3-4567-1208-000000004006}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_unit := cfgUnit;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgIsModulo" Id="{c9d0e1f2-a3b4-5678-2309-000000004007}">
+      <Declaration><![CDATA[// TRUE = the NC axis is configured as a modulo axis. Metadata only (the NC carries no
+// modulo flag in the cyclic image); drives whether the HMI shows the modulo position
+// (ModuloActPos) or the accumulated ActPos. Orthogonal to cfgAxisType.
+PROPERTY PUBLIC cfgIsModulo : BOOL]]></Declaration>
+      <Get Name="Get" Id="{d0e1f2a3-b4c5-6789-340a-000000004008}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgIsModulo := _isModulo;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{e1f2a3b4-c5d6-7890-450b-000000004009}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_isModulo := cfgIsModulo;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+  </POU>
+</TcPlcObject>

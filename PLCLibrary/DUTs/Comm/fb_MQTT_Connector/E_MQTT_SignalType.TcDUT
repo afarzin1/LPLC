@@ -1,0 +1,24 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_MQTT_SignalType" Id="{48e39eb8-80f7-49f9-b366-c2d200af5e74}">
+    <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// E_MQTT_SignalType - Supported data types for MQTT signals
+// ═══════════════════════════════════════════════════════════════════════
+{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_MQTT_SignalType :
+(
+    NONE        := 0,
+    TYPE_BOOL   := 1,
+    TYPE_BYTE   := 2,
+    TYPE_INT    := 3,
+    TYPE_DINT   := 4,
+    TYPE_REAL   := 5,
+    TYPE_LREAL  := 6,
+    TYPE_STRING := 7,
+    TYPE_TIME   := 8
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

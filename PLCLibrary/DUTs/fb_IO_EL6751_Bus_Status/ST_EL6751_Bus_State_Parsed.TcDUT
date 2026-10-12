@@ -1,0 +1,19 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_EL6751_Bus_State_Parsed" Id="{4c5a6076-5042-44f8-8df0-c92019edd43c}">
+    <Declaration><![CDATA[TYPE ST_EL6751_Bus_State_Parsed :
+STRUCT
+	stsCANDeviceState				:STRING;
+	stsCANControllerBusOff			:BOOL;
+	stsCANControllerWarningLimit	:BOOL;
+	stsRxQueueOverrun				:BOOL;
+	stsCANSendError					:BOOL;
+	stsCANQueueIntRxOverflow		:BOOL;
+	stsCANQueueIntTxOverflow		:BOOL;
+	stsSyncToggle					:BOOL;
+	stsBusLoad						:UINT;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

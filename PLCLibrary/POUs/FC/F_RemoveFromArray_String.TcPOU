@@ -1,0 +1,50 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="F_RemoveFromArray_String" Id="{8e5e5c1b-17ca-4d1e-8da8-d5e2bb2bfd35}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION F_RemoveFromArray_String : DINT
+VAR_INPUT
+    value : STRING;            // String to remove
+    maxSize : DINT;           // Maximum array capacity
+END_VAR
+VAR_IN_OUT
+    arr : ARRAY[*] OF STRING; // Array of strings
+END_VAR
+VAR
+    currentSize : DINT := 0;
+    i : DINT;
+    foundPos : DINT := -1;    // -1 indicates not found
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// Find current size and position of value
+FOR i := 1 TO UPPER_BOUND(arr, 1) DO
+    IF arr[i] = '' THEN
+        currentSize := i;
+        EXIT;
+    END_IF
+    IF arr[i] = value AND foundPos = -1 THEN
+        foundPos := i;
+    END_IF
+    // If we reach the end without finding empty string
+    IF i = UPPER_BOUND(arr, 1) THEN
+        currentSize := i + 1;
+    END_IF
+END_FOR
+
+// If value wasn't found or array is empty, return
+IF foundPos = -1 OR currentSize = 0 THEN
+    RETURN;
+END_IF
+
+// Shift elements up to fill the gap
+FOR i := foundPos TO currentSize - 2 DO
+    arr[i] := arr[i + 1];
+END_FOR
+
+// Clear the last element
+arr[currentSize - 1] := '';
+
+// Return the position where the value was found
+F_RemoveFromArray_String := foundPos;]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

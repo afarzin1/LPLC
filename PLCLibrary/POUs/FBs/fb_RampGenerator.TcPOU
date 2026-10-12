@@ -1,0 +1,125 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_RampGenerator" Id="{ecf8f3fe-e3df-4871-8324-34715a26dea6}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_RampGenerator
+VAR_INPUT
+    inpSPRequest    : LREAL;    (* Requested Setpoint value *)
+    inpRampTime     : TIME;     (* Total desired time for the ramp (e.g., T#5s, T#250ms).
+                                   If T#0s or less, output jumps immediately. *)
+    cfgScanRate     : TIME;     (* Scan rate (cycle time) of the task calling this FB instance
+                                   (e.g., T#1ms, T#10ms). Must be greater than T#0s. *)
+END_VAR
+VAR_OUTPUT
+    stsRamp         : LREAL;    (* Current ramped output value *)
+	stsRampActive	: BOOL;
+END_VAR
+VAR
+    // Internal state variables
+    _lastSPRequest  : LREAL;    (* Stores the previous SP request to detect changes *)
+    _startValue     : LREAL;    (* Value of stsRamp when the ramp started *)
+    _targetValue    : LREAL;    (* Target value (inpSPRequest) for the current ramp *)
+    _increment      : LREAL;    (* Amount to add/subtract from stsRamp each scan cycle *)
+    _scanCounter    : UDINT;    (* Counts scans elapsed during the current ramp *)
+    _totalScans     : UDINT;    (* Total number of scans required for the complete ramp *)
+    _isRamping      : BOOL := FALSE; (* TRUE if a ramp is currently in progress *)
+    _firstScan      : BOOL := TRUE;  (* Flag for first scan initialization *)
+
+    // Internal calculation variables
+    _rampTimeSeconds : LREAL;   (* Calculated ramp time in seconds *)
+    _scanRateSeconds : LREAL;   (* Calculated scan rate in seconds *)
+END_VAR
+VAR CONSTANT
+    MILLISECONDS_TO_SECONDS : LREAL := 1000.0; (* Conversion factor *)
+    ZERO_LREAL              : LREAL := 0.0;    (* Constant for zero LREAL *)
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// --- Initialization on the first scan cycle ---
+// On the very first call after instantiation or reset, initialize internal states.
+IF _firstScan THEN
+    stsRamp         := inpSPRequest;        // Initialize output to the initial request
+    _lastSPRequest  := inpSPRequest;        // Initialize last request tracking
+    _targetValue    := inpSPRequest;        // Initialize target value
+    _startValue     := inpSPRequest;        // Initialize start value
+    _isRamping      := FALSE;               // Not ramping initially
+    _scanCounter    := 0;
+    _totalScans     := 0;
+    _increment      := ZERO_LREAL;
+    _firstScan      := FALSE;               // Clear the first scan flag for subsequent calls
+END_IF
+
+// --- Check for Setpoint Change ---
+// Detect if the external request has changed since the last scan cycle.
+IF inpSPRequest <> _lastSPRequest THEN
+    // A new ramp needs to be started or the target needs immediate update.
+    _targetValue    := inpSPRequest;   // Store the new target value
+    _startValue     := stsRamp;        // The ramp starts from the current output value
+
+    // --- Calculate Ramp Parameters ---
+    // Convert TIME inputs to LREAL seconds for calculation.
+    // Uses the native TIME_TO_LREAL function (converts TIME to LREAL milliseconds)
+    // and divides by 1000.0 to get seconds. Requires Standard.lib (usually included).
+    _rampTimeSeconds := TIME_TO_LREAL(inpRampTime) / MILLISECONDS_TO_SECONDS;
+    _scanRateSeconds := TIME_TO_LREAL(cfgScanRate) / MILLISECONDS_TO_SECONDS;
+
+    // Check for valid positive ramp time and scan rate. Scan rate must be positive.
+    IF _rampTimeSeconds > ZERO_LREAL AND _scanRateSeconds > ZERO_LREAL THEN
+        // Calculate the total number of scan cycles required for the ramp duration.
+        // LREAL_TO_UDINT truncates; for very precise timing, consider rounding logic if needed.
+        _totalScans := LREAL_TO_UDINT(_rampTimeSeconds / _scanRateSeconds);
+
+        IF _totalScans > 0 AND _targetValue <> _startValue THEN
+            // Calculate the change in value required per scan cycle.
+            _increment := (_targetValue - _startValue) / UDINT_TO_LREAL(_totalScans);
+            _scanCounter := 0;      // Reset the scan counter for the new ramp
+            _isRamping := TRUE;     // Set the flag indicating ramp is active
+        ELSE
+            // Ramp time is shorter than one scan cycle, total scans is zero,
+            // or start value already equals target value. Jump directly.
+            stsRamp := _targetValue;
+            _isRamping := FALSE;
+            _scanCounter := 0;
+            _totalScans := 0;
+            _increment := ZERO_LREAL;
+        END_IF
+    ELSE
+        // Ramp time is zero/negative or scan rate is invalid (zero/negative). Jump directly.
+        stsRamp := _targetValue;
+        _isRamping := FALSE;
+        _scanCounter := 0;
+        _totalScans := 0;
+        _increment := ZERO_LREAL;
+    END_IF
+
+    // Update the last tracked SP request AFTER calculations are done based on the change.
+    _lastSPRequest := inpSPRequest;
+
+// --- Continue Active Ramp ---
+ELSIF _isRamping THEN
+    // If the Setpoint Request hasn't changed, continue the current ramp if one is active.
+    IF _scanCounter < _totalScans THEN
+        // Increment/decrement the ramp value by the calculated step.
+        stsRamp := stsRamp + _increment;
+        _scanCounter := _scanCounter + 1;
+
+        // Check if the ramp is now complete (reached or passed target) on this scan.
+        // This check prevents overshoot/undershoot due to floating point inaccuracies
+        // and ensures the ramp stops exactly at the target value.
+        IF _scanCounter >= _totalScans OR
+           (_increment > ZERO_LREAL AND stsRamp >= _targetValue) OR
+           (_increment < ZERO_LREAL AND stsRamp <= _targetValue) THEN
+
+            stsRamp := _targetValue; // Set final value exactly
+            _isRamping := FALSE;     // Mark ramp as finished
+            // Optional: _scanCounter := _totalScans; // Ensure counter reflects completion state
+        END_IF
+    ELSE
+        // Safeguard: If ramp flag is somehow still true but counter is already >= total, fix state.
+        stsRamp := _targetValue;
+        _isRamping := FALSE;
+    END_IF
+END_IF
+
+stsRampActive := _isRamping;]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

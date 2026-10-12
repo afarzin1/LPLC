@@ -1,0 +1,358 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_AnalogSensor" Id="{47f6c7bd-fe02-440f-b580-1050f940601c}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_AnalogSensor EXTENDS abs_fb_Device
+VAR_INPUT
+	inpRawIOChannel			: DINT;
+	inpScaledIOChannel		: LREAL;
+	inpChannelDiag			: ST_AnalogSensor_Diag; //IO channel diagnostics
+	cfgScalingNeeded		: BOOL;					// Set to False if scaled in IO
+	cfgChannelMinInt		: DINT;					//Min INT IO channel value
+	cfgChannelMaxInt		: DINT;					//Max INT IO channel value
+	cfgSensorMin			: LREAL;  				//Min Sensor value (0V, 4mA etc)
+	cfgSensorMax			: LREAL;  				//Max Sensor value (10V, 20mA etc)
+	cfgEngUnitMin			: LREAL;  				//Min span of instrument
+	cfgEngUnitMax			: LREAL;  				//Max span of instrument
+
+END_VAR
+VAR_OUTPUT
+	stsSensorRawSignal		: LREAL;
+	stsEngValue				: LREAL;
+END_VAR
+VAR
+	_sensorRawSignal		: LREAL;
+	_engValue				: LREAL;
+	_alarmEnable	: BOOL;
+	_alarmL			: LREAL;
+	_alarmLL		: LREAL;
+	_alarmH			: LREAL;
+	_alarmHH		: LREAL;
+	_calOffset		: LREAL;
+	_calGain		: LREAL := 1.0;	// 1 = no gain correction (0 would zero every reading)
+	_engUnit		: STRING;
+	_alarmDebounce  : ARRAY[1..4] OF TON;
+	_alarmCooldown	: ARRAY[1..4] OF BOOL;
+END_VAR
+
+VAR PERSISTENT
+	HMI	: ST_AnalogSensor_HMI_Interface;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+
+scaleInput();
+
+FaultHandler();
+
+setHMI();
+
+stsSensorRawSignal	:= _sensorRawSignal;
+stsEngValue			:= _engValue;
+]]></ST>
+    </Implementation>
+    <Property Name="cfgAlarmEnable" Id="{85b0b92f-89e9-4c28-8c48-159cca36ca0b}">
+      <Declaration><![CDATA[PROPERTY cfgAlarmEnable : BOOL]]></Declaration>
+      <Get Name="Get" Id="{ab414bf6-47ac-49a6-8d45-280c463c030a}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgAlarmEnable := _alarmEnable;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{9d485d44-bc03-4f66-961a-42200a7fc226}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_alarmEnable := cfgAlarmEnable;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgAlarmH" Id="{7667dc4a-4a97-4595-81c5-4d4d6bee51f0}">
+      <Declaration><![CDATA[PROPERTY cfgAlarmH : LREAL]]></Declaration>
+      <Get Name="Get" Id="{aab43fa0-a936-4754-8933-e824119b328f}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgAlarmH := _alarmH;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a9fa46eb-d234-4cf2-9802-c1e2430da5e8}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_alarmH := cfgAlarmH;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgAlarmHH" Id="{9a4850df-214b-4766-aff3-09ba6e049d18}">
+      <Declaration><![CDATA[PROPERTY cfgAlarmHH : LREAL]]></Declaration>
+      <Get Name="Get" Id="{a0951f48-a1ba-4227-8424-c64d4ec981f7}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgAlarmHH := _alarmHH;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{99ca7ccf-b7e7-4b21-85bb-491f4039534a}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_alarmHH := cfgAlarmHH;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgAlarmL" Id="{0bbec210-6ddf-4e6b-8577-7021e5906044}">
+      <Declaration><![CDATA[PROPERTY cfgAlarmL : LREAL]]></Declaration>
+      <Get Name="Get" Id="{c8fb85ac-6ac7-4350-ade5-13cee2ac5f67}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgAlarmL := _alarmL;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{1ed12130-121d-472e-a6aa-86d3511dfdd1}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_alarmL := cfgAlarmL;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgAlarmLL" Id="{54bc43e4-8784-46ad-86b1-9ed64ee6e561}">
+      <Declaration><![CDATA[PROPERTY cfgAlarmLL : LREAL]]></Declaration>
+      <Get Name="Get" Id="{765187a2-4225-4ada-b697-aeaea67703a0}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgAlarmLL := _alarmLL;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{72e5a276-3a95-4061-8b88-a09b1d056507}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_alarmLL := cfgAlarmLL;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgCalGain" Id="{010e40e4-a0bc-454d-b660-9d91328485e2}">
+      <Declaration><![CDATA[PROPERTY cfgCalGain : LREAL]]></Declaration>
+      <Get Name="Get" Id="{874bf37c-b47f-41aa-86b8-839fc87eb0ea}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgCalGain := _calGain;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{c465761a-80af-443a-a52e-cca43e0d46e6}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_calGain := cfgCalGain;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgCalOffset" Id="{be584468-24e3-4e7c-9cfb-d317da3a766d}">
+      <Declaration><![CDATA[PROPERTY cfgCalOffset : LREAL]]></Declaration>
+      <Get Name="Get" Id="{140a8eaf-fe5a-49ad-b170-3f50cbd9ac82}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgCalOffset := _calOffset;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{0c475ec5-d79e-4057-a919-37a9c4cde68a}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_calOffset := cfgCalOffset;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgEngUnit" Id="{e03703b9-839c-4f4e-8b94-46e305a37e73}">
+      <Declaration><![CDATA[PROPERTY cfgEngUnit : STRING]]></Declaration>
+      <Get Name="Get" Id="{d7578639-525f-4563-b1f3-2a5f669b8f65}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgEngUnit := _engUnit;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{00932a2a-dfc2-416b-8861-3537463e0486}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_engUnit := cfgEngUnit;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdReset" Id="{78448479-001d-465c-889f-2ecec2bbc229}">
+      <Declaration><![CDATA[METHOD cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[setFault(0, '');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FaultHandler" Id="{6cb13eed-dfb7-459f-9aa0-bcdcdc13a0de}">
+      <Declaration><![CDATA[METHOD PROTECTED FaultHandler : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _alarmEnable THEN
+	//L Warning
+	_alarmDebounce[1](IN:=_alarmCooldown[1], PT:=T#30S);
+	_alarmDebounce[2](IN:=_alarmCooldown[2], PT:=T#30S);
+	IF _engValue < cfgAlarmL THEN
+		IF NOT _alarmCooldown[1] THEN
+			sendWarning(CONCAT(CONCAT('Low Warning - ', ANY_TO_STRING(TO_REAL(_engValue))),_EngUnit),1);
+			_alarmCooldown[1] := TRUE;
+		END_IF
+	END_IF
+	IF _alarmCooldown[1] AND _alarmDebounce[1].Q THEN
+		_alarmCooldown[1] := FALSE;
+	END_IF
+	
+	//H Warning
+	IF _engValue > cfgAlarmH THEN
+		IF NOT _alarmCooldown[2] THEN
+			sendWarning(CONCAT(CONCAT('High Warning - ', ANY_TO_STRING(TO_REAL(_engValue))),_EngUnit),2);
+			_alarmCooldown[2] := TRUE;
+		END_IF
+	END_IF
+	IF _alarmCooldown[2] AND _alarmDebounce[2].Q THEN
+		_alarmCooldown[2] := FALSE;
+	END_IF
+	
+	IF _engValue < cfgAlarmLL THEN
+		setFault(1,CONCAT(CONCAT('Low Alarm - ', ANY_TO_STRING(TO_REAL(_engValue))),_EngUnit));
+	END_IF
+	
+	IF _engValue > cfgAlarmHH THEN
+		setFault(1,CONCAT(CONCAT('High Alarm - ', ANY_TO_STRING(TO_REAL(_engValue))),_EngUnit));
+	END_IF
+	
+	IF inpChannelDiag.error THEN
+		setFault(1, 'Channel Error');
+	END_IF
+	
+	IF inpChannelDiag.overrange THEN
+		setFault(1, 'Overrange');
+	END_IF
+	
+	IF inpChannelDiag.underrange THEN
+		setFault(1, 'Underrange');
+	END_IF
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{4ac9531d-1d47-4246-9b5f-b8f7308c70c4}">
+      <Declaration><![CDATA[(*FB_Init is always available implicitly and it is used primarily for initialization.
+The return value is not evaluated. For a specific influence, you can also declare the
+methods explicitly and provide additional code there with the standard initialization
+code. You can evaluate the return value.*)
+METHOD FB_Init : BOOL
+VAR_INPUT
+	(* TRUE: the retain variables are initialized (reset warm / reset cold)*)
+	bInitRetains	: BOOL;
+	(* TRUE: the instance will be copied to the copy code afterward (online change)   *)
+	bInCopyCode			: BOOL;
+	cfgDeviceName		: STRING;
+	cfgEnable			: BOOL;
+	cfgInitEventClass	: BOOL;
+	cfgAlarmEnable		: BOOL;
+	cfgAlarmH			: LREAL;
+	cfgAlarmHH			: LREAL;
+	cfgAlarmL			: LREAL;
+	cfgAlarmLL			: LREAL;
+	cfgEngUnit			: STRING;
+	cfgCalOffset		: LREAL;
+	cfgCalGain			: LREAL := 1.0;	// omitted in the declaration = 1 (no correction)
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 		:= 		cfgDeviceName; 		
+THIS^.cfgEnable 			:= 	    cfgEnable; 	
+THIS^.cfgInitEventClass		:= 		cfgInitEventClass;
+THIS^.cfgAlarmEnable		:=		cfgAlarmEnable;
+THIS^.cfgAlarmH				:=		cfgAlarmH;
+THIS^.cfgAlarmHH			:=		cfgAlarmHH;
+THIS^.cfgAlarmL				:=		cfgAlarmL;
+THIS^.cfgAlarmLL			:=		cfgAlarmLL;
+THIS^.cfgCalOffset			:=		cfgCalOffset;
+THIS^.cfgCalGain			:=		cfgCalGain;
+THIS^.cfgEngUnit			:=		cfgEngUnit;
+
+THIS^.HMI.cfgAlarmEnable	:= cfgAlarmEnable;
+THIS^.HMI.cfgAlarmH			:= cfgAlarmH;
+THIS^.HMI.cfgAlarmHH		:= cfgAlarmHH;
+THIS^.HMI.cfgAlarmL			:= cfgAlarmL;
+THIS^.HMI.cfgAlarmLL		:= cfgAlarmLL;
+THIS^.HMI.cfgEngUnit		:= cfgEngUnit;
+THIS^.HMI.cfgCalOffset		:= cfgCalOffset;
+THIS^.HMI.cfgCalGain		:= cfgCalGain;
+
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="scaleInput" Id="{4ed8c567-e060-4c8d-8018-b01267e3113b}">
+      <Declaration><![CDATA[METHOD scaleInput : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF cfgScalingNeeded THEN
+	_sensorRawSignal	:= F_AnalogToEngUnit(inpRawIOChannel, cfgChannelMinInt, cfgChannelMaxInt, cfgSensorMin, cfgSensorMax);
+	_engValue			:= (F_AnalogToEngUnit(stsSensorRawSignal, cfgSensorMin, cfgSensorMax, cfgEngUnitMin, cfgEngUnitMax) * _CalGain) + _CalOffset;
+ELSE
+	_sensorRawSignal := inpScaledIOChannel;
+	_engValue		 := (inpScaledIOChannel * _CalGain) + _CalOffset;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setHMI" Id="{7aae993c-2f01-4e4c-b6f2-f3f4d86398aa}">
+      <Declaration><![CDATA[METHOD PROTECTED setHMI : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[HMI.HMIbaseDevice := HMIbaseDevice;
+
+HMI.stsEngValue 		:= _engValue;
+HMI.stsSensorRawSignal	:= _sensorRawSignal;
+
+cfgAlarmEnable		:= HMI.cfgAlarmEnable;
+cfgAlarmH			:= HMI.cfgAlarmH;
+cfgAlarmHH			:= HMI.cfgAlarmHH;
+cfgAlarmL			:= HMI.cfgAlarmL;
+cfgAlarmLL			:= HMI.cfgAlarmLL;
+cfgCalOffset		:= HMI.cfgCalOffset;
+cfgCalGain			:= HMI.cfgCalGain;
+cfgEngUnit			:= HMI.cfgEngUnit;
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

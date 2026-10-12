@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_XPendant_HMI_Status" Id="{21e4735c-fa00-49c1-a60d-73f9204a3d6f}">
+    <Declaration><![CDATA[// Read-only pendant status for the HMI. Mirrors fb_Dev_XPendant's GATED sts*
+// outputs (all idle unless stsConnected) plus the liveness diagnostics.
+TYPE ST_XPendant_HMI_Status :
+STRUCT
+    stsConnected : BOOL;    // controller present AND feed alive AND enabled
+    stsFeedAlive : BOOL;    // service watchdog fresh (diagnostic: FALSE + Connected claimed = service died)
+    stsActive    : BOOL;    // inpActive AND stsConnected — pendant in service and usable now
+    stsInService : BOOL;    // mirror of inpActive (supervision: pendant expected) — read by the IPC service
+
+    stsBtnA      : BOOL;
+    stsBtnB      : BOOL;
+    stsBtnX      : BOOL;
+    stsBtnY      : BOOL;
+    stsBumpL     : BOOL;
+    stsBumpR     : BOOL;
+    stsStart     : BOOL;
+    stsBack      : BOOL;
+    stsThumbL    : BOOL;
+    stsThumbR    : BOOL;
+
+    stsDpadUp    : BOOL;
+    stsDpadDown  : BOOL;
+    stsDpadLeft  : BOOL;
+    stsDpadRight : BOOL;
+
+    // Analogs as direction + speed pairs (mirror of the FB outputs).
+    stsLeftStickX  : ST_XPendant_Axis;
+    stsLeftStickY  : ST_XPendant_Axis;
+    stsRightStickX : ST_XPendant_Axis;
+    stsRightStickY : ST_XPendant_Axis;
+    stsTriggerL    : ST_XPendant_Axis;
+    stsTriggerR    : ST_XPendant_Axis;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

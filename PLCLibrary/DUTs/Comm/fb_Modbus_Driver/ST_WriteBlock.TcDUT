@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="ST_WriteBlock" Id="{a5193c21-527b-4ef2-ae7e-03db1cdbb55b}">
+    <Declaration><![CDATA[TYPE ST_WriteBlock :
+STRUCT
+    startAddress        : UINT;
+    quantity            : UINT;
+    area                : E_MBArea;
+    functionCode        : BYTE;
+
+    arrSignalIndex      : ARRAY[1..64] OF UINT;
+    arrOffsetInBlock    : ARRAY[1..64] OF UINT;
+    signalCount         : UINT;
+
+    enabled             : BOOL := TRUE;
+    containsBitSignals  : BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

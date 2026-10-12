@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_XPendant_HMI_Interface" Id="{3563f22d-799f-46a0-a712-3f98449a56ec}">
+    <Declaration><![CDATA[// HMI interface for fb_Dev_XPendant (bound as <instance>.HMI).
+// No Commands/Config sub-structs: the pendant is an input-only device — its
+// enable/disable lives in the IPC service (surface C), and config (feed timeout)
+// is instantiation-time via FB_Init/cfgFeedTimeout, not operator-editable.
+TYPE ST_XPendant_HMI_Interface :
+STRUCT
+    // Inherited base-device HMI values (deviceName, enabled, stsInAuto, stsFaulted,
+    // stsFaultDescription, interlock). Populated from abs_fb_Device.
+    HMIbaseDevice : ST_Device_HMI_Interface;
+    Status        : ST_XPendant_HMI_Status;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

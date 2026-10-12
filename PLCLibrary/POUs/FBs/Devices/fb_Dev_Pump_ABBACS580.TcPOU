@@ -1,0 +1,253 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_Pump_ABBACS580" Id="{a1b20000-0000-4000-8000-000000000001}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_Pump_ABBACS580 EXTENDS abs_fb_Device
+VAR_INPUT
+	inpESTOPs_OK			: BOOL;		// 1 = ESTOPs healthy, 0 = ESTOP active
+	inpMachineSTOP			: BOOL;
+	inpOverpressureTrip		: BOOL;		// asserted by caller when pressure > limit
+END_VAR
+
+VAR PERSISTENT
+	HMI						: ST_Pump_ABBACS580_HMI_Interface;
+END_VAR
+
+VAR
+	// Embedded VFD driver (forward-only operation enforced by this wrapper)
+	VFD : fb_Dev_VFD_ABBACS580(
+		cfgDeviceName		:= CONCAT(_deviceName, ' VFD'),
+		cfgEnable			:= TRUE,
+		cfgInitEventClass	:= TRUE,
+		cfgIPAddress		:= _ipAddress,
+		cfgUnitID			:= _unitId);
+
+	// Pump-level control state (set by cmdRun / cmdSetpoint in auto mode,
+	// sourced from VFD.HMI in manual mode)
+	_ctrlRun				: BOOL;
+	_ctrlSetpoint			: LREAL;	// 0..100 percent
+	_resetTrig				: R_TRIG;
+
+	// Modbus addressing mirrors (set via cfg* properties before enable)
+	_ipAddress				: STRING(15) := '192.168.1.50';
+	_unitId					: BYTE := 1;
+
+	// Trip bit OR'd into the VFD's outbound CW
+	_trippedBitMask			: WORD;
+
+	// Interlock array
+	_interlocks				: ARRAY[1..10] OF BOOL;
+END_VAR
+
+VAR_OUTPUT
+	stsOverpressureTripped	: BOOL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+
+// Propagate Modbus addressing into the inner VFD. Required because TwinCAT
+// initializes embedded FBs in VAR declaration order: VFD.FB_Init runs before
+// _ipAddress is default-initialized AND before pump.FB_Init applies any
+// override, so VFD._ipAddress would otherwise be locked at empty. Assigning
+// each scan is cheap and is consumed once by VFD's one-shot _modbusInit.
+VFD.cfgIPAddress	:= _ipAddress;
+VFD.cfgUnitID		:= _unitId;
+
+// Continuous trip bit. Drive will fault via External event 1 IF par 31.01
+// has been configured on the drive (e.g. to FBA Main CW bit 12).
+IF inpOverpressureTrip THEN
+	_trippedBitMask := 16#1000;
+ELSE
+	_trippedBitMask := 16#0000;
+END_IF
+stsOverpressureTripped := inpOverpressureTrip;
+
+// Manual mode: source commands from pump HMI. Forward-only is enforced by the
+// pump's BOOL ocmdRun and 0..100 setpoint clamp — the inner VFD never sees a
+// reverse command because we force it to auto mode below.
+IF _enabled THEN
+	IF NOT _inAuto THEN
+		_ctrlRun		:= HMI.ocmdRun;
+		_ctrlSetpoint	:= LIMIT(0.0, HMI.ocmdSetpoint, 100.0);
+	END_IF
+END_IF
+
+_resetTrig(CLK := HMI.ocmdReset);
+IF _resetTrig.Q THEN
+	cmdReset();
+END_IF
+
+// Pump-level interlocks
+_interlocks[1] := inpESTOPs_OK;
+cmdSetInterlock(1, 'ESTOPs OK', _interlocks[1]);
+
+_interlocks[2] := NOT inpMachineSTOP;
+cmdSetInterlock(2, 'Machine STOP Not Active', _interlocks[2]);
+
+_interlocks[3] := NOT inpOverpressureTrip;
+cmdSetInterlock(3, 'Pressure below limit', _interlocks[3]);
+
+FaultHandler();
+
+// Interlock enforcement (force stop on broken interlock; mirror to pump HMI
+// so the operator sees the run command drop)
+IF NOT interlock.outInterlockOK THEN
+	_ctrlRun	:= FALSE;
+	HMI.ocmdRun	:= FALSE;
+END_IF
+
+// Drive the inner VFD with the forward-only API.
+// inpAuto is forced TRUE so VFD never sources commands from its own HMI —
+// pump HMI is the sole operator surface. cmdEnable / cmdSetpoint are the
+// single source of truth for the inner VFD.
+IF _ctrlRun THEN
+	VFD.cmdEnable(1);
+ELSE
+	VFD.cmdEnable(0);
+END_IF
+VFD.cmdSetpoint(_ctrlSetpoint);
+
+VFD(
+	inpAuto				:= TRUE,
+	inpReset			:= inpReset,
+	inpInterlockBypass	:= inpInterlockBypass,
+	inpESTOPs_OK		:= inpESTOPs_OK,
+	inpMachineSTOP		:= inpMachineSTOP,
+	inpCWAuxBitMask		:= _trippedBitMask);
+
+updateHMI();
+]]></ST>
+    </Implementation>
+    <Property Name="cfgIPAddress" Id="{a1b20000-0000-4000-8000-000000000002}">
+      <Declaration><![CDATA[PROPERTY cfgIPAddress : STRING(15)
+]]></Declaration>
+      <Get Name="Get" Id="{a1b20000-0000-4000-8000-000000000003}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgIPAddress := _ipAddress;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a1b20000-0000-4000-8000-000000000004}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_ipAddress := cfgIPAddress;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgUnitID" Id="{a1b20000-0000-4000-8000-000000000005}">
+      <Declaration><![CDATA[PROPERTY cfgUnitID : BYTE
+]]></Declaration>
+      <Get Name="Get" Id="{a1b20000-0000-4000-8000-000000000006}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgUnitID := _unitId;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a1b20000-0000-4000-8000-000000000007}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_unitId := cfgUnitID;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdRun" Id="{a1b20000-0000-4000-8000-000000000010}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdRun : BOOL
+VAR_INPUT
+	command		: BOOL;		// TRUE = run forward, FALSE = stop
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_ctrlRun := command;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdSetpoint" Id="{a1b20000-0000-4000-8000-000000000011}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdSetpoint : BOOL
+VAR_INPUT
+	setpoint	: LREAL;	// 0..100 percent (negative clamped to 0)
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_ctrlSetpoint := LIMIT(0.0, setpoint, 100.0);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{a1b20000-0000-4000-8000-000000000012}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[setFault(0, '');
+VFD.cmdReset();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FaultHandler" Id="{a1b20000-0000-4000-8000-000000000014}">
+      <Declaration><![CDATA[METHOD PRIVATE FaultHandler : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Overpressure: latch as a pump fault so the operator sees what stopped the
+// pump. Without this, the interlock-3 enforcement above silently force-stops
+// the pump with no fault state.
+IF inpOverpressureTrip THEN
+	setFault(1, 'Overpressure trip');
+END_IF
+
+// Forward drive-level trip as a pump fault. Evaluated after overpressure so
+// that if both fire simultaneously, the drive fault code surfaces in the
+// description (overpressure already routed to the drive via CW bit 12).
+IF VFD.stsTripped THEN
+	setFault(1, CONCAT('VFD Tripped, code ', UINT_TO_STRING(VFD.stsFaultCode)));
+END_IF
+
+// Drive-level warning passthrough
+IF VFD.stsAlarm THEN
+	sendWarning('Drive alarm active', 10);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="updateHMI" Id="{a1b20000-0000-4000-8000-000000000015}">
+      <Declaration><![CDATA[METHOD PRIVATE updateHMI : BOOL
+VAR
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[HMI.HMIbaseDevice			:= HMIbaseDevice;
+HMI.stsInterlocks			:= interlock.getHMIdata();
+HMI.stsOverpressureTripped	:= stsOverpressureTripped;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{a1b20000-0000-4000-8000-000000000016}">
+      <Declaration><![CDATA[METHOD FB_Init : BOOL
+VAR_INPUT
+	bInitRetains		: BOOL;
+	bInCopyCode			: BOOL;
+	cfgDeviceName		: STRING;
+	cfgEnable			: BOOL;
+	cfgInitEventClass	: BOOL;
+	cfgIPAddress		: STRING(15);
+	cfgUnitID			: BYTE;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName		:= cfgDeviceName;
+THIS^.cfgEnable			:= cfgEnable;
+THIS^.cfgInitEventClass	:= cfgInitEventClass;
+THIS^.cfgIPAddress		:= cfgIPAddress;
+THIS^.cfgUnitID			:= cfgUnitID;
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

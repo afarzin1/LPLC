@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_Axis_Mode" Id="{a1b2c3d4-e5f6-7890-ab01-ef1234567890}">
+    <Declaration><![CDATA[TYPE E_Axis_Mode :
+(
+    eAbsolute    := 0,  // MC_MoveAbsolute
+    eRelative    := 1,  // MC_MoveRelative
+    eVelocity    := 2,  // MC_MoveVelocity
+    eTorque      := 3,  // MC_TorqueControl
+    eHalt        := 4,  // MC_Halt (interruptible)
+    eStop        := 5,  // MC_Stop (forced standstill)
+    eHome        := 6,  // reserved Phase 2
+    eSetPosition := 7,  // reserved Phase 2
+    eModulo      := 8,  // reserved Phase 2
+    eExternal    := 9   // coordination hook - yields axis to external owner
+) INT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

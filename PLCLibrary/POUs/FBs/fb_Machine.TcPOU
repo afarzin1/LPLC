@@ -1,0 +1,299 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Machine" Id="{7f8a0705-1be0-4c4a-b8d0-9fd9c1011634}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Machine
+
+VAR_INPUT
+	inpReset				: BOOL;		// IO Reset button
+	inpStop					: BOOL;		// IO Stop button
+	inpStart				: BOOL;		// IO Start button
+	inpStartedFeedback		: BOOL;		// State feedback from state machine
+	inpBypassInterlocks		: BOOL;		// IO interlock bypass switch
+	inpAuto					: BOOL;		// IO Auto 
+	inpPause				: BOOL;		// IO Pause button
+	inpPausedFeedback		: BOOL;		// State feedback from state machine
+	inpSafetyPowerOn		: BOOL;		// Feedback from safety controller
+	inpSafetyFaultActive	: BOOL;		// Feedback from safety controller
+	inpSafetyFaultDelay		: BOOL;		// Feedback from safety controller
+	inpSafetyResetButton	: BOOL;		// IO safety reset
+END_VAR
+
+VAR
+	HMI					: ST_Machine_HMI_Interface;
+	_faultMonitor		: fb_FaultMonitor;
+	eventLogger 		: FB_tcEventLogger;
+	firstScanTOF	  	: TOF;
+	_clearLogs			: BOOL;
+	_cmdStop			: BOOL;
+	_cmdStart			: BOOL;
+	_reset				: BOOL;
+	_stop				: BOOL;
+	_start				: BOOL;
+	_auto				: BOOL;
+	_pause				: BOOL;
+	_interlockbypass	: BOOL;
+	_safetyPowerOn		: BOOL;
+	_safetyFaultActive	: BOOL;
+	_safetyFaultDelay	: BOOL;
+	transSafetyReset	: R_TRIG;
+	hostname		  	: fb_gethostname;
+	_firstScan			: BOOL := TRUE;
+	// --- machine identity = the IPC hostname (2026-09-20) ---
+	_machineName		: T_MaxString;	// set once FB_GetHostName has answered; empty before that
+	_hostnameRetry		: TON;			// re-arms the lookup while it keeps failing (cold restart: system service not ready yet)
+	_hostnameAttempts	: UDINT;		// diagnostic: how many asks it took
+	_identityLogged		: BOOL;
+	_clearLogTrig		: BOOL;
+	MachineState		: fb_Dev_Machine(cfgDeviceName := 'Machine', cfgEnable := TRUE, cfgInitEventClass :=TRUE,);
+	myUPS 				: FB_S_UPS_BAPI;
+	writePersistent	  	: fb_WritePersistentData;
+	writePersTrig	  	: BOOL;
+	_hasUPS				: BOOL;
+	_hbTimer			: TON;		// 500ms heartbeat generator (HMI frozen-data watchdog)
+	_heartbeat			: BOOL;		// toggled square wave published to HMI.stsHeartBeat
+END_VAR
+
+VAR_OUTPUT
+	stsAuto					: BOOL;
+	stsInterlocksBypassed	: BOOL;
+	stsFirstScan			: BOOL;
+	stsMachineName			: T_MaxString;
+	stsIdentityValid		: BOOL;		// TRUE once stsMachineName holds the IPC hostname
+	stsStarted				: BOOL;
+	stsFaultActive			: BOOL;
+	outStop					: BOOL;
+	outReset				: BOOL;
+	outStart				: BOOL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[firstScanTOF(IN:=_clearLogTrig,PT:=T#20ms);
+
+//Machine identity = the IPC hostname, nothing else. FB_GetHostName is one ADS
+//call to the local system service; right after a cold restart it can fail or
+//time out, and the old one-shot on the first scan then left the name empty for
+//good, and everything keyed on the machine name never started. Ask until it answers.
+hostname(sNetID:='', tTimeout:=T#2S);
+IF hostname.bExecute AND NOT hostname.bBusy THEN
+	// request finished: the result or the error is in
+	hostname.bExecute := FALSE;
+	IF NOT hostname.bError AND hostname.sHostName <> '' THEN
+		_machineName := hostname.sHostName;
+	END_IF
+END_IF
+_hostnameRetry(IN := (_machineName = '') AND NOT hostname.bExecute AND NOT hostname.bBusy, PT := T#1S);
+IF (_firstScan OR _hostnameRetry.Q) AND _machineName = '' AND NOT hostname.bExecute THEN
+	hostname.bExecute := TRUE;
+	_hostnameAttempts := _hostnameAttempts + 1;
+END_IF
+IF _machineName <> '' AND NOT _identityLogged THEN
+	_identityLogged := TRUE;
+	ADSLOGSTR(ADSLOG_MSGTYPE_HINT OR ADSLOG_MSGTYPE_LOG,
+		CONCAT(CONCAT('Machine identity acquired after ', UDINT_TO_STRING(_hostnameAttempts)), ' attempt(s): %s'), _machineName);
+END_IF
+
+// Run UPS
+IF _hasUPS THEN
+	myUPS(sNetID :='',
+			iPLCPort:=851,
+		  tTimeout := DEFAULT_ADS_TIMEOUT,
+		  eUPSMode := eSUPS_WrPersistData_Shutdown,
+		  ePersistentMode := SPDM_2PASS,tRecoverTime := T#3S);
+	writePersistent(NETID:='', PORT := 851, START:= writePersTrig,TMOUT := DEFAULT_ADS_TIMEOUT);
+END_IF
+
+//Run global fault monitor	  
+_faultMonitor();
+
+// Interlock Bypass
+
+_interlockBypass := inpBypassInterlocks;
+
+//Send out Reset oneshot if reset is triggered from HMI, safety button, or method
+transSafetyReset(CLK:=inpSafetyResetButton);
+IF transSafetyReset.q OR HMI.inpReset OR _reset OR inpReset THEN
+	HMI.inpReset 	:= FALSE;
+	_reset			:= FALSE;
+	outReset	 	:= TRUE;
+	IF _stop THEN
+		_stop := FALSE;
+	END_IF
+ELSE
+	outReset 		:= FALSE;
+END_IF
+
+IF HMI.inpManual THEN
+	HMI.inpManual 	:= FALSE;
+	_auto 			:= FALSE;
+END_IF
+
+IF HMI.inpAuto OR inpAuto THEN
+	HMI.inpAuto 	:= FALSE;
+	_auto			:= TRUE;
+END_IF
+
+IF HMI.inpStart OR _cmdStart THEN
+	HMI.inpStart := FALSE;
+	_cmdStart	 := FALSE;
+	outStart	 := TRUE;
+ELSE
+	outStart	:= FALSE;
+END_IF
+
+IF HMI.inpStop OR inpStop OR _cmdStop THEN
+	HMI.inpStop	:= FALSE;
+	_cmdStop	:= FALSE;
+	_start		:= FALSE;
+	_stop		:= TRUE;
+END_IF
+
+IF HMI.inpClearMachineLog OR _clearLogs THEN
+	HMI.inpClearMachineLog := FALSE;
+	_clearLogs		:= FALSE;
+	_clearLogTrig	:= TRUE;
+END_IF
+
+IF firstScanTOF.Q THEN
+	_clearLogTrig	:= FALSE;
+	eventLogger.ClearLoggedEvents(0);
+END_IF
+
+HMI.stsMachineName			:= _machineName;
+HMI.stsInAuto				:= _auto;
+HMI.stsInManual				:= NOT(_auto);
+HMI.stsInterlockBypassed	:= _interlockbypass;
+HMI.stsPaused				:= inpPausedFeedback;
+HMI.stsStarted				:= inpStartedFeedback;
+HMI.stsStopped				:= _stop;
+
+// HMI heartbeat: 500ms on / 500ms off square wave the web HMI watches to detect frozen data
+// end-to-end (PLC stopped / stale reads) even while the transport still reads OK.
+_hbTimer(IN := NOT _hbTimer.Q, PT := T#500MS);
+IF _hbTimer.Q THEN
+	_heartbeat := NOT _heartbeat;
+END_IF
+HMI.stsHeartBeat			:= _heartbeat;
+
+_safetyPowerOn				:= inpSafetyPowerOn;
+_safetyFaultActive			:= inpSafetyFaultActive;
+_safetyFaultDelay			:= inpSafetyFaultDelay;
+
+MachineState(inpAuto := _auto, inpReset := outReset, inpInterlockbypass := _interlockbypass, start:=_start, stop:=_stop
+			, SafetyPowerOn:= _safetyPowerOn, SafetyFaultActive:=_safetyFaultActive, faultMonitor :=ADR(_faultMonitor));
+
+stsAuto						:= _auto;
+stsInterlocksBypassed		:= _interlockbypass;
+stsFirstScan				:= _firstScan;
+stsMachineName				:= _machineName;
+stsIdentityValid			:= _machineName <> '';
+stsStarted					:= inpStartedFeedback;
+outStop						:= _stop;
+stsFaultActive				:= _faultMonitor.stsFaultActive;]]></ST>
+    </Implementation>
+    <Property Name="cfgHasUPS" Id="{33e6fa17-4cb0-46ce-90af-8ec03aed5e16}">
+      <Declaration><![CDATA[PROPERTY cfgHasUPS : bool]]></Declaration>
+      <Get Name="Get" Id="{d4ca7d72-81df-41bc-b0b5-79b394370d9e}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgHasUPS := _hasUPS;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{e906af9b-cc6b-4dd5-938d-4764949f2064}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_hasUPS := cfgHasUPS;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdClearLogs" Id="{11a5ebb8-875a-464a-8015-e37994080214}">
+      <Declaration><![CDATA[METHOD cmdClearLogs : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_clearLogs := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdExportEventLogs" Id="{d1a0c004-0001-4000-a000-000000000001}">
+      <Declaration><![CDATA[METHOD cmdExportEventLogs : BOOL
+VAR_INPUT
+	filePath : T_MaxString;
+END_VAR
+VAR
+	exportSettings : FB_TcEventCsvExportSettings;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[exportSettings.sDelimiter := ',';
+eventLogger.ExportLoggedEvents(sFilename := filePath, ipExportSettings:=exportSettings);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{f0b642a8-0b7a-4357-b086-980537144a82}">
+      <Declaration><![CDATA[METHOD cmdReset : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_reset := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdStart" Id="{13eb1f16-b1f6-4d86-91c9-1f7208565916}">
+      <Declaration><![CDATA[METHOD cmdStart : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_cmdStart := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdStop" Id="{058be764-dd28-4a27-939b-0533cedda3b3}">
+      <Declaration><![CDATA[METHOD cmdStop : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_cmdStop := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="faultMonitor" Id="{fd32180d-56bf-4436-a9c1-69518cb7bd56}">
+      <Declaration><![CDATA[PROPERTY faultMonitor : POINTER TO fb_faultmonitor]]></Declaration>
+      <Get Name="Get" Id="{3d7dea71-e072-4a7c-b651-0a5e0edccbb8}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[faultMonitor := ADR(_faultMonitor);]]></ST>
+        </Implementation>
+      </Get>
+    </Property>
+    <Method Name="FB_Init" Id="{352d8cdc-14f5-4dad-aec6-564534ca5870}">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init: BOOL
+VAR_INPUT
+    bInitRetains: BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode: BOOL;  // TRUE: the instance will be copied to the copy code afterward (online change)   
+	hasUPS		: BOOL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^._hasUPS := hasUPS;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="firstScanComplete" Id="{2c239553-aa5e-463f-a848-eb6a02afbeac}">
+      <Declaration><![CDATA[METHOD firstScanComplete : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_firstScan := FALSE;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

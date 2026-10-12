@@ -1,0 +1,2104 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Modbus_Driver" Id="{9216fba1-c86d-4127-bdbb-73384648b062}" SpecialFunc="None">
+    <Declaration><![CDATA[// High-level Modbus TCP driver. Configuration-driven: define signals as
+// arrays of ST_MBSignalConfig and the driver handles block optimization,
+// endian conversion, RMW for bit-in-register writes, reconnection, and
+// quality tracking.
+//
+// Usage:
+//   1. Set properties (ipAddress, readSignalCount, writeSignalCount, ...)
+//      BEFORE first enabling the FB.
+//   2. Pass pointers to user arrays (config, results, write data) via inputs.
+//   3. Call cycle() every PLC scan after the FB body call.
+//   4. Optional: hold inpHoldWrites TRUE to keep reading without writing — e.g. until
+//      the caller has read the device's current values to seed its write data from.
+//
+// Failure handling: after maxConsecFails failed transactions in a row the driver drops the
+// link, waits reconnectDelay and retries; after maxReconnectAttempts such retries without a
+// clean read cycle it stops in Faulted (no traffic) until cmdReset() or an enable toggle.
+//
+// Required library: Tc3_ModbusTCP (TF6250).
+FUNCTION_BLOCK fb_Modbus_Driver
+VAR_INPUT
+    inpEnable               : BOOL;
+    inpHoldWrites           : BOOL;     // TRUE = keep polling reads, start no write cycle
+
+    inpPtrReadConfig        : POINTER TO ST_MBSignalConfig;
+    inpPtrWriteConfig       : POINTER TO ST_MBSignalConfig;
+    inpPtrReadResults       : POINTER TO ST_MBReadResult;
+    inpPtrWriteData         : POINTER TO ST_MBWriteData;
+END_VAR
+
+VAR_OUTPUT
+    stsStatus               : ST_MBDeviceStatus;
+    stsError                : BOOL;
+    stsErrorId              : UDINT;
+END_VAR
+
+VAR CONSTANT
+    MAX_READ_SIGNALS        : UINT := 100;
+    MAX_WRITE_SIGNALS       : UINT := 100;
+    MAX_READ_BLOCKS         : UINT := 25;
+    MAX_WRITE_BLOCKS        : UINT := 25;
+    MAX_REGS_PER_BLOCK      : UINT := 125;
+    MAX_COILS_PER_BLOCK     : UINT := 2000;
+    MAX_SIGNALS_PER_BLOCK   : UINT := 64;
+    MAX_BIT_REGISTERS       : UINT := 20;
+    GAP_TOLERANCE_REGS      : UINT := 4;
+    GAP_TOLERANCE_COILS     : UINT := 16;
+    BIT_INDEX_NA            : BYTE := 255;
+END_VAR
+
+VAR
+    // Configuration (set via properties before enable)
+    cfgIpAddress            : STRING(15) := '192.168.1.1';
+    cfgPort                 : UINT := 502;
+    cfgUnitId               : BYTE := 1;
+    cfgTimeout              : TIME := T#1S;
+    cfgPollInterval         : TIME := T#100MS;
+    cfgCommandDelay         : TIME := T#10MS;
+    cfgWriteCycleInterval   : TIME := T#500MS;
+    cfgWordOrder            : E_WordOrder := E_WordOrder.BigEndian;
+    cfgMaxConsecFails       : UINT := 3;
+    cfgStaleThreshold       : TIME := T#5S;
+    cfgReconnectDelay       : TIME := T#2S;
+    cfgMaxReconnectAttempts : UINT := 3;
+    cfgReadSignalCount      : UINT;
+    cfgWriteSignalCount     : UINT;
+
+    // State machine
+    _state                  : E_DriverState := E_DriverState.Init;
+    _initialized            : BOOL;
+    _enablePrev             : BOOL;
+
+    // Connection state (Tc2_ModbusCaller manages TCP internally per FB call;
+    // _socketConnected here means "driver is ready and last operation didn't fail")
+    _socketConnected        : BOOL;
+    _connectAttempts        : UINT;
+    _disconnectPending      : BOOL;
+
+    // Timing
+    tonPollInterval         : TON;
+    tonWriteInterval        : TON;
+    tonCommandDelay         : TON;
+    tonTimeout              : TON;
+    tonReconnectDelay       : TON;
+    _lastGoodReadTime       : TIME;
+    _lastGoodWriteTime      : TIME;
+
+    // Parsed configuration
+    _arrParsedRead          : ARRAY[1..100] OF ST_ParsedSignal;
+    _arrParsedWrite         : ARRAY[1..100] OF ST_ParsedSignal;
+
+    // Optimized blocks
+    _arrReadBlocks          : ARRAY[1..25] OF ST_ReadBlock;
+    _readBlockCount         : UINT;
+
+    _arrWriteBlocks         : ARRAY[1..25] OF ST_WriteBlock;
+    _writeBlockCount        : UINT;
+
+    // Bit register tracking (RMW)
+    _arrBitRegisters        : ARRAY[1..20] OF ST_BitRegisterRmw;
+    _bitRegisterCount       : UINT;
+
+    // Runtime indices
+    _currentBlockIdx        : UINT;
+    _currentRmwIdx          : UINT;
+
+    // Raw data buffers
+    _arrRawReadBuffer       : ARRAY[0..124] OF WORD;
+    _arrRawWriteBuffer      : ARRAY[0..124] OF WORD;
+
+    // Tc2_ModbusCaller function blocks (each manages its own TCP connection)
+    fbMbReadCoils           : FB_MBReadCoils;       // FC01
+    fbMbReadInputs          : FB_MBReadInputs;      // FC02 (discrete inputs)
+    fbMbReadRegs            : FB_MBReadRegs;        // FC03 (holding regs)
+    fbMbReadInputRegs       : FB_MBReadInputRegs;   // FC04 (input regs)
+    fbMbWriteSingleCoil     : FB_MBWriteSingleCoil; // FC05
+    fbMbWriteSingleReg      : FB_MBWriteSingleReg;  // FC06
+    fbMbWriteCoils          : FB_MBWriteCoils;      // FC15
+    fbMbWriteRegs           : FB_MBWriteRegs;       // FC16
+
+    // Error tracking
+    _consecFailures         : UINT;
+    _lastMbError            : UDINT;
+    _readCycleFailed        : BOOL;     // a block failed in the current read cycle
+    _writeCycleFailed       : BOOL;     // a block failed in the current write cycle
+    _resetRequest           : BOOL;     // cmdReset(): restart from Init without an enable edge
+
+    // Sorting workspace
+    _arrSortIdx             : ARRAY[1..100] OF UINT;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// FB body intentionally empty. All work is performed in the cycle() method,
+// which the user must call once per PLC scan after invoking the FB itself.
+;]]></ST>
+    </Implementation>
+    <Method Name="applyBitModifications" Id="{dcdfc097-d520-4757-8c4b-cd77e375abd5}">
+      <Declaration><![CDATA[METHOD PRIVATE applyBitModifications
+VAR_INPUT
+    inpRmwIdx : UINT;
+END_VAR
+VAR
+    _reg        : REFERENCE TO ST_BitRegisterRmw;
+    _baseValue  : WORD;
+    _bitIdx     : UINT;
+    _sigIdx     : UINT;
+    _pData      : POINTER TO ST_MBWriteData;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_reg REF= _arrBitRegisters[inpRmwIdx];
+
+_baseValue := swapBytes(_reg.readValue);
+
+FOR _bitIdx := 0 TO 15 DO
+    IF (_reg.managedBitMask AND SHL(WORD#1, _bitIdx)) <> 0 THEN
+        _sigIdx := _reg.arrSignalIndex[_bitIdx];
+
+        IF _sigIdx > 0 THEN
+            _pData := inpPtrWriteData + UINT_TO_DWORD(_sigIdx - 1) * SIZEOF(ST_MBWriteData);
+
+            IF _pData^.valueBool THEN
+                _baseValue := _baseValue OR SHL(WORD#1, _bitIdx);
+            ELSE
+                _baseValue := _baseValue AND NOT SHL(WORD#1, _bitIdx);
+            END_IF
+        END_IF
+    END_IF
+END_FOR
+
+_reg.writeValue := _baseValue;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="checkReadComplete" Id="{d5095362-abcf-49bc-9904-d9492d145606}">
+      <Declaration><![CDATA[METHOD PRIVATE checkReadComplete : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE _arrReadBlocks[_currentBlockIdx].functionCode OF
+    1:
+        fbMbReadCoils(bExecute := FALSE);
+        checkReadComplete := NOT fbMbReadCoils.bBusy;
+    2:
+        fbMbReadInputs(bExecute := FALSE);
+        checkReadComplete := NOT fbMbReadInputs.bBusy;
+    3:
+        fbMbReadRegs(bExecute := FALSE);
+        checkReadComplete := NOT fbMbReadRegs.bBusy;
+    4:
+        fbMbReadInputRegs(bExecute := FALSE);
+        checkReadComplete := NOT fbMbReadInputRegs.bBusy;
+ELSE
+    // RMW read path uses fbMbReadRegs unconditionally.
+    fbMbReadRegs(bExecute := FALSE);
+    checkReadComplete := NOT fbMbReadRegs.bBusy;
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="checkStaleData" Id="{f407b87e-5eaf-4101-8e55-f46fd34fb869}">
+      <Declaration><![CDATA[METHOD PRIVATE checkStaleData
+VAR
+    _i          : UINT;
+    _pResult    : POINTER TO ST_MBReadResult;
+    _elapsed    : TIME;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_elapsed := TIME() - _lastGoodReadTime;
+
+IF _elapsed > cfgStaleThreshold THEN
+    FOR _i := 1 TO cfgReadSignalCount DO
+        _pResult := inpPtrReadResults + UINT_TO_DWORD(_i - 1) * SIZEOF(ST_MBReadResult);
+
+        IF _pResult^.quality = E_SignalQuality.Good THEN
+            _pResult^.quality := E_SignalQuality.UncertainStale;
+        END_IF
+    END_FOR
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="checkWriteComplete" Id="{3668d78b-676d-4a0b-953d-f7ace7eeb00c}">
+      <Declaration><![CDATA[METHOD PRIVATE checkWriteComplete : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _state = E_DriverState.WriteWait THEN
+    IF _arrWriteBlocks[_currentBlockIdx].area = E_MBArea.Coils THEN
+        fbMbWriteCoils(bExecute := FALSE);
+        checkWriteComplete := NOT fbMbWriteCoils.bBusy;
+    ELSE
+        fbMbWriteRegs(bExecute := FALSE);
+        checkWriteComplete := NOT fbMbWriteRegs.bBusy;
+    END_IF
+ELSE
+    fbMbWriteSingleReg(bExecute := FALSE);
+    checkWriteComplete := NOT fbMbWriteSingleReg.bBusy;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{4f0d507f-bb4e-4070-8d68-dfce59acdbc0}">
+      <Declaration><![CDATA[// Recover a Faulted (or errored) driver without toggling inpEnable: it restarts from Init on
+// the next cycle() — re-parses the configuration and resumes polling. No effect while disabled.
+METHOD PUBLIC cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpEnable THEN
+    _state := E_DriverState.Init;
+    _resetRequest := TRUE;
+    cmdReset := TRUE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="combineWords" Id="{27fa7240-bb0a-4728-8a80-25f819de38bb}">
+      <Declaration><![CDATA[METHOD PRIVATE combineWords : DWORD
+VAR_INPUT
+    inpWord0        : WORD;
+    inpWord1        : WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF cfgWordOrder = E_WordOrder.BigEndian THEN
+    combineWords := SHL(WORD_TO_DWORD(inpWord0), 16) OR WORD_TO_DWORD(inpWord1);
+ELSE
+    combineWords := SHL(WORD_TO_DWORD(inpWord1), 16) OR WORD_TO_DWORD(inpWord0);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="commandDelay" Id="{5398d53f-7ea6-4ddc-9612-586aca22437b}">
+      <Declaration><![CDATA[PROPERTY PUBLIC commandDelay : TIME
+]]></Declaration>
+      <Get Name="Get" Id="{416f4204-869d-4247-8338-1fb3351c178a}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[commandDelay := cfgCommandDelay;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{7c012c75-0059-405b-af23-9f4a9c2e6c41}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgCommandDelay := commandDelay;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cycle" Id="{5bd2019c-4a0b-4ac9-8220-067fe3ecbac3}">
+      <Declaration><![CDATA[METHOD PUBLIC cycle
+VAR
+    _risingEnable   : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_risingEnable := inpEnable AND NOT _enablePrev;
+_enablePrev := inpEnable;
+
+IF NOT inpEnable THEN
+    disable();
+    RETURN;
+END_IF
+
+IF _initialized AND _socketConnected THEN
+    stsStatus.timeSinceLastGoodRead := TIME() - _lastGoodReadTime;
+    stsStatus.timeSinceLastGoodWrite := TIME() - _lastGoodWriteTime;
+END_IF
+
+CASE _state OF
+
+    E_DriverState.Init:
+        IF _risingEnable OR _resetRequest THEN
+            _resetRequest := FALSE;
+            reset();
+            _state := E_DriverState.ParseConfig;
+        END_IF
+
+    E_DriverState.ParseConfig:
+        IF parseAllConfigs() THEN
+            _state := E_DriverState.OptimizeBlocks;
+        ELSE
+            stsError := TRUE;
+            _state := E_DriverState.Error;
+        END_IF
+
+    E_DriverState.OptimizeBlocks:
+        optimizeReadBlocks();
+        optimizeWriteBlocks();
+        identifyBitRegisters();
+
+        stsStatus.readBlockCount := _readBlockCount;
+        stsStatus.writeBlockCount := _writeBlockCount;
+        stsStatus.bitRegisterCount := _bitRegisterCount;
+
+        _initialized := TRUE;
+        _state := E_DriverState.Connecting;
+
+    E_DriverState.Connecting:
+        // Tc2_ModbusCaller manages TCP internally per FB call; no explicit connect.
+        // Treat the driver as "ready to talk" once configs are parsed.
+        _socketConnected := TRUE;
+        _connectAttempts := 0;
+        stsStatus.connected := TRUE;
+        stsStatus.reconnectAttempts := 0;
+        _lastGoodReadTime := TIME();
+        _lastGoodWriteTime := TIME();
+        _state := E_DriverState.Ready;
+
+    E_DriverState.ConnectWait:
+        // Vestigial state retained for E_DriverState compatibility; transition to Ready.
+        _state := E_DriverState.Ready;
+
+    E_DriverState.ReconnectWait:
+        tonReconnectDelay(IN := TRUE, PT := cfgReconnectDelay);
+        IF tonReconnectDelay.Q THEN
+            tonReconnectDelay(IN := FALSE);
+            _socketConnected := TRUE;
+            stsStatus.connected := TRUE;
+            _state := E_DriverState.Ready;
+        END_IF
+
+    E_DriverState.Disconnecting:
+        // No socket to disconnect (Tc2_ModbusCaller is per-call).
+        _socketConnected := FALSE;
+        stsStatus.connected := FALSE;
+        stsStatus.readCycleActive := FALSE;
+        stsStatus.writeCycleActive := FALSE;
+        _consecFailures := 0;           // the retry gets its own maxConsecFails budget
+        _state := E_DriverState.DisconnectWait;
+
+    E_DriverState.DisconnectWait:
+        IF _disconnectPending THEN
+            _disconnectPending := FALSE;
+            tonReconnectDelay(IN := FALSE);
+            _state := E_DriverState.ReconnectWait;
+        ELSE
+            _state := E_DriverState.Init;
+        END_IF
+
+    E_DriverState.Ready:
+        tonPollInterval(IN := TRUE, PT := cfgPollInterval);
+        IF tonPollInterval.Q THEN
+            tonPollInterval(IN := FALSE);
+            IF _readBlockCount > 0 THEN
+                _state := E_DriverState.ReadStart;
+                RETURN;
+            END_IF
+        END_IF
+
+        tonWriteInterval(IN := TRUE, PT := cfgWriteCycleInterval);
+        IF tonWriteInterval.Q THEN
+            tonWriteInterval(IN := FALSE);
+            IF NOT inpHoldWrites AND (_writeBlockCount > 0 OR _bitRegisterCount > 0) THEN
+                _state := E_DriverState.WriteStart;
+                RETURN;
+            END_IF
+        END_IF
+
+        checkStaleData();
+
+    E_DriverState.ReadStart:
+        _currentBlockIdx := 1;
+        _readCycleFailed := FALSE;
+        stsStatus.readCycleActive := TRUE;
+        _state := E_DriverState.ReadSend;
+
+    E_DriverState.ReadSend:
+        IF _currentBlockIdx > _readBlockCount THEN
+            _state := E_DriverState.ReadComplete;
+        ELSE
+            sendReadRequest(_currentBlockIdx);
+            _state := E_DriverState.ReadWait;
+        END_IF
+
+    E_DriverState.ReadWait:
+        tonTimeout(IN := TRUE, PT := cfgTimeout);
+
+        IF checkReadComplete() THEN
+            tonTimeout(IN := FALSE);
+            IF readSucceeded() THEN
+                processReadBlock(_currentBlockIdx);
+                _consecFailures := 0;
+            ELSE
+                handleBlockError(_currentBlockIdx, TRUE);
+            END_IF
+            IF _state = E_DriverState.ReadWait THEN   // the error handler may have moved us to Disconnecting/Faulted
+                _state := E_DriverState.ReadDelay;
+            END_IF
+
+        ELSIF tonTimeout.Q THEN
+            tonTimeout(IN := FALSE);
+            handleBlockError(_currentBlockIdx, TRUE);
+            IF _state = E_DriverState.ReadWait THEN   // the error handler may have moved us to Disconnecting/Faulted
+                _state := E_DriverState.ReadDelay;
+            END_IF
+        END_IF
+
+    E_DriverState.ReadDelay:
+        tonCommandDelay(IN := TRUE, PT := cfgCommandDelay);
+        IF tonCommandDelay.Q THEN
+            tonCommandDelay(IN := FALSE);
+            _currentBlockIdx := _currentBlockIdx + 1;
+            _state := E_DriverState.ReadSend;
+        END_IF
+
+    E_DriverState.ReadComplete:
+        stsStatus.readCycleActive := FALSE;
+        stsStatus.totalReadCycles := stsStatus.totalReadCycles + 1;
+        // Only a cycle in which EVERY block succeeded is a good read. Stamping it regardless
+        // kept timeSinceLastGoodRead near zero (and stale marking off) while every read failed.
+        IF NOT _readCycleFailed THEN
+            _lastGoodReadTime := TIME();
+            _connectAttempts := 0;      // link proven again: the reconnect budget starts over
+            stsStatus.reconnectAttempts := 0;
+        END_IF
+        _state := E_DriverState.Ready;
+
+    E_DriverState.WriteStart:
+        _currentBlockIdx := 1;
+        _writeCycleFailed := FALSE;
+        _currentRmwIdx := 0;
+        stsStatus.writeCycleActive := TRUE;
+        _state := E_DriverState.WriteSend;
+
+    E_DriverState.WriteSend:
+        WHILE _currentBlockIdx <= _writeBlockCount DO
+            IF NOT _arrWriteBlocks[_currentBlockIdx].containsBitSignals THEN
+                packAndSendWriteBlock(_currentBlockIdx);
+                _state := E_DriverState.WriteWait;
+                RETURN;
+            END_IF
+            _currentBlockIdx := _currentBlockIdx + 1;
+        END_WHILE
+
+        IF _currentRmwIdx < _bitRegisterCount THEN
+            _currentRmwIdx := _currentRmwIdx + 1;
+            _state := E_DriverState.RmwReadSend;
+        ELSE
+            _state := E_DriverState.WriteComplete;
+        END_IF
+
+    E_DriverState.WriteWait:
+        tonTimeout(IN := TRUE, PT := cfgTimeout);
+
+        IF checkWriteComplete() THEN
+            tonTimeout(IN := FALSE);
+            IF writeSucceeded() THEN
+                updateWriteStatus(_currentBlockIdx, TRUE);
+                _consecFailures := 0;
+            ELSE
+                handleBlockError(_currentBlockIdx, FALSE);
+                updateWriteStatus(_currentBlockIdx, FALSE);
+            END_IF
+            IF _state = E_DriverState.WriteWait THEN   // the error handler may have moved us to Disconnecting/Faulted
+                _state := E_DriverState.WriteDelay;
+            END_IF
+
+        ELSIF tonTimeout.Q THEN
+            tonTimeout(IN := FALSE);
+            handleBlockError(_currentBlockIdx, FALSE);
+            updateWriteStatus(_currentBlockIdx, FALSE);
+            IF _state = E_DriverState.WriteWait THEN   // the error handler may have moved us to Disconnecting/Faulted
+                _state := E_DriverState.WriteDelay;
+            END_IF
+        END_IF
+
+    E_DriverState.WriteDelay:
+        tonCommandDelay(IN := TRUE, PT := cfgCommandDelay);
+        IF tonCommandDelay.Q THEN
+            tonCommandDelay(IN := FALSE);
+            _currentBlockIdx := _currentBlockIdx + 1;
+            _state := E_DriverState.WriteSend;
+        END_IF
+
+    E_DriverState.RmwReadSend:
+        sendRmwReadRequest(_currentRmwIdx);
+        _state := E_DriverState.RmwReadWait;
+
+    E_DriverState.RmwReadWait:
+        tonTimeout(IN := TRUE, PT := cfgTimeout);
+
+        IF checkReadComplete() THEN
+            tonTimeout(IN := FALSE);
+            IF readSucceeded() THEN
+                _arrBitRegisters[_currentRmwIdx].readValue := _arrRawReadBuffer[0];
+                _state := E_DriverState.RmwModify;
+            ELSE
+                handleRmwError(_currentRmwIdx);
+                IF _state = E_DriverState.RmwReadWait THEN   // the error handler may have moved us to Disconnecting/Faulted
+                    _state := E_DriverState.RmwDelay;
+                END_IF
+            END_IF
+
+        ELSIF tonTimeout.Q THEN
+            tonTimeout(IN := FALSE);
+            handleRmwError(_currentRmwIdx);
+            IF _state = E_DriverState.RmwReadWait THEN   // the error handler may have moved us to Disconnecting/Faulted
+                _state := E_DriverState.RmwDelay;
+            END_IF
+        END_IF
+
+    E_DriverState.RmwModify:
+        applyBitModifications(_currentRmwIdx);
+        _state := E_DriverState.RmwWriteSend;
+
+    E_DriverState.RmwWriteSend:
+        sendRmwWriteRequest(_currentRmwIdx);
+        _state := E_DriverState.RmwWriteWait;
+
+    E_DriverState.RmwWriteWait:
+        tonTimeout(IN := TRUE, PT := cfgTimeout);
+
+        IF checkWriteComplete() THEN
+            tonTimeout(IN := FALSE);
+            IF writeSucceeded() THEN
+                updateRmwStatus(_currentRmwIdx, TRUE);
+                _consecFailures := 0;
+            ELSE
+                handleRmwError(_currentRmwIdx);
+                updateRmwStatus(_currentRmwIdx, FALSE);
+            END_IF
+            IF _state = E_DriverState.RmwWriteWait THEN   // the error handler may have moved us to Disconnecting/Faulted
+                _state := E_DriverState.RmwDelay;
+            END_IF
+
+        ELSIF tonTimeout.Q THEN
+            tonTimeout(IN := FALSE);
+            handleRmwError(_currentRmwIdx);
+            updateRmwStatus(_currentRmwIdx, FALSE);
+            IF _state = E_DriverState.RmwWriteWait THEN   // the error handler may have moved us to Disconnecting/Faulted
+                _state := E_DriverState.RmwDelay;
+            END_IF
+        END_IF
+
+    E_DriverState.RmwDelay:
+        tonCommandDelay(IN := TRUE, PT := cfgCommandDelay);
+        IF tonCommandDelay.Q THEN
+            tonCommandDelay(IN := FALSE);
+            IF _currentRmwIdx < _bitRegisterCount THEN
+                _currentRmwIdx := _currentRmwIdx + 1;
+                _state := E_DriverState.RmwReadSend;
+            ELSE
+                _state := E_DriverState.WriteComplete;
+            END_IF
+        END_IF
+
+    E_DriverState.WriteComplete:
+        stsStatus.writeCycleActive := FALSE;
+        stsStatus.totalWriteCycles := stsStatus.totalWriteCycles + 1;
+        IF NOT _writeCycleFailed THEN
+            _lastGoodWriteTime := TIME();
+        END_IF
+        _state := E_DriverState.Ready;
+
+    E_DriverState.Error:
+        stsError := TRUE;
+        stsStatus.totalErrors := stsStatus.totalErrors + 1;
+        _disconnectPending := TRUE;
+        _state := E_DriverState.Disconnecting;
+
+    E_DriverState.Faulted:
+        stsStatus.faulted := TRUE;
+        stsError := TRUE;
+
+END_CASE
+
+stsStatus.currentState := _state;
+stsStatus.consecutiveFailures := _consecFailures;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="dintToWords" Id="{b6660868-e0d1-4b30-abe7-2b26b087636f}">
+      <Declaration><![CDATA[METHOD PRIVATE dintToWords
+VAR_INPUT
+    inpValue        : DINT;
+END_VAR
+VAR_OUTPUT
+    stsWord0        : WORD;
+    stsWord1        : WORD;
+END_VAR
+VAR
+    _dword          : DWORD;
+    _w0, _w1        : WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_dword := DINT_TO_DWORD(inpValue);
+splitDword(inpValue := _dword, stsWord0 => _w0, stsWord1 => _w1);
+stsWord0 := swapBytes(_w0);
+stsWord1 := swapBytes(_w1);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="disable" Id="{bb29eacf-e7ae-4c57-a01a-0711812f5ba6}">
+      <Declaration><![CDATA[METHOD PRIVATE disable
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Tc2_ModbusCaller has no socket to tear down explicitly.
+_socketConnected := FALSE;
+
+tonPollInterval(IN := FALSE);
+tonWriteInterval(IN := FALSE);
+tonCommandDelay(IN := FALSE);
+tonTimeout(IN := FALSE);
+tonReconnectDelay(IN := FALSE);
+
+// Back to Init from ANY state, Faulted included: re-enabling restarts the driver. (Faulted used
+// to survive a disable, which left a faulted driver dead until the PLC restarted.)
+_state := E_DriverState.Init;
+_resetRequest := FALSE;
+
+_initialized := FALSE;
+stsStatus.connected := FALSE;
+stsStatus.readCycleActive := FALSE;
+stsStatus.writeCycleActive := FALSE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="handleBlockError" Id="{195a0432-d58e-45c0-a1cd-3eba77f84282}">
+      <Declaration><![CDATA[METHOD PRIVATE handleBlockError
+VAR_INPUT
+    inpBlockIdx : UINT;
+    inpIsRead   : BOOL;
+END_VAR
+VAR
+    _block      : REFERENCE TO ST_ReadBlock;
+    _i          : UINT;
+    _sigIdx     : UINT;
+    _pResult    : POINTER TO ST_MBReadResult;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_consecFailures := _consecFailures + 1;
+stsStatus.totalErrors := stsStatus.totalErrors + 1;
+IF inpIsRead THEN
+    _readCycleFailed := TRUE;
+ELSE
+    _writeCycleFailed := TRUE;
+END_IF
+
+IF inpIsRead THEN
+    _block REF= _arrReadBlocks[inpBlockIdx];
+
+    FOR _i := 1 TO _block.signalCount DO
+        _sigIdx := _block.arrSignalIndex[_i];
+        _pResult := inpPtrReadResults + UINT_TO_DWORD(_sigIdx - 1) * SIZEOF(ST_MBReadResult);
+        _pResult^.quality := E_SignalQuality.BadComm;
+    END_FOR
+END_IF
+
+IF _consecFailures >= cfgMaxConsecFails THEN
+    _connectAttempts := _connectAttempts + 1;
+    stsStatus.reconnectAttempts := _connectAttempts;
+
+    IF _connectAttempts >= cfgMaxReconnectAttempts THEN
+        _state := E_DriverState.Faulted;
+    ELSE
+        _disconnectPending := TRUE;
+        _state := E_DriverState.Disconnecting;
+    END_IF
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="handleRmwError" Id="{5ec8cef9-ad83-4697-9468-f993aa3fbca6}">
+      <Declaration><![CDATA[METHOD PRIVATE handleRmwError
+VAR_INPUT
+    inpRmwIdx : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_consecFailures := _consecFailures + 1;
+stsStatus.totalErrors := stsStatus.totalErrors + 1;
+_writeCycleFailed := TRUE;      // RMW runs inside the write cycle
+
+IF _consecFailures >= cfgMaxConsecFails THEN
+    _connectAttempts := _connectAttempts + 1;
+    stsStatus.reconnectAttempts := _connectAttempts;
+
+    IF _connectAttempts >= cfgMaxReconnectAttempts THEN
+        _state := E_DriverState.Faulted;
+    ELSE
+        _disconnectPending := TRUE;
+        _state := E_DriverState.Disconnecting;
+    END_IF
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="identifyBitRegisters" Id="{31380060-339e-4e1d-96a9-5cfc6a5759d1}">
+      <Declaration><![CDATA[METHOD PRIVATE identifyBitRegisters
+VAR
+    _i, _j          : UINT;
+    _addr           : UINT;
+    _bitIdx         : BYTE;
+    _found          : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_bitRegisterCount := 0;
+
+FOR _i := 1 TO cfgWriteSignalCount DO
+    IF _arrParsedWrite[_i].valid AND _arrParsedWrite[_i].isBitInRegister THEN
+        _addr := _arrParsedWrite[_i].baseAddress;
+        _bitIdx := _arrParsedWrite[_i].bitIndex;
+
+        _found := FALSE;
+        FOR _j := 1 TO _bitRegisterCount DO
+            IF _arrBitRegisters[_j].address = _addr THEN
+                _arrBitRegisters[_j].managedBitMask :=
+                    _arrBitRegisters[_j].managedBitMask OR SHL(WORD#1, _bitIdx);
+                _arrBitRegisters[_j].arrSignalIndex[_bitIdx] := _i;
+                _found := TRUE;
+                EXIT;
+            END_IF
+        END_FOR
+
+        IF NOT _found AND _bitRegisterCount < MAX_BIT_REGISTERS THEN
+            _bitRegisterCount := _bitRegisterCount + 1;
+            _arrBitRegisters[_bitRegisterCount].address := _addr;
+            _arrBitRegisters[_bitRegisterCount].managedBitMask := SHL(WORD#1, _bitIdx);
+            _arrBitRegisters[_bitRegisterCount].arrSignalIndex[_bitIdx] := _i;
+        END_IF
+    END_IF
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="ipAddress" Id="{44fe0803-5d72-4e90-a0fa-3895049caeb6}">
+      <Declaration><![CDATA[PROPERTY PUBLIC ipAddress : STRING(15)
+]]></Declaration>
+      <Get Name="Get" Id="{19909d68-e3fd-403d-885f-ff658df8746a}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[ipAddress := cfgIpAddress;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{4f19b785-11c8-48b7-83de-74dcc28f5bdf}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgIpAddress := ipAddress;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="isReady" Id="{b3577e2b-c499-4970-a796-97364bed8bfa}">
+      <Declaration><![CDATA[PROPERTY PUBLIC isReady : BOOL
+]]></Declaration>
+      <Get Name="Get" Id="{9505d4ae-3065-4137-8b09-926ca32e090e}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[isReady := (_state = E_DriverState.Ready) AND _socketConnected;
+]]></ST>
+        </Implementation>
+      </Get>
+    </Property>
+    <Property Name="maxConsecFails" Id="{a663870a-758f-422e-a54b-b97a34c177fb}">
+      <Declaration><![CDATA[PROPERTY PUBLIC maxConsecFails : UINT
+]]></Declaration>
+      <Get Name="Get" Id="{85172394-ec7f-4ec1-984e-02dbda849abc}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[maxConsecFails := cfgMaxConsecFails;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{dee6e7d0-6373-4c2c-bf92-d65ccd64ad77}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgMaxConsecFails := MAX(1, maxConsecFails);
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="maxReconnectAttempts" Id="{f3a5c49a-99ea-4ef8-bb45-70158ed82959}">
+      <Declaration><![CDATA[PROPERTY PUBLIC maxReconnectAttempts : UINT
+]]></Declaration>
+      <Get Name="Get" Id="{d3f2c198-1252-4047-9faa-aa4917efaf7c}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[maxReconnectAttempts := cfgMaxReconnectAttempts;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{17da10cb-f252-4b16-b17c-2651fa16ef91}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgMaxReconnectAttempts := maxReconnectAttempts;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="optimizeReadBlocks" Id="{111b32e2-46e7-4038-b120-9f158b0477b4}">
+      <Declaration><![CDATA[METHOD PRIVATE optimizeReadBlocks
+VAR
+    _i, _j          : UINT;
+    _sortCount      : UINT;
+    _currentBlock   : UINT;
+    _blockStart     : UINT;
+    _blockEnd       : UINT;
+    _blockArea      : E_MBArea;
+    _gapTolerance   : UINT;
+    _maxPerBlock    : UINT;
+    _nextAddr       : UINT;
+    _nextEnd        : UINT;
+    _temp           : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_sortCount := 0;
+FOR _i := 1 TO cfgReadSignalCount DO
+    IF _arrParsedRead[_i].valid THEN
+        _sortCount := _sortCount + 1;
+        _arrSortIdx[_sortCount] := _i;
+    END_IF
+END_FOR
+
+IF _sortCount = 0 THEN
+    _readBlockCount := 0;
+    RETURN;
+END_IF
+
+FOR _i := 1 TO _sortCount - 1 DO
+    FOR _j := _i + 1 TO _sortCount DO
+        IF shouldSwapForSort(_arrSortIdx[_i], _arrSortIdx[_j], TRUE) THEN
+            _temp := _arrSortIdx[_i];
+            _arrSortIdx[_i] := _arrSortIdx[_j];
+            _arrSortIdx[_j] := _temp;
+        END_IF
+    END_FOR
+END_FOR
+
+_currentBlock := 0;
+_i := 1;
+
+WHILE _i <= _sortCount DO
+    _currentBlock := _currentBlock + 1;
+    IF _currentBlock > MAX_READ_BLOCKS THEN
+        _currentBlock := _currentBlock - 1;
+        EXIT;
+    END_IF
+
+    _blockArea := _arrParsedRead[_arrSortIdx[_i]].area;
+    _blockStart := _arrParsedRead[_arrSortIdx[_i]].baseAddress;
+    _blockEnd := _blockStart + _arrParsedRead[_arrSortIdx[_i]].registerCount - 1;
+
+    IF _blockArea = E_MBArea.Coils OR _blockArea = E_MBArea.DiscreteInputs THEN
+        _gapTolerance := GAP_TOLERANCE_COILS;
+        _maxPerBlock := MAX_COILS_PER_BLOCK;
+    ELSE
+        _gapTolerance := GAP_TOLERANCE_REGS;
+        _maxPerBlock := MAX_REGS_PER_BLOCK;
+    END_IF
+
+    _arrReadBlocks[_currentBlock].area := _blockArea;
+    _arrReadBlocks[_currentBlock].startAddress := _blockStart;
+    _arrReadBlocks[_currentBlock].signalCount := 1;
+    _arrReadBlocks[_currentBlock].arrSignalIndex[1] := _arrSortIdx[_i];
+    _arrReadBlocks[_currentBlock].arrOffsetInBlock[1] := 0;
+    _arrReadBlocks[_currentBlock].enabled := TRUE;
+
+    CASE _blockArea OF
+        E_MBArea.Coils:
+            _arrReadBlocks[_currentBlock].functionCode := 1;
+        E_MBArea.DiscreteInputs:
+            _arrReadBlocks[_currentBlock].functionCode := 2;
+        E_MBArea.HoldingRegisters:
+            _arrReadBlocks[_currentBlock].functionCode := 3;
+        E_MBArea.InputRegisters:
+            _arrReadBlocks[_currentBlock].functionCode := 4;
+    END_CASE
+
+    _j := _i + 1;
+    WHILE _j <= _sortCount DO
+        IF _arrParsedRead[_arrSortIdx[_j]].area <> _blockArea THEN
+            EXIT;
+        END_IF
+
+        _nextAddr := _arrParsedRead[_arrSortIdx[_j]].baseAddress;
+        _nextEnd := _nextAddr + _arrParsedRead[_arrSortIdx[_j]].registerCount - 1;
+
+        IF _nextAddr > (_blockEnd + _gapTolerance + 1) THEN
+            EXIT;
+        END_IF
+
+        IF (_nextEnd - _blockStart + 1) > _maxPerBlock THEN
+            EXIT;
+        END_IF
+
+        _arrReadBlocks[_currentBlock].signalCount :=
+            _arrReadBlocks[_currentBlock].signalCount + 1;
+        _arrReadBlocks[_currentBlock].arrSignalIndex[_arrReadBlocks[_currentBlock].signalCount] :=
+            _arrSortIdx[_j];
+        _arrReadBlocks[_currentBlock].arrOffsetInBlock[_arrReadBlocks[_currentBlock].signalCount] :=
+            _nextAddr - _blockStart;
+
+        IF _nextEnd > _blockEnd THEN
+            _blockEnd := _nextEnd;
+        END_IF
+
+        _j := _j + 1;
+    END_WHILE
+
+    _arrReadBlocks[_currentBlock].quantity := _blockEnd - _blockStart + 1;
+    _i := _j;
+END_WHILE
+
+_readBlockCount := _currentBlock;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="optimizeWriteBlocks" Id="{2abaa8ad-d781-4be3-98d9-7fb6bd199f53}">
+      <Declaration><![CDATA[METHOD PRIVATE optimizeWriteBlocks
+VAR
+    _i, _j          : UINT;
+    _sortCount      : UINT;
+    _currentBlock   : UINT;
+    _blockStart     : UINT;
+    _blockEnd       : UINT;
+    _blockArea      : E_MBArea;
+    _gapTolerance   : UINT;
+    _maxPerBlock    : UINT;
+    _nextAddr       : UINT;
+    _nextEnd        : UINT;
+    _temp           : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_sortCount := 0;
+FOR _i := 1 TO cfgWriteSignalCount DO
+    IF _arrParsedWrite[_i].valid AND NOT _arrParsedWrite[_i].isBitInRegister THEN
+        _sortCount := _sortCount + 1;
+        _arrSortIdx[_sortCount] := _i;
+    END_IF
+END_FOR
+
+IF _sortCount = 0 THEN
+    _writeBlockCount := 0;
+    RETURN;
+END_IF
+
+FOR _i := 1 TO _sortCount - 1 DO
+    FOR _j := _i + 1 TO _sortCount DO
+        IF shouldSwapForSort(_arrSortIdx[_i], _arrSortIdx[_j], FALSE) THEN
+            _temp := _arrSortIdx[_i];
+            _arrSortIdx[_i] := _arrSortIdx[_j];
+            _arrSortIdx[_j] := _temp;
+        END_IF
+    END_FOR
+END_FOR
+
+_currentBlock := 0;
+_i := 1;
+
+WHILE _i <= _sortCount DO
+    _currentBlock := _currentBlock + 1;
+    IF _currentBlock > MAX_WRITE_BLOCKS THEN
+        _currentBlock := _currentBlock - 1;
+        EXIT;
+    END_IF
+
+    _blockArea := _arrParsedWrite[_arrSortIdx[_i]].area;
+    _blockStart := _arrParsedWrite[_arrSortIdx[_i]].baseAddress;
+    _blockEnd := _blockStart + _arrParsedWrite[_arrSortIdx[_i]].registerCount - 1;
+
+    IF _blockArea = E_MBArea.Coils THEN
+        _gapTolerance := GAP_TOLERANCE_COILS;
+        _maxPerBlock := MAX_COILS_PER_BLOCK;
+    ELSE
+        _gapTolerance := GAP_TOLERANCE_REGS;
+        _maxPerBlock := MAX_REGS_PER_BLOCK;
+    END_IF
+
+    _arrWriteBlocks[_currentBlock].area := _blockArea;
+    _arrWriteBlocks[_currentBlock].startAddress := _blockStart;
+    _arrWriteBlocks[_currentBlock].signalCount := 1;
+    _arrWriteBlocks[_currentBlock].arrSignalIndex[1] := _arrSortIdx[_i];
+    _arrWriteBlocks[_currentBlock].arrOffsetInBlock[1] := 0;
+    _arrWriteBlocks[_currentBlock].enabled := TRUE;
+    _arrWriteBlocks[_currentBlock].containsBitSignals := FALSE;
+
+    CASE _blockArea OF
+        E_MBArea.Coils:
+            _arrWriteBlocks[_currentBlock].functionCode := 15;
+        E_MBArea.HoldingRegisters:
+            _arrWriteBlocks[_currentBlock].functionCode := 16;
+    END_CASE
+
+    _j := _i + 1;
+    WHILE _j <= _sortCount DO
+        IF _arrParsedWrite[_arrSortIdx[_j]].area <> _blockArea THEN
+            EXIT;
+        END_IF
+
+        _nextAddr := _arrParsedWrite[_arrSortIdx[_j]].baseAddress;
+        _nextEnd := _nextAddr + _arrParsedWrite[_arrSortIdx[_j]].registerCount - 1;
+
+        IF _nextAddr > (_blockEnd + _gapTolerance + 1) THEN
+            EXIT;
+        END_IF
+
+        IF (_nextEnd - _blockStart + 1) > _maxPerBlock THEN
+            EXIT;
+        END_IF
+
+        _arrWriteBlocks[_currentBlock].signalCount :=
+            _arrWriteBlocks[_currentBlock].signalCount + 1;
+        _arrWriteBlocks[_currentBlock].arrSignalIndex[_arrWriteBlocks[_currentBlock].signalCount] :=
+            _arrSortIdx[_j];
+        _arrWriteBlocks[_currentBlock].arrOffsetInBlock[_arrWriteBlocks[_currentBlock].signalCount] :=
+            _nextAddr - _blockStart;
+
+        IF _nextEnd > _blockEnd THEN
+            _blockEnd := _nextEnd;
+        END_IF
+
+        _j := _j + 1;
+    END_WHILE
+
+    _arrWriteBlocks[_currentBlock].quantity := _blockEnd - _blockStart + 1;
+    _i := _j;
+END_WHILE
+
+_writeBlockCount := _currentBlock;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="packAndSendWriteBlock" Id="{d3f61157-24e2-4bc2-acd4-c929c647d134}">
+      <Declaration><![CDATA[METHOD PRIVATE packAndSendWriteBlock
+VAR_INPUT
+    inpBlockIdx : UINT;
+END_VAR
+VAR
+    _block      : REFERENCE TO ST_WriteBlock;
+    _i          : UINT;
+    _sigIdx     : UINT;
+    _offset     : UINT;
+    _parsed     : REFERENCE TO ST_ParsedSignal;
+    _pData      : POINTER TO ST_MBWriteData;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_block REF= _arrWriteBlocks[inpBlockIdx];
+
+MEMSET(ADR(_arrRawWriteBuffer), 0, SIZEOF(_arrRawWriteBuffer));
+
+FOR _i := 1 TO _block.signalCount DO
+    _sigIdx := _block.arrSignalIndex[_i];
+    _offset := _block.arrOffsetInBlock[_i];
+    _parsed REF= _arrParsedWrite[_sigIdx];
+
+    _pData := inpPtrWriteData + UINT_TO_DWORD(_sigIdx - 1) * SIZEOF(ST_MBWriteData);
+
+    CASE _parsed.dataType OF
+        E_MBDataType.mbReal32:
+            realToWords(
+                inpValue := _pData^.valueReal,
+                stsWord0 => _arrRawWriteBuffer[_offset],
+                stsWord1 => _arrRawWriteBuffer[_offset + 1]
+            );
+
+        E_MBDataType.mbInt32:
+            dintToWords(
+                inpValue := _pData^.valueDint,
+                stsWord0 => _arrRawWriteBuffer[_offset],
+                stsWord1 => _arrRawWriteBuffer[_offset + 1]
+            );
+
+        E_MBDataType.mbUInt32:
+            udintToWords(
+                inpValue := _pData^.valueUdint,
+                stsWord0 => _arrRawWriteBuffer[_offset],
+                stsWord1 => _arrRawWriteBuffer[_offset + 1]
+            );
+
+        E_MBDataType.mbInt16:
+            _arrRawWriteBuffer[_offset] := swapBytes(INT_TO_WORD(_pData^.valueInt));
+
+        E_MBDataType.mbUInt16:
+            _arrRawWriteBuffer[_offset] := swapBytes(UINT_TO_WORD(_pData^.valueUint));
+
+        E_MBDataType.mbWord16:
+            _arrRawWriteBuffer[_offset] := swapBytes(_pData^.valueWord);
+
+        E_MBDataType.mbBit:
+            IF _pData^.valueBool THEN
+                _arrRawWriteBuffer[_offset / 16] :=
+                    _arrRawWriteBuffer[_offset / 16] OR SHL(WORD#1, _offset MOD 16);
+            END_IF
+    END_CASE
+END_FOR
+
+IF _block.area = E_MBArea.Coils THEN
+    fbMbWriteCoils(
+        sIPAddr     := cfgIpAddress,
+        nTCPPort    := cfgPort,
+        nUnitID     := cfgUnitId,
+        nQuantity   := _block.quantity,
+        nMBAddr     := _block.startAddress,
+        cbLength    := UINT_TO_UDINT(_block.quantity + 7) / 8,
+        pSrcAddr    := ADR(_arrRawWriteBuffer),
+        bExecute    := TRUE,
+        tTimeout    := cfgTimeout
+    );
+ELSE
+    fbMbWriteRegs(
+        sIPAddr     := cfgIpAddress,
+        nTCPPort    := cfgPort,
+        nUnitID     := cfgUnitId,
+        nQuantity   := _block.quantity,
+        nMBAddr     := _block.startAddress,
+        cbLength    := UINT_TO_UDINT(_block.quantity) * 2,
+        pSrcAddr    := ADR(_arrRawWriteBuffer),
+        bExecute    := TRUE,
+        tTimeout    := cfgTimeout
+    );
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="parseAllConfigs" Id="{ea14179c-9180-4ee6-8f1c-a22739a6ad21}">
+      <Declaration><![CDATA[METHOD PRIVATE parseAllConfigs : BOOL
+VAR
+    _i              : UINT;
+    _pConfig        : POINTER TO ST_MBSignalConfig;
+    _pResult        : POINTER TO ST_MBReadResult;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF cfgReadSignalCount > 0 AND (inpPtrReadConfig = 0 OR inpPtrReadResults = 0) THEN
+    stsErrorId := 16#8001;
+    RETURN;
+END_IF
+
+IF cfgWriteSignalCount > 0 AND (inpPtrWriteConfig = 0 OR inpPtrWriteData = 0) THEN
+    stsErrorId := 16#8002;
+    RETURN;
+END_IF
+
+FOR _i := 1 TO cfgReadSignalCount DO
+    _pConfig := inpPtrReadConfig + UINT_TO_DWORD(_i - 1) * SIZEOF(ST_MBSignalConfig);
+
+    parseModbusAddress(
+        inpModbusAddr := _pConfig^.modbusAddr,
+        inpDataType := _pConfig^.dataType,
+        inpBitIndex := _pConfig^.bitIndex,
+        stsParsed => _arrParsedRead[_i]
+    );
+
+    IF NOT _arrParsedRead[_i].valid THEN
+        _pResult := inpPtrReadResults + UINT_TO_DWORD(_i - 1) * SIZEOF(ST_MBReadResult);
+        _pResult^.quality := E_SignalQuality.BadConfig;
+    END_IF
+END_FOR
+
+FOR _i := 1 TO cfgWriteSignalCount DO
+    _pConfig := inpPtrWriteConfig + UINT_TO_DWORD(_i - 1) * SIZEOF(ST_MBSignalConfig);
+
+    parseModbusAddress(
+        inpModbusAddr := _pConfig^.modbusAddr,
+        inpDataType := _pConfig^.dataType,
+        inpBitIndex := _pConfig^.bitIndex,
+        stsParsed => _arrParsedWrite[_i]
+    );
+END_FOR
+
+parseAllConfigs := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="parseModbusAddress" Id="{bb13278e-6c39-4b23-bb4d-809495d67275}">
+      <Declaration><![CDATA[METHOD PRIVATE parseModbusAddress
+VAR_INPUT
+    inpModbusAddr   : UDINT;
+    inpDataType     : E_MBDataType;
+    inpBitIndex     : BYTE;
+END_VAR
+VAR_OUTPUT
+    stsParsed       : ST_ParsedSignal;
+END_VAR
+VAR
+    _areaCode       : UDINT;
+    _offset         : UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stsParsed.valid := FALSE;
+stsParsed.dataType := inpDataType;
+stsParsed.bitIndex := inpBitIndex;
+
+IF inpModbusAddr >= 400001 THEN
+    _areaCode := 4;
+    _offset := (inpModbusAddr MOD 100000) - 1;
+ELSIF inpModbusAddr >= 40001 THEN
+    _areaCode := 4;
+    _offset := (inpModbusAddr MOD 10000) - 1;
+ELSIF inpModbusAddr >= 30001 THEN
+    _areaCode := 3;
+    _offset := (inpModbusAddr MOD 10000) - 1;
+ELSIF inpModbusAddr >= 10001 THEN
+    _areaCode := 1;
+    _offset := (inpModbusAddr MOD 10000) - 1;
+ELSIF inpModbusAddr >= 1 THEN
+    _areaCode := 0;
+    _offset := inpModbusAddr - 1;
+ELSE
+    RETURN;
+END_IF
+
+IF _offset > 65535 THEN
+    RETURN;
+END_IF
+
+stsParsed.baseAddress := UDINT_TO_UINT(_offset);
+
+CASE _areaCode OF
+    0:
+        stsParsed.area := E_MBArea.Coils;
+        stsParsed.registerCount := 1;
+        stsParsed.bitIndex := BIT_INDEX_NA;
+        stsParsed.isBitInRegister := FALSE;
+
+    1:
+        stsParsed.area := E_MBArea.DiscreteInputs;
+        stsParsed.registerCount := 1;
+        stsParsed.bitIndex := BIT_INDEX_NA;
+        stsParsed.isBitInRegister := FALSE;
+
+    3:
+        stsParsed.area := E_MBArea.InputRegisters;
+        IF inpDataType = E_MBDataType.mbBit AND inpBitIndex < 16 THEN
+            stsParsed.isBitInRegister := TRUE;
+        END_IF
+
+    4:
+        stsParsed.area := E_MBArea.HoldingRegisters;
+        IF inpDataType = E_MBDataType.mbBit AND inpBitIndex < 16 THEN
+            stsParsed.isBitInRegister := TRUE;
+        END_IF
+
+ELSE
+    RETURN;
+END_CASE
+
+CASE inpDataType OF
+    E_MBDataType.mbReal32,
+    E_MBDataType.mbInt32,
+    E_MBDataType.mbUInt32:
+        stsParsed.registerCount := 2;
+
+    E_MBDataType.mbInt16,
+    E_MBDataType.mbUInt16,
+    E_MBDataType.mbWord16,
+    E_MBDataType.mbBit:
+        stsParsed.registerCount := 1;
+END_CASE
+
+stsParsed.valid := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="pollInterval" Id="{fe7c55a8-e053-4894-806f-5a4ea1468709}">
+      <Declaration><![CDATA[PROPERTY PUBLIC pollInterval : TIME
+]]></Declaration>
+      <Get Name="Get" Id="{e74a3607-f769-4256-8f22-1a383a0f6b50}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[pollInterval := cfgPollInterval;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{568f873a-c497-40f5-9e52-52e70bff3151}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgPollInterval := pollInterval;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="port" Id="{b11e8bc5-6205-45e0-beb5-3210365c8eed}">
+      <Declaration><![CDATA[PROPERTY PUBLIC port : UINT
+]]></Declaration>
+      <Get Name="Get" Id="{a2fb8b2f-e73a-4e92-9cf8-e72937492592}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[port := cfgPort;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{e156f8fd-1cd8-4147-af12-5ddfa3db9d0f}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgPort := port;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="processReadBlock" Id="{3f5dc17a-3729-4f07-a982-2079411155a9}">
+      <Declaration><![CDATA[METHOD PRIVATE processReadBlock
+VAR_INPUT
+    inpBlockIdx : UINT;
+END_VAR
+VAR
+    _block      : REFERENCE TO ST_ReadBlock;
+    _i          : UINT;
+    _sigIdx     : UINT;
+    _offset     : UINT;
+    _parsed     : REFERENCE TO ST_ParsedSignal;
+    _pResult    : POINTER TO ST_MBReadResult;
+    _rawWord    : WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_block REF= _arrReadBlocks[inpBlockIdx];
+
+FOR _i := 1 TO _block.signalCount DO
+    _sigIdx := _block.arrSignalIndex[_i];
+    _offset := _block.arrOffsetInBlock[_i];
+    _parsed REF= _arrParsedRead[_sigIdx];
+
+    _pResult := inpPtrReadResults + UINT_TO_DWORD(_sigIdx - 1) * SIZEOF(ST_MBReadResult);
+
+    CASE _parsed.dataType OF
+        E_MBDataType.mbReal32:
+            _pResult^.valueReal := wordsToReal(
+                _arrRawReadBuffer[_offset],
+                _arrRawReadBuffer[_offset + 1]
+            );
+
+        E_MBDataType.mbInt32:
+            _pResult^.valueDint := wordsToDint(
+                _arrRawReadBuffer[_offset],
+                _arrRawReadBuffer[_offset + 1]
+            );
+
+        E_MBDataType.mbUInt32:
+            _pResult^.valueUdint := wordsToUdint(
+                _arrRawReadBuffer[_offset],
+                _arrRawReadBuffer[_offset + 1]
+            );
+
+        E_MBDataType.mbInt16:
+            _rawWord := swapBytes(_arrRawReadBuffer[_offset]);
+            _pResult^.valueInt := WORD_TO_INT(_rawWord);
+
+        E_MBDataType.mbUInt16:
+            _rawWord := swapBytes(_arrRawReadBuffer[_offset]);
+            _pResult^.valueUint := WORD_TO_UINT(_rawWord);
+
+        E_MBDataType.mbWord16:
+            _pResult^.valueWord := swapBytes(_arrRawReadBuffer[_offset]);
+
+        E_MBDataType.mbBit:
+            IF _parsed.isBitInRegister THEN
+                _rawWord := swapBytes(_arrRawReadBuffer[_offset]);
+                _pResult^.valueBool := (_rawWord AND SHL(WORD#1, _parsed.bitIndex)) <> 0;
+            ELSE
+                _pResult^.valueBool := (_arrRawReadBuffer[_offset / 16] AND SHL(WORD#1, _offset MOD 16)) <> 0;
+            END_IF
+    END_CASE
+
+    _pResult^.quality := E_SignalQuality.Good;
+    _pResult^.updateCount := _pResult^.updateCount + 1;
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="readSignalCount" Id="{1761a401-5c7e-4199-b2b3-502e1442bc1e}">
+      <Declaration><![CDATA[PROPERTY PUBLIC readSignalCount : UINT
+]]></Declaration>
+      <Get Name="Get" Id="{931053b6-a877-48f4-b540-34989e64526d}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[readSignalCount := cfgReadSignalCount;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{86c33099-c10c-4fd5-b191-c3974bda2db6}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgReadSignalCount := MIN(readSignalCount, MAX_READ_SIGNALS);
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="readSucceeded" Id="{1fb3f461-d6b7-4fb5-90a3-b900d2de2b48}">
+      <Declaration><![CDATA[METHOD PRIVATE readSucceeded : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// During an RMW read, _state = RmwReadWait and there is no current read block;
+// the active FB in that case is fbMbReadRegs.
+IF _state = E_DriverState.RmwReadWait THEN
+    readSucceeded := NOT fbMbReadRegs.bError;
+    IF fbMbReadRegs.bError THEN
+        _lastMbError := 1;
+    END_IF
+ELSE
+    CASE _arrReadBlocks[_currentBlockIdx].functionCode OF
+        1:
+            readSucceeded := NOT fbMbReadCoils.bError;
+            IF fbMbReadCoils.bError THEN
+                _lastMbError := 1;
+            END_IF
+        2:
+            readSucceeded := NOT fbMbReadInputs.bError;
+            IF fbMbReadInputs.bError THEN
+                _lastMbError := 1;
+            END_IF
+        3:
+            readSucceeded := NOT fbMbReadRegs.bError;
+            IF fbMbReadRegs.bError THEN
+                _lastMbError := 1;
+            END_IF
+        4:
+            readSucceeded := NOT fbMbReadInputRegs.bError;
+            IF fbMbReadInputRegs.bError THEN
+                _lastMbError := 1;
+            END_IF
+    END_CASE
+END_IF
+
+stsStatus.lastErrorCode := _lastMbError;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="realToWords" Id="{3760e2e3-5d3a-4b6f-acbf-224871e36e42}">
+      <Declaration><![CDATA[METHOD PRIVATE realToWords
+VAR_INPUT
+    inpValue        : REAL;
+END_VAR
+VAR_OUTPUT
+    stsWord0        : WORD;
+    stsWord1        : WORD;
+END_VAR
+VAR
+    _dword          : DWORD;
+    _w0, _w1        : WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[MEMCPY(ADR(_dword), ADR(inpValue), SIZEOF(REAL));
+splitDword(inpValue := _dword, stsWord0 => _w0, stsWord1 => _w1);
+stsWord0 := swapBytes(_w0);
+stsWord1 := swapBytes(_w1);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="reconnectDelay" Id="{ca6af3e2-8466-4901-b835-5e5be9c77d85}">
+      <Declaration><![CDATA[PROPERTY PUBLIC reconnectDelay : TIME
+]]></Declaration>
+      <Get Name="Get" Id="{4775b455-64c3-4ff4-ae15-6833ad948259}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[reconnectDelay := cfgReconnectDelay;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{81cdc6a4-7de5-427e-a194-b0178c13699f}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgReconnectDelay := reconnectDelay;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="reset" Id="{754d0347-0f0b-4377-8ecf-d5045b082dd8}">
+      <Declaration><![CDATA[METHOD PRIVATE reset
+VAR
+    _i : UINT;
+    _pResult : POINTER TO ST_MBReadResult;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_state := E_DriverState.Init;
+_initialized := FALSE;
+_socketConnected := FALSE;
+_consecFailures := 0;
+_connectAttempts := 0;
+_disconnectPending := FALSE;
+
+MEMSET(ADR(stsStatus), 0, SIZEOF(stsStatus));
+stsError := FALSE;
+stsErrorId := 0;
+
+MEMSET(ADR(_arrParsedRead), 0, SIZEOF(_arrParsedRead));
+MEMSET(ADR(_arrParsedWrite), 0, SIZEOF(_arrParsedWrite));
+MEMSET(ADR(_arrReadBlocks), 0, SIZEOF(_arrReadBlocks));
+MEMSET(ADR(_arrWriteBlocks), 0, SIZEOF(_arrWriteBlocks));
+MEMSET(ADR(_arrBitRegisters), 0, SIZEOF(_arrBitRegisters));
+
+_readBlockCount := 0;
+_writeBlockCount := 0;
+_bitRegisterCount := 0;
+
+tonPollInterval(IN := FALSE);
+tonWriteInterval(IN := FALSE);
+tonCommandDelay(IN := FALSE);
+tonTimeout(IN := FALSE);
+tonReconnectDelay(IN := FALSE);
+
+IF inpPtrReadResults <> 0 THEN
+    FOR _i := 1 TO cfgReadSignalCount DO
+        _pResult := inpPtrReadResults + UINT_TO_DWORD(_i - 1) * SIZEOF(ST_MBReadResult);
+        _pResult^.quality := E_SignalQuality.UncertainInit;
+    END_FOR
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="sendReadRequest" Id="{35129bce-dfd0-4f7c-87dc-907cab83d5c4}">
+      <Declaration><![CDATA[METHOD PRIVATE sendReadRequest
+VAR_INPUT
+    inpBlockIdx : UINT;
+END_VAR
+VAR
+    _block : REFERENCE TO ST_ReadBlock;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_block REF= _arrReadBlocks[inpBlockIdx];
+
+CASE _block.functionCode OF
+    1:  // FC01 Read Coils
+        fbMbReadCoils(
+            sIPAddr     := cfgIpAddress,
+            nTCPPort    := cfgPort,
+            nUnitID     := cfgUnitId,
+            nQuantity   := _block.quantity,
+            nMBAddr     := _block.startAddress,
+            cbLength    := SIZEOF(_arrRawReadBuffer),
+            pDestAddr   := ADR(_arrRawReadBuffer),
+            bExecute    := TRUE,
+            tTimeout    := cfgTimeout
+        );
+
+    2:  // FC02 Read Discrete Inputs
+        fbMbReadInputs(
+            sIPAddr     := cfgIpAddress,
+            nTCPPort    := cfgPort,
+            nUnitID     := cfgUnitId,
+            nQuantity   := _block.quantity,
+            nMBAddr     := _block.startAddress,
+            cbLength    := SIZEOF(_arrRawReadBuffer),
+            pDestAddr   := ADR(_arrRawReadBuffer),
+            bExecute    := TRUE,
+            tTimeout    := cfgTimeout
+        );
+
+    3:  // FC03 Read Holding Registers
+        fbMbReadRegs(
+            sIPAddr     := cfgIpAddress,
+            nTCPPort    := cfgPort,
+            nUnitID     := cfgUnitId,
+            nQuantity   := _block.quantity,
+            nMBAddr     := _block.startAddress,
+            cbLength    := UINT_TO_UDINT(_block.quantity) * 2,
+            pDestAddr   := ADR(_arrRawReadBuffer),
+            bExecute    := TRUE,
+            tTimeout    := cfgTimeout
+        );
+
+    4:  // FC04 Read Input Registers
+        fbMbReadInputRegs(
+            sIPAddr     := cfgIpAddress,
+            nTCPPort    := cfgPort,
+            nUnitID     := cfgUnitId,
+            nQuantity   := _block.quantity,
+            nMBAddr     := _block.startAddress,
+            cbLength    := UINT_TO_UDINT(_block.quantity) * 2,
+            pDestAddr   := ADR(_arrRawReadBuffer),
+            bExecute    := TRUE,
+            tTimeout    := cfgTimeout
+        );
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="sendRmwReadRequest" Id="{15b463aa-d359-4775-897d-fdb9683582c9}">
+      <Declaration><![CDATA[METHOD PRIVATE sendRmwReadRequest
+VAR_INPUT
+    inpRmwIdx : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// RMW always operates on a single holding register (FC03 read).
+fbMbReadRegs(
+    sIPAddr     := cfgIpAddress,
+    nTCPPort    := cfgPort,
+    nUnitID     := cfgUnitId,
+    nQuantity   := 1,
+    nMBAddr     := _arrBitRegisters[inpRmwIdx].address,
+    cbLength    := 2,
+    pDestAddr   := ADR(_arrRawReadBuffer),
+    bExecute    := TRUE,
+    tTimeout    := cfgTimeout
+);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="sendRmwWriteRequest" Id="{4347b936-687c-40eb-af9f-87779e770d52}">
+      <Declaration><![CDATA[METHOD PRIVATE sendRmwWriteRequest
+VAR_INPUT
+    inpRmwIdx : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fbMbWriteSingleReg(
+    sIPAddr     := cfgIpAddress,
+    nTCPPort    := cfgPort,
+    nUnitID     := cfgUnitId,
+    nMBAddr     := _arrBitRegisters[inpRmwIdx].address,
+    nValue      := swapBytes(_arrBitRegisters[inpRmwIdx].writeValue),
+    bExecute    := TRUE,
+    tTimeout    := cfgTimeout
+);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="shouldSwapForSort" Id="{3f7d5974-6d6b-4455-b01a-7c8709df45b8}">
+      <Declaration><![CDATA[METHOD PRIVATE shouldSwapForSort : BOOL
+VAR_INPUT
+    inpIdx1         : UINT;
+    inpIdx2         : UINT;
+    inpIsRead       : BOOL;
+END_VAR
+VAR
+    _area1, _area2  : E_MBArea;
+    _addr1, _addr2  : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpIsRead THEN
+    _area1 := _arrParsedRead[inpIdx1].area;
+    _area2 := _arrParsedRead[inpIdx2].area;
+    _addr1 := _arrParsedRead[inpIdx1].baseAddress;
+    _addr2 := _arrParsedRead[inpIdx2].baseAddress;
+ELSE
+    _area1 := _arrParsedWrite[inpIdx1].area;
+    _area2 := _arrParsedWrite[inpIdx2].area;
+    _addr1 := _arrParsedWrite[inpIdx1].baseAddress;
+    _addr2 := _arrParsedWrite[inpIdx2].baseAddress;
+END_IF
+
+IF _area1 > _area2 THEN
+    shouldSwapForSort := TRUE;
+ELSIF _area1 = _area2 AND _addr1 > _addr2 THEN
+    shouldSwapForSort := TRUE;
+ELSE
+    shouldSwapForSort := FALSE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="splitDword" Id="{99dbdecc-c50f-4a41-99b0-65a77a48ba75}">
+      <Declaration><![CDATA[METHOD PRIVATE splitDword
+VAR_INPUT
+    inpValue        : DWORD;
+END_VAR
+VAR_OUTPUT
+    stsWord0        : WORD;
+    stsWord1        : WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF cfgWordOrder = E_WordOrder.BigEndian THEN
+    stsWord0 := DWORD_TO_WORD(SHR(inpValue, 16));
+    stsWord1 := DWORD_TO_WORD(inpValue AND 16#FFFF);
+ELSE
+    stsWord0 := DWORD_TO_WORD(inpValue AND 16#FFFF);
+    stsWord1 := DWORD_TO_WORD(SHR(inpValue, 16));
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="staleThreshold" Id="{191e3e3a-9b55-4ea2-b165-da6cdc1d7de8}">
+      <Declaration><![CDATA[PROPERTY PUBLIC staleThreshold : TIME
+]]></Declaration>
+      <Get Name="Get" Id="{f13b35c4-3d5f-4240-b0d0-e47cfa5afa49}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[staleThreshold := cfgStaleThreshold;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{5ed40519-c0ae-4979-8609-cc56a9609d1b}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgStaleThreshold := staleThreshold;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="swapBytes" Id="{507b3232-e9d4-4da7-8d6e-e43f6a6cebb3}">
+      <Declaration><![CDATA[METHOD PRIVATE swapBytes : WORD
+VAR_INPUT
+    inpValue : WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Tc2_ModbusCaller (FB_MBReadRegs / FB_MBWriteRegs) already converts between
+// network and host byte order — each WORD in _arrRawReadBuffer / _arrRawWriteBuffer
+// is already the correct host-order register value. No additional byte swap needed.
+swapBytes := inpValue;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="timeout" Id="{329cfea1-02c0-4f21-a893-20f808dc0264}">
+      <Declaration><![CDATA[PROPERTY PUBLIC timeout : TIME
+]]></Declaration>
+      <Get Name="Get" Id="{c3577812-1459-4c90-b864-f72c6eefa103}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[timeout := cfgTimeout;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{d0ad2f8b-1502-4f5a-bd7e-a7480d0d173f}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgTimeout := timeout;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="udintToWords" Id="{e2acf2bb-09fe-425d-9272-d589a2a378b3}">
+      <Declaration><![CDATA[METHOD PRIVATE udintToWords
+VAR_INPUT
+    inpValue        : UDINT;
+END_VAR
+VAR_OUTPUT
+    stsWord0        : WORD;
+    stsWord1        : WORD;
+END_VAR
+VAR
+    _dword          : DWORD;
+    _w0, _w1        : WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_dword := UDINT_TO_DWORD(inpValue);
+splitDword(inpValue := _dword, stsWord0 => _w0, stsWord1 => _w1);
+stsWord0 := swapBytes(_w0);
+stsWord1 := swapBytes(_w1);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="unitId" Id="{48f4f2a9-af5b-45b5-b498-5e1465260b89}">
+      <Declaration><![CDATA[PROPERTY PUBLIC unitId : BYTE
+]]></Declaration>
+      <Get Name="Get" Id="{766fdc78-1fba-4784-a8f9-f346910a32d5}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[unitId := cfgUnitId;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{383e216f-6628-41d6-9034-754b4e91119d}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgUnitId := unitId;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="updateRmwStatus" Id="{96c4579c-45cf-47a0-b977-0579b1d0d0f1}">
+      <Declaration><![CDATA[METHOD PRIVATE updateRmwStatus
+VAR_INPUT
+    inpRmwIdx   : UINT;
+    inpSuccess  : BOOL;
+END_VAR
+VAR
+    _reg        : REFERENCE TO ST_BitRegisterRmw;
+    _bitIdx     : UINT;
+    _sigIdx     : UINT;
+    _pData      : POINTER TO ST_MBWriteData;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_reg REF= _arrBitRegisters[inpRmwIdx];
+
+FOR _bitIdx := 0 TO 15 DO
+    IF (_reg.managedBitMask AND SHL(WORD#1, _bitIdx)) <> 0 THEN
+        _sigIdx := _reg.arrSignalIndex[_bitIdx];
+
+        IF _sigIdx > 0 THEN
+            _pData := inpPtrWriteData + UINT_TO_DWORD(_sigIdx - 1) * SIZEOF(ST_MBWriteData);
+
+            _pData^.writeSuccess := inpSuccess;
+            _pData^.writeError := NOT inpSuccess;
+
+            IF inpSuccess THEN
+                _pData^.writeCount := _pData^.writeCount + 1;
+            END_IF
+        END_IF
+    END_IF
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="updateWriteStatus" Id="{85207c6a-bd91-42ab-b8ed-04c832d263d4}">
+      <Declaration><![CDATA[METHOD PRIVATE updateWriteStatus
+VAR_INPUT
+    inpBlockIdx : UINT;
+    inpSuccess  : BOOL;
+END_VAR
+VAR
+    _block      : REFERENCE TO ST_WriteBlock;
+    _i          : UINT;
+    _sigIdx     : UINT;
+    _pData      : POINTER TO ST_MBWriteData;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_block REF= _arrWriteBlocks[inpBlockIdx];
+
+FOR _i := 1 TO _block.signalCount DO
+    _sigIdx := _block.arrSignalIndex[_i];
+    _pData := inpPtrWriteData + UINT_TO_DWORD(_sigIdx - 1) * SIZEOF(ST_MBWriteData);
+
+    _pData^.writeSuccess := inpSuccess;
+    _pData^.writeError := NOT inpSuccess;
+
+    IF inpSuccess THEN
+        _pData^.writeCount := _pData^.writeCount + 1;
+    END_IF
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="wordOrder" Id="{3dff9cc7-c36b-4f3e-8d33-79cc8d88ce78}">
+      <Declaration><![CDATA[PROPERTY PUBLIC wordOrder : E_WordOrder
+]]></Declaration>
+      <Get Name="Get" Id="{7cd200da-cee4-4a96-9277-8868e366ad60}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[wordOrder := cfgWordOrder;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{0f895852-3fdd-459d-b8fe-a67b7dcebd01}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgWordOrder := wordOrder;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="wordsToDint" Id="{d96d33ab-dcc4-4c5d-8a52-e29b45064117}">
+      <Declaration><![CDATA[METHOD PRIVATE wordsToDint : DINT
+VAR_INPUT
+    inpWord0        : WORD;
+    inpWord1        : WORD;
+END_VAR
+VAR
+    _w0             : WORD;
+    _w1             : WORD;
+    _dword          : DWORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_w0 := swapBytes(inpWord0);
+_w1 := swapBytes(inpWord1);
+_dword := combineWords(_w0, _w1);
+wordsToDint := DWORD_TO_DINT(_dword);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="wordsToReal" Id="{0bd31e58-b420-4c0e-a0ed-ad2b77de77c9}">
+      <Declaration><![CDATA[METHOD PRIVATE wordsToReal : REAL
+VAR_INPUT
+    inpWord0        : WORD;
+    inpWord1        : WORD;
+END_VAR
+VAR
+    _w0             : WORD;
+    _w1             : WORD;
+    _dword          : DWORD;
+    _result         : REAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_w0 := swapBytes(inpWord0);
+_w1 := swapBytes(inpWord1);
+_dword := combineWords(_w0, _w1);
+MEMCPY(ADR(_result), ADR(_dword), SIZEOF(REAL));
+wordsToReal := _result;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="wordsToUdint" Id="{3d2e9505-e73c-46a9-aeda-728cf6bcff0e}">
+      <Declaration><![CDATA[METHOD PRIVATE wordsToUdint : UDINT
+VAR_INPUT
+    inpWord0        : WORD;
+    inpWord1        : WORD;
+END_VAR
+VAR
+    _w0             : WORD;
+    _w1             : WORD;
+    _dword          : DWORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_w0 := swapBytes(inpWord0);
+_w1 := swapBytes(inpWord1);
+_dword := combineWords(_w0, _w1);
+wordsToUdint := DWORD_TO_UDINT(_dword);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="writeCycleInterval" Id="{d0dce5f5-27ac-4ecc-a891-95501497183b}">
+      <Declaration><![CDATA[PROPERTY PUBLIC writeCycleInterval : TIME
+]]></Declaration>
+      <Get Name="Get" Id="{32e16415-8a99-4046-84b0-535fb48df19d}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[writeCycleInterval := cfgWriteCycleInterval;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{2cca36cb-6880-4019-9ebe-c4ad66323d56}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgWriteCycleInterval := writeCycleInterval;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="writeSignalCount" Id="{56476bc2-7f98-4550-a6dd-16c8b5fa0717}">
+      <Declaration><![CDATA[PROPERTY PUBLIC writeSignalCount : UINT
+]]></Declaration>
+      <Get Name="Get" Id="{9befd42c-6bb9-4d6f-93ff-e87a52cc78d0}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[writeSignalCount := cfgWriteSignalCount;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{86511c04-03c9-4c17-aa60-aef6c37e5e01}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF NOT _initialized THEN
+    cfgWriteSignalCount := MIN(writeSignalCount, MAX_WRITE_SIGNALS);
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="writeSucceeded" Id="{c69c6b3b-e83c-4cd4-9ebe-424caf276299}">
+      <Declaration><![CDATA[METHOD PRIVATE writeSucceeded : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _state = E_DriverState.WriteWait THEN
+    IF _arrWriteBlocks[_currentBlockIdx].area = E_MBArea.Coils THEN
+        writeSucceeded := NOT fbMbWriteCoils.bError;
+        IF fbMbWriteCoils.bError THEN
+            _lastMbError := 1;
+        END_IF
+    ELSE
+        writeSucceeded := NOT fbMbWriteRegs.bError;
+        IF fbMbWriteRegs.bError THEN
+            _lastMbError := 1;
+        END_IF
+    END_IF
+ELSE
+    writeSucceeded := NOT fbMbWriteSingleReg.bError;
+    IF fbMbWriteSingleReg.bError THEN
+        _lastMbError := 1;
+    END_IF
+END_IF
+
+stsStatus.lastErrorCode := _lastMbError;
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

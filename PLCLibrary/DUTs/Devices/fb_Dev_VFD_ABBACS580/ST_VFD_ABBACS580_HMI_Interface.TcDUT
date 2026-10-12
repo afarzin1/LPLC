@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_VFD_ABBACS580_HMI_Interface" Id="{a1b00003-0000-4000-8000-000000000001}">
+    <Declaration><![CDATA[TYPE ST_VFD_ABBACS580_HMI_Interface :
+STRUCT
+	HMIbaseDevice		: ST_Device_HMI_Interface;
+	stsInterlocks		: ST_Interlock_HMI_Interface;
+
+	// Operator commands
+	ocmdReset			: BOOL;
+	ocmdRunMode			: USINT;	// 0=stop, 1=fwd, 2=reverse
+	ocmdSetpoint		: LREAL;	// percent, -100..+100
+
+	// Command echo
+	stsRunMode			: USINT;
+	stsSetpoint			: LREAL;
+
+	// Drive state
+	stsState			: STRING;
+	stsRunning			: BOOL;
+	stsAtSetpoint		: BOOL;
+	stsRemote			: BOOL;
+	stsTripped			: BOOL;
+	stsAlarm			: BOOL;
+
+	// Telemetry (engineering units)
+	stsActualSpeed		: LREAL;
+	stsMotorCurrent		: LREAL;
+	stsDCBusVoltage		: LREAL;
+	stsOutputFreq		: LREAL;
+	stsMotorTorque		: LREAL;
+	stsInverterTemp		: LREAL;
+	stsFaultCode		: UINT;
+	stsFaultText		: STRING;
+
+	// Diagnostics
+	stsCWRaw			: WORD;
+	stsSWRaw			: WORD;
+	stsCommsConnected	: BOOL;
+	stsCommsFaulted		: BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

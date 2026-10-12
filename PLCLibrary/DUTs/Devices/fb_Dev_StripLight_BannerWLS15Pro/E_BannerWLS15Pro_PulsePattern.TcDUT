@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_BannerWLS15Pro_PulsePattern" Id="{10e7f3c6-523c-44fc-9b9e-bcdde1808585}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+// Run Mode pulse pattern, subindex 5 (219132 Rev. A, section 1.3.2).
+// Only read by the flashing animations.
+TYPE E_BannerWLS15Pro_PulsePattern :
+(
+    eNormal     := 0,
+    eStrobe     := 1,
+    eThreePulse := 2,
+    eSOS        := 3,
+    eRandom     := 4
+) BYTE;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

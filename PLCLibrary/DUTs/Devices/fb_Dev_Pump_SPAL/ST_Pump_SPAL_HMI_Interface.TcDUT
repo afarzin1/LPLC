@@ -1,0 +1,30 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Pump_SPAL_HMI_Interface" Id="{18cc238e-351e-4efd-8710-529b90e2e893}">
+    <Declaration><![CDATA[TYPE ST_Pump_SPAL_HMI_Interface :
+STRUCT
+	HMIbaseDevice		: ST_Device_HMI_Interface;
+	stsLVOn				: BOOL;
+	stsBusStatus		: ST_EL6751_Bus_State_Parsed;
+	stsBusOK			: BOOL;
+	ocmdReset			: BOOL;
+	stsInterlocks		: ST_Interlock_HMI_Interface;
+	stsRunPump			: USINT;
+	stsSetpoint			: LREAL;
+
+	ocmdRunPump			: USINT;
+	ocmdSetpoint		: LREAL;
+	stsState			: STRING;
+	stsCommandFB		: STRING;
+	stsMotorFB			: STRING;
+	stsServiceIndicator	: STRING;
+	stsError			: STRING;
+	stsPower			: LREAL;
+	stsTemperature		: LREAL;
+	stsSpeed			: LREAL;
+		
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

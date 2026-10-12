@@ -1,0 +1,18 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_MQTT_Direction" Id="{69797a1a-437a-4a83-99dc-95d53463252b}">
+    <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// E_MQTT_Direction - Data flow direction
+// ═══════════════════════════════════════════════════════════════════════
+{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_MQTT_Direction :
+(
+    PUBLISH       := 1,     // PLC → MQTT only
+    SUBSCRIBE     := 2,     // MQTT → PLC only  
+    BIDIRECTIONAL := 3      // Both directions
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

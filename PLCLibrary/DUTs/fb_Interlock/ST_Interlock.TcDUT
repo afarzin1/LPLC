@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Interlock" Id="{4300dd3d-cb05-43eb-a93d-e40bc8ef5461}">
+    <Declaration><![CDATA[TYPE ST_Interlock :
+STRUCT
+	conditions	: ARRAY[1..10] OF BOOL := [1,1,1,1,1,1,1,1,1,1];
+	descriptions	: ARRAY[1..10] OF STRING := ['N/A','N/A','N/A','N/A','N/A','N/A','N/A','N/A','N/A','N/A'];
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

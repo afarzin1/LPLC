@@ -1,0 +1,131 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_AnalogSensor_CurrentTransducer" Id="{a822f842-1ccd-4194-bd47-dd8572ada53a}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_AnalogSensor_CurrentTransducer EXTENDS fb_Dev_AnalogSensor
+VAR_INPUT
+END_VAR
+VAR_OUTPUT
+END_VAR
+VAR
+	_cfgShuntResValue	:LREAL;
+	_cfgWindingRatio	:LREAL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+
+scaleInput();
+
+FaultHandler();
+
+setHMI();
+
+stsSensorRawSignal	:= _sensorRawSignal;
+stsEngValue			:= _engValue;]]></ST>
+    </Implementation>
+    <Property Name="cfgShuntResValue" Id="{6b70de73-49bf-4869-88ef-248a795fb48a}">
+      <Declaration><![CDATA[PROPERTY cfgShuntResValue : LREAL]]></Declaration>
+      <Get Name="Get" Id="{d311cfd9-361d-4444-ab8a-492a0ed0d0aa}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgShuntResValue := _cfgShuntResValue;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{08985d1b-3f4b-4259-9d83-855bf7d26360}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_cfgShuntResValue := cfgShuntResValue;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgWindingRatio" Id="{b7763c4b-b735-47d4-bd66-ff8104a08d23}">
+      <Declaration><![CDATA[PROPERTY cfgWindingRatio : LREAL]]></Declaration>
+      <Get Name="Get" Id="{497d4c6d-88d7-4aec-a7cd-23642fa1a4ba}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgWindingRatio := _cfgWindingRatio;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{eca31712-efbd-492a-a4a5-b57d836ff1b7}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_cfgWindingRatio := cfgWindingRatio;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="FB_Init" Id="{4e76c754-8e8c-4f3a-abda-377adc0a0941}">
+      <Declaration><![CDATA[(*FB_Init is always available implicitly and it is used primarily for initialization.
+The return value is not evaluated. For a specific influence, you can also declare the
+methods explicitly and provide additional code there with the standard initialization
+code. You can evaluate the return value.*)
+METHOD FB_Init : BOOL
+VAR_INPUT
+	(* TRUE: the retain variables are initialized (reset warm / reset cold)*)
+	bInitRetains	: BOOL;
+	(* TRUE: the instance will be copied to the copy code afterward (online change)   *)
+	bInCopyCode	: BOOL;
+	cfgDeviceName		: STRING;
+	cfgEnable			: BOOL;
+	cfgInitEventClass	: BOOL;
+	cfgAlarmEnable		: BOOL;
+	cfgAlarmH			: LREAL;
+	cfgAlarmHH			: LREAL;
+	cfgAlarmL			: LREAL;
+	cfgAlarmLL			: LREAL;
+	cfgEngUnit			: STRING;
+	cfgCalOffset		: LREAL;
+	cfgCalGain			: LREAL := 1.0;	// omitted in the declaration = 1 (no correction)
+	cfgShuntResValue	: LREAL;
+	cfgWindingRatio		: LREAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 		:= 		cfgDeviceName; 		
+THIS^.cfgEnable 			:= 	    cfgEnable; 	
+THIS^.cfgInitEventClass		:= 		cfgInitEventClass;
+THIS^.cfgAlarmEnable		:=		cfgAlarmEnable;
+THIS^.cfgAlarmH				:=		cfgAlarmH;
+THIS^.cfgAlarmHH			:=		cfgAlarmHH;
+THIS^.cfgAlarmL				:=		cfgAlarmL;
+THIS^.cfgAlarmLL			:=		cfgAlarmLL;
+THIS^.cfgCalOffset			:=		cfgCalOffset;
+THIS^.cfgCalGain			:=		cfgCalGain;
+THIS^.cfgEngUnit			:=		cfgEngUnit;
+THIS^.cfgShuntResValue		:=		cfgShuntResValue;
+THIS^.cfgWindingRatio		:=		cfgWindingRatio;
+
+THIS^.HMI.cfgAlarmEnable	:= cfgAlarmEnable;
+THIS^.HMI.cfgAlarmH			:= cfgAlarmH;
+THIS^.HMI.cfgAlarmHH		:= cfgAlarmHH;
+THIS^.HMI.cfgAlarmL			:= cfgAlarmL;
+THIS^.HMI.cfgAlarmLL		:= cfgAlarmLL;
+THIS^.HMI.cfgEngUnit		:= cfgEngUnit;
+THIS^.HMI.cfgCalOffset		:= cfgCalOffset;
+THIS^.HMI.cfgCalGain		:= cfgCalGain;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="scaleInput" Id="{0676921f-fb3f-4c05-a1a0-4a7a7f1ff178}">
+      <Declaration><![CDATA[METHOD scaleInput : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF cfgScalingNeeded THEN
+	_sensorRawSignal	:= F_AnalogToEngUnit(inpRawIOChannel, cfgChannelMinInt, cfgChannelMaxInt, cfgSensorMin, cfgSensorMax);
+	_engValue			:= (_sensorRawSignal * _cfgWindingRatio / _cfgShuntResValue) * _CalGain + _calOffset;
+ELSE
+	_sensorRawSignal := inpRawIOChannel;
+	_engValue		 := (inpRawIOChannel * _CalGain) + _calOffset;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

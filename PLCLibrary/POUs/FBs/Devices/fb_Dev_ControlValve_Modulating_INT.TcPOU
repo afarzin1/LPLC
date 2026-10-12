@@ -1,0 +1,75 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_ControlValve_Modulating_INT" Id="{a46f9dec-f0ba-4026-9f76-42bade718bae}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_ControlValve_Modulating_INT
+VAR_INPUT
+	IO_valveFeedback	: INT;
+	IO_valveOutput		: POINTER TO INT;
+	inpAuto				: BOOL;
+	inpReset			: BOOL;
+	inpInterlockBypass	: BOOL;
+	faultMonitor		: POINTER TO fb_FaultMonitor;
+END_VAR
+
+VAR
+	valveFeedback_scaled	: LREAL;
+	valveFeedback_volts		: LREAL;
+	_valveName				: STRING;
+	Valve					: fb_Dev_ControlValve_Modulating(cfgDeviceName := _valveName, cfgEnable := TRUE, cfgInitEventClass := TRUE);
+	_valvePositionCmd		: LREAL;
+	_valveOutput_volts		: LREAL;
+	
+END_VAR
+VAR_OUTPUT
+	outValvePosition	: LREAL;
+	stsValveFeedback	: LREAL;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//INPUTS AND OUTPUTS FOR THIS FB VARIANT ARE UNSCALLED ANALOG VALUES
+valveFeedback_volts	:=  F_AnalogToEngUnit(TO_REAL(IO_valveFeedback), -32767, 32767, -10, 10);
+valveFeedback_scaled := F_AnalogToEngUnit(valveFeedback_volts, 2, 10, 0, 100);
+
+Valve(inpAuto := inpAuto, inpReset := inpReset, inpInterlockBypass := inpInterlockBypass, faultMonitor:=faultMonitor
+		, inpValvePosition := valveFeedback_scaled);
+		
+outValvePosition := Valve.outValvePosition;
+stsValveFeedback := Valve.stsValveFeedback;
+
+Valve.valvePosition := _valvePositionCmd;
+
+_valveOutput_volts := F_AnalogToEngUnit(Valve.outValvePosition, 0, 100, 2, 10);	
+IO_valveOutput^ := TO_INT(F_AnalogToEngUnit(inpRawSignal := _valveOutput_volts, IO_min := -10, IO_max := 10, engMin := -32767, engMax := 32767));
+		
+		]]></ST>
+    </Implementation>
+    <Property Name="cmdSetValvePosition" Id="{09961da3-bcab-4033-9a48-488ddc2322a7}">
+      <Declaration><![CDATA[PROPERTY cmdSetValvePosition : LREAL]]></Declaration>
+      <Set Name="Set" Id="{a926c3a6-92b6-493a-aaf0-75f02157657e}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_valvePositionCmd := cmdSetValvePosition;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="FB_Init" Id="{80509941-fe81-4fd6-87c4-a58ea58a4b16}">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init: BOOL
+VAR_INPUT
+    bInitRetains	: BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode		: BOOL;  // TRUE: the instance will be copied to the copy code afterward (online change) 
+	cfgDeviceName	: STRING;  
+	cfgInitPosition  : LREAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^._valveName 			:= cfgDeviceName;
+THIS^.Valve.cfgDeviceName 	:= cfgDeviceName;
+THIS^.cmdSetValvePosition   := cfgInitPosition;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

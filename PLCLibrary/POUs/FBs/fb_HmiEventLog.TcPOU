@@ -1,0 +1,91 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_HmiEventLog" Id="{b2c3d4e5-1000-4a5b-9c8d-100000000000}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_HmiEventLog
+(* fb_HmiEventLog
+
+   Buffered HMI event log — a fixed-size RING of recent log lines plus a monotonic sequence number,
+   made to be republished in an MQTT transaction group (or any snapshot transport). The HMI backend
+   DRAINS the ring by sequence number, so every event is captured regardless of the publish rate —
+   unlike sampling a single "current status" string, which silently drops any change shorter than one
+   publish period.
+
+   Each slot holds "<seq>|<sev>|<message>" (sev: I=info, W=warning, E=error); slot index = seq MOD
+   cRING_SIZE. Usage:
+     _log.Info('Auto sequence started');   // or .Warn(...) / .Fault(...) / .Push('I', msg)
+   then register stsSequence + stsRingBuffer[0..N-1] into the HMI publish group. The backend keeps a
+   "last drained seq" and appends every slot whose seq is newer, so nothing is lost between snapshots
+   as long as the ring is larger than the burst between two snapshots (16 covers a 1 s group period).
+*)
+
+VAR CONSTANT
+	cRING_SIZE		: DINT := 16;	// ring slots; keep the stsRingBuffer array bound below in sync
+END_VAR
+
+VAR
+	_sequence		: DINT;
+END_VAR
+
+VAR_OUTPUT
+	stsSequence		: DINT;								// monotonic high-water sequence (also total logged)
+	stsRingBuffer	: ARRAY[0..15] OF STRING(120);		// last cRING_SIZE entries, each "<seq>|<sev>|<message>"
+	stsRingSize		: DINT := 16;						// exposed so the reader need not hard-code the size
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// No cyclic logic — the ring is driven entirely by the Push / Info / Warn / Fault methods.]]></ST>
+    </Implementation>
+    <Method Name="Fault" Id="{b2c3d4e5-1004-4a5b-9c8d-100000000004}">
+      <Declaration><![CDATA[METHOD PUBLIC Fault : BOOL
+VAR_INPUT
+	inpMessage		: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Push('E', inpMessage);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Info" Id="{b2c3d4e5-1002-4a5b-9c8d-100000000002}">
+      <Declaration><![CDATA[METHOD PUBLIC Info : BOOL
+VAR_INPUT
+	inpMessage		: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Push('I', inpMessage);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Push" Id="{b2c3d4e5-1001-4a5b-9c8d-100000000001}">
+      <Declaration><![CDATA[// Append one entry to the ring: "<seq>|<sev>|<message>" at slot (seq MOD cRING_SIZE).
+METHOD PUBLIC Push : BOOL
+VAR_INPUT
+	inpSeverity		: STRING;	// 'I' | 'W' | 'E'
+	inpMessage		: STRING;
+END_VAR
+VAR
+	entry			: STRING(120);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_sequence := _sequence + 1;
+entry := DINT_TO_STRING(_sequence);
+entry := CONCAT(entry, '|');
+entry := CONCAT(entry, inpSeverity);
+entry := CONCAT(entry, '|');
+entry := CONCAT(entry, inpMessage);
+stsRingBuffer[_sequence MOD cRING_SIZE] := entry;
+stsSequence := _sequence;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Warn" Id="{b2c3d4e5-1003-4a5b-9c8d-100000000003}">
+      <Declaration><![CDATA[METHOD PUBLIC Warn : BOOL
+VAR_INPUT
+	inpMessage		: STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Push('W', inpMessage);]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

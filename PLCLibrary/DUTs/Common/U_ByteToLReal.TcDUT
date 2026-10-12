@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="U_ByteToLReal" Id="{ef2870fd-1f19-44d1-ae58-547809e4fb74}">
+    <Declaration><![CDATA[TYPE U_ByteToLReal :
+UNION
+	bytes : ARRAY [1..4] OF  BYTE;
+	value	:REAL;
+END_UNION
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

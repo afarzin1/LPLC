@@ -1,0 +1,402 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_IsolationMonitor" Id="{8a0ce665-8cea-4c8b-ba39-86c5e1c84d35}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_IsolationMonitor EXTENDS abs_fb_device
+
+VAR_INPUT
+	IO_IN_DeviceTrip	: POINTER TO BOOL;
+	IO_IN_DeviceWarning	: POINTER TO BOOL;
+	IO_OUT_TripReset	: POINTER TO BOOL;
+	IO_OUT_Test			: POINTER TO BOOL;
+END_VAR
+
+VAR
+	_modbus_IF				: ST_Modbus_Commands;
+	_modbus_cfg				: ST_Modbus_Device_Config;
+	_RegReadTimer			: TON;
+	_RegWriteTimer			: TON;
+	_RegReadState			:INT := 0;
+	_RegRead				: ARRAY [1..84] OF BYTE;
+	_IsoMon_DeviceSignals	: ST_IsoMon_MBIF;
+	HMI						: ST_IsoMon_HMI_Interface;
+	HMI_DeviceSignals		: ST_IsoMon_DeviceSignals;
+	TOFReset				: TOF;
+	TOFResetTrig			: BOOL;
+	TOFTest					: TOF;
+	TOFTestTrig				: BOOL;
+	_cmdResetTrip			: BOOL;
+	_commOK					: BOOL;		// TRUE after the last register read succeeded
+
+	
+END_VAR
+
+VAR_OUTPUT
+	stsInsulationResistance	: REAL;
+	stsCommOK				: BOOL;		// FALSE = the readings below are NOT current (read failed or not yet read)
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+Interlock.name := _DeviceName;
+Interlock(inpConfig := _dataInterlock);
+
+FaultHandler();
+
+//Set device config for Modbus interface
+_modbus_IF.ReadRegisters.sIPAddr	:= _modbus_cfg.cfgIP_address;
+_modbus_IF.ReadRegisters.nTCPPort 	:= _modbus_cfg.cfgTCPPort;
+_modbus_IF.ReadRegisters.nUnitID	:= _modbus_cfg.cfgUnitID;
+_modbus_IF.ReadRegisters.tTimeout 	:= _modbus_cfg.cfgTimeout;
+
+IF _enabled THEN	
+	_modbus_IF.ReadRegisters();
+END_IF
+
+//Read Registers (parsed only when a read completes without error - see cmdReadRegisters)
+IF _enabled THEN
+	cmdReadRegisters();
+ELSE
+	_commOK := FALSE;
+END_IF
+stsCommOK := _commOK;
+
+_RegReadTimer(IN := NOT _RegReadTimer.Q, PT := T#0.1S);
+IF _RegReadTimer.Q THEN
+	IF _RegReadState = 900 THEN
+		_RegReadState := 0;
+	END_IF
+END_IF
+
+TOFReset(IN:=TOFResetTrig, PT:= T#1S);
+TOFTest(IN:=TOFTestTrig, PT:= T#1S);
+
+//DataTask.IsoMon_InsulationResistance	:= _IsoMon_DeviceSignals.insulationResistance.value / 1000;
+
+updateHMI();
+
+stsInsulationResistance := HMI_deviceSignals.insulationResistance_kOhm;
+
+
+]]></ST>
+    </Implementation>
+    <Property Name="cfgModbusConfig" Id="{bb93b6cc-3bda-493a-a34d-a7c863905352}">
+      <Declaration><![CDATA[PROPERTY cfgModbusConfig : ST_Modbus_Device_Config]]></Declaration>
+      <Get Name="Get" Id="{513b8477-57de-4acd-8302-7c2beba8c792}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgModbusConfig := _modbus_cfg;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{60e1df16-d594-4a81-b9a5-ce9d6b858c7c}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_modbus_cfg := cfgModbusConfig;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdParseRegisters" Id="{92700fbf-c727-434b-835d-15323256ed39}">
+      <Declaration><![CDATA[METHOD PRIVATE cmdParseRegisters : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// 0x2000: insulationResistance
+_IsoMon_DeviceSignals.insulationResistance.bytes[1] := _RegRead[3];
+_IsoMon_DeviceSignals.insulationResistance.bytes[2] := _RegRead[4];
+_IsoMon_DeviceSignals.insulationResistance.bytes[3] := _RegRead[1];
+_IsoMon_DeviceSignals.insulationResistance.bytes[4] := _RegRead[2];
+
+// 0x2002: minInsulationValue
+_IsoMon_DeviceSignals.minInsulationValue.bytes[1] := _RegRead[7];
+_IsoMon_DeviceSignals.minInsulationValue.bytes[2] := _RegRead[8];
+_IsoMon_DeviceSignals.minInsulationValue.bytes[3] := _RegRead[5];
+_IsoMon_DeviceSignals.minInsulationValue.bytes[4] := _RegRead[6];
+
+// 0x2004: systemLeakageCapacitance
+_IsoMon_DeviceSignals.systemLeakageCapacitance.bytes[1] := _RegRead[11];
+_IsoMon_DeviceSignals.systemLeakageCapacitance.bytes[2] := _RegRead[12];
+_IsoMon_DeviceSignals.systemLeakageCapacitance.bytes[3] := _RegRead[9];
+_IsoMon_DeviceSignals.systemLeakageCapacitance.bytes[4] := _RegRead[10];
+
+// 0x2006: voltageL1L2
+_IsoMon_DeviceSignals.voltageL1L2.bytes[1] := _RegRead[15];
+_IsoMon_DeviceSignals.voltageL1L2.bytes[2] := _RegRead[16];
+_IsoMon_DeviceSignals.voltageL1L2.bytes[3] := _RegRead[13];
+_IsoMon_DeviceSignals.voltageL1L2.bytes[4] := _RegRead[14];
+
+// 0x2008: voltageL1L3
+_IsoMon_DeviceSignals.voltageL1L3.bytes[1] := _RegRead[19];
+_IsoMon_DeviceSignals.voltageL1L3.bytes[2] := _RegRead[20];
+_IsoMon_DeviceSignals.voltageL1L3.bytes[3] := _RegRead[17];
+_IsoMon_DeviceSignals.voltageL1L3.bytes[4] := _RegRead[18];
+
+// 0x200A: voltageL2L3
+_IsoMon_DeviceSignals.voltageL2L3.bytes[1] := _RegRead[23];
+_IsoMon_DeviceSignals.voltageL2L3.bytes[2] := _RegRead[24];
+_IsoMon_DeviceSignals.voltageL2L3.bytes[3] := _RegRead[21];
+_IsoMon_DeviceSignals.voltageL2L3.bytes[4] := _RegRead[22];
+
+// 0x200C: voltageL1PE
+_IsoMon_DeviceSignals.voltageL1PE.bytes[1] := _RegRead[27];
+_IsoMon_DeviceSignals.voltageL1PE.bytes[2] := _RegRead[28];
+_IsoMon_DeviceSignals.voltageL1PE.bytes[3] := _RegRead[25];
+_IsoMon_DeviceSignals.voltageL1PE.bytes[4] := _RegRead[26];
+
+// 0x200E: voltageL2PE
+_IsoMon_DeviceSignals.voltageL2PE.bytes[1] := _RegRead[31];
+_IsoMon_DeviceSignals.voltageL2PE.bytes[2] := _RegRead[32];
+_IsoMon_DeviceSignals.voltageL2PE.bytes[3] := _RegRead[29];
+_IsoMon_DeviceSignals.voltageL2PE.bytes[4] := _RegRead[30];
+
+// 0x2010: voltageL3PE
+_IsoMon_DeviceSignals.voltageL3PE.bytes[1] := _RegRead[35];
+_IsoMon_DeviceSignals.voltageL3PE.bytes[2] := _RegRead[36];
+_IsoMon_DeviceSignals.voltageL3PE.bytes[3] := _RegRead[33];
+_IsoMon_DeviceSignals.voltageL3PE.bytes[4] := _RegRead[34];
+
+// 0x2012: systemFrequency
+_IsoMon_DeviceSignals.systemFrequency.bytes[1] := _RegRead[39];
+_IsoMon_DeviceSignals.systemFrequency.bytes[2] := _RegRead[40];
+_IsoMon_DeviceSignals.systemFrequency.bytes[3] := _RegRead[37];
+_IsoMon_DeviceSignals.systemFrequency.bytes[4] := _RegRead[38];
+
+// 0x2014: couplingToSystem
+_IsoMon_DeviceSignals.couplingToSystem.bytes[1] := _RegRead[43];
+_IsoMon_DeviceSignals.couplingToSystem.bytes[2] := _RegRead[44];
+_IsoMon_DeviceSignals.couplingToSystem.bytes[3] := _RegRead[41];
+_IsoMon_DeviceSignals.couplingToSystem.bytes[4] := _RegRead[42];
+
+// 0x2016: couplingToEarth
+_IsoMon_DeviceSignals.couplingToEarth.bytes[1] := _RegRead[47];
+_IsoMon_DeviceSignals.couplingToEarth.bytes[2] := _RegRead[48];
+_IsoMon_DeviceSignals.couplingToEarth.bytes[3] := _RegRead[45];
+_IsoMon_DeviceSignals.couplingToEarth.bytes[4] := _RegRead[46];
+
+// 0x2018: deviceError
+_IsoMon_DeviceSignals.deviceError.bytes[1] := _RegRead[51];
+_IsoMon_DeviceSignals.deviceError.bytes[2] := _RegRead[52];
+_IsoMon_DeviceSignals.deviceError.bytes[3] := _RegRead[49];
+_IsoMon_DeviceSignals.deviceError.bytes[4] := _RegRead[50];
+
+// 0x201A: deviceInactive
+_IsoMon_DeviceSignals.deviceInactive.bytes[1] := _RegRead[55];
+_IsoMon_DeviceSignals.deviceInactive.bytes[2] := _RegRead[56];
+_IsoMon_DeviceSignals.deviceInactive.bytes[3] := _RegRead[53];
+_IsoMon_DeviceSignals.deviceInactive.bytes[4] := _RegRead[54];
+
+// 0x201C: dcOffset
+_IsoMon_DeviceSignals.dcOffset.bytes[1] := _RegRead[59];
+_IsoMon_DeviceSignals.dcOffset.bytes[2] := _RegRead[60];
+_IsoMon_DeviceSignals.dcOffset.bytes[3] := _RegRead[57];
+_IsoMon_DeviceSignals.dcOffset.bytes[4] := _RegRead[58];
+
+// 0x201E: measurementQuality
+_IsoMon_DeviceSignals.measurementQuality.bytes[1] := _RegRead[63];
+_IsoMon_DeviceSignals.measurementQuality.bytes[2] := _RegRead[64];
+_IsoMon_DeviceSignals.measurementQuality.bytes[3] := _RegRead[61];
+_IsoMon_DeviceSignals.measurementQuality.bytes[4] := _RegRead[62];
+
+// 0x2020: symmetricalAlarm
+_IsoMon_DeviceSignals.symmetricalAlarm.bytes[1] := _RegRead[67];
+_IsoMon_DeviceSignals.symmetricalAlarm.bytes[2] := _RegRead[68];
+_IsoMon_DeviceSignals.symmetricalAlarm.bytes[3] := _RegRead[65];
+_IsoMon_DeviceSignals.symmetricalAlarm.bytes[4] := _RegRead[66];
+
+// 0x2022: dcMinusAlarm
+_IsoMon_DeviceSignals.dcMinusAlarm.bytes[1] := _RegRead[71];
+_IsoMon_DeviceSignals.dcMinusAlarm.bytes[2] := _RegRead[72];
+_IsoMon_DeviceSignals.dcMinusAlarm.bytes[3] := _RegRead[69];
+_IsoMon_DeviceSignals.dcMinusAlarm.bytes[4] := _RegRead[70];
+
+// 0x2024: dcPlusAlarm
+_IsoMon_DeviceSignals.dcPlusAlarm.bytes[1] := _RegRead[75];
+_IsoMon_DeviceSignals.dcPlusAlarm.bytes[2] := _RegRead[76];
+_IsoMon_DeviceSignals.dcPlusAlarm.bytes[3] := _RegRead[73];
+_IsoMon_DeviceSignals.dcPlusAlarm.bytes[4] := _RegRead[74];
+
+// 0x2026: durationMeasuringPulse
+_IsoMon_DeviceSignals.durationMeasuringPulse.bytes[1] := _RegRead[79];
+_IsoMon_DeviceSignals.durationMeasuringPulse.bytes[2] := _RegRead[80];
+_IsoMon_DeviceSignals.durationMeasuringPulse.bytes[3] := _RegRead[77];
+_IsoMon_DeviceSignals.durationMeasuringPulse.bytes[4] := _RegRead[78];
+
+// 0x2028: voltageDCPE
+_IsoMon_DeviceSignals.voltageDCPE.bytes[1] := _RegRead[83];
+_IsoMon_DeviceSignals.voltageDCPE.bytes[2] := _RegRead[84];
+_IsoMon_DeviceSignals.voltageDCPE.bytes[3] := _RegRead[81];
+_IsoMon_DeviceSignals.voltageDCPE.bytes[4] := _RegRead[82];
+
+
+
+
+
+
+
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReadRegisters" Id="{d9aed744-98bd-4e97-b3e9-401403cc9cbc}">
+      <Declaration><![CDATA[METHOD PRIVATE cmdReadRegisters : BOOL
+VAR_INPUT
+END_VAR
+
+VAR
+
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE _RegReadState OF 
+	0:
+		IF (_modbus_IF.ReadRegisters.bBusy = FALSE) THEN
+			_modbus_IF.ReadRegisters.nQuantity := SIZEOF(_RegRead)/2;
+			_modbus_IF.ReadRegisters.cbLength  := SIZEOF(_RegRead);
+			_modbus_IF.ReadRegisters.pDestAddr := ADR(_RegRead);
+			_modbus_IF.ReadRegisters.nMBAddr   := 8192;
+			_modbus_IF.ReadRegisters.bExecute  := TRUE;
+			_RegReadState := 1;
+		END_IF
+	1:
+		IF _modbus_IF.ReadRegisters.bBusy = TRUE THEN
+			_modbus_IF.ReadRegisters.bExecute := FALSE;
+			_RegReadState := 2;
+		END_IF
+	2:
+		IF _modbus_IF.ReadRegisters.bBusy = FALSE THEN
+			// A failed read used to go unnoticed: the HMI kept showing the last insulation
+			// resistance with no fault. Now it faults (latched until reset) and the old values
+			// are not re-parsed; stsCommOK says whether the readings are current.
+			IF _modbus_IF.ReadRegisters.bError THEN
+				_commOK := FALSE;
+				setFault(1, 'Comms. Read Fault - insulation readings are not current');
+			ELSE
+				_commOK := TRUE;
+				cmdParseRegisters();
+			END_IF
+			_RegReadState := 900;
+		END_IF
+END_CASE]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{778dd64a-f791-49fb-85d9-fae64074c060}">
+      <Declaration><![CDATA[METHOD cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[setFault(0,'');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdResetTrip" Id="{c8010787-d5b5-44ad-883a-dcb557ba291d}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdResetTrip : BOOL
+VAR_INPUT
+
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_cmdResetTrip := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdTest" Id="{9902e8ff-a9f7-4328-8ce1-b303ff7ad2c1}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdTest : BOOL
+VAR_INPUT
+	IO_value	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF IO_OUT_Test <> 0 THEN
+	IO_OUT_Test^ := IO_value;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FaultHandler" Id="{085ceba6-e4ca-4424-b175-e1409ffb28de}">
+      <Declaration><![CDATA[METHOD PRIVATE FaultHandler : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF IO_IN_DeviceTrip^ = FALSE THEN
+	setFault(1,'Loss of isolation between HVDC and ground');
+END_IF
+
+IF IO_IN_DeviceWarning^ = FALSE THEN
+	sendWarning('Isolation Warning - abnormally low isolation to ground',1);
+END_IF
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{6c626fe9-5831-4ebb-81fb-3b7f775176d8}">
+      <Declaration><![CDATA[(*FB_Init is always available implicitly and it is used primarily for initialization.
+The return value is not evaluated. For a specific influence, you can also declare the
+methods explicitly and provide additional code there with the standard initialization
+code. You can evaluate the return value.*)
+METHOD FB_Init : BOOL
+VAR_INPUT
+	(* TRUE: the retain variables are initialized (reset warm / reset cold)*)
+	bInitRetains	: BOOL;
+	(* TRUE: the instance will be copied to the copy code afterward (online change)   *)
+	bInCopyCode	: BOOL;
+	cfgDeviceName	: STRING;
+	cfgEnable	: BOOL;
+	cfgInitEventClass	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 		:= 		cfgDeviceName; 		
+THIS^.cfgEnable 			:= 	    cfgEnable; 	
+THIS^.cfgInitEventClass		:= 		cfgInitEventClass;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="updateHMI" Id="{72cc4185-3808-4f7e-a8b0-81ca03163161}">
+      <Declaration><![CDATA[METHOD updateHMI : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[HMI_deviceSignals.insulationResistance_kOhm := _isoMon_DeviceSignals.insulationResistance.value / 1000;
+HMI_deviceSignals.minInsulationValue		:= _isoMon_DeviceSignals.minInsulationValue.value / 1000;
+HMI_deviceSignals.voltageDCPlusToMinus		:= _isoMon_DeviceSignals.voltageL1L3.value;
+HMI_deviceSignals.voltageDCPlusToPE			:= _isoMon_DeviceSignals.voltageL1PE.value;
+HMI_deviceSignals.voltageDCMinusToPE		:= _isoMon_DeviceSignals.voltageL3PE.value;
+HMI_deviceSignals.couplingToSystem			:= _isoMon_DeviceSignals.couplingToSystem.value;
+HMI_deviceSignals.couplingtoEarth			:= _isoMon_DeviceSignals.couplingToEarth.value;
+HMI_deviceSignals.deviceError				:= _isoMon_DeviceSignals.deviceError.value;
+HMI_deviceSignals.deviceInactive			:= _isoMon_DeviceSignals.deviceInactive.value;
+HMI_deviceSignals.dcOffset					:= _isoMon_DeviceSignals.dcOffset.value;
+HMI_deviceSignals.measurementQuality		:= _isoMon_DeviceSignals.measurementQuality.value;
+HMI.HMIbaseDevice := HMIbaseDevice;
+
+//Reset command from HMI
+IF HMI.ocmdTripReset OR inpReset OR _cmdResetTrip THEN
+	TOFResetTrig 		:= TRUE;
+	HMI.ocmdTripReset	:= FALSE;
+	_cmdResetTrip		:= FALSE;
+END_IF
+
+IF TOFReset.Q THEN
+	IO_OUT_TripReset^ := TRUE;
+	TOFResetTrig	  := FALSE;
+ELSE
+	IO_OUT_TripReset^ := FALSE;
+END_IF
+
+//Test command from HMI
+IF HMI.ocmdTest THEN
+	TOFTestTrig			:= TRUE;
+	HMI.ocmdTest		:= FALSE;
+END_IF
+
+IF TOFTest.Q THEN
+	IO_OUT_Test^	  := TRUE;
+	TOFTestTrig		  := FALSE;
+ELSE
+	IO_OUT_Test^	  := FALSE;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

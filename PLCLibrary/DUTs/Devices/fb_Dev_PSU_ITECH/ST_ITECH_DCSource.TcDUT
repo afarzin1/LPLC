@@ -1,0 +1,28 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ITECH_DCSource" Id="{e081ea83-417d-4b4e-90a4-e5bd7fc11488}">
+    <Declaration><![CDATA[TYPE ST_ITECH_DCSource :
+STRUCT
+	DCMode			  : UDINT;
+	DCVoltSP		  : REAL;
+	DCVoltRise		  : REAL;
+	DCVoltFall		  : REAL;
+	DCCurrentSP		  : REAL;
+	DCCurrentRise	  : REAL;
+	DCCurrentFall	  : REAL;
+	DCVoltHigh        : REAL;   // dc_v_high (float)
+    DCVoltLow         : REAL;   // dc_v_low (float)
+    DCCurrentHigh     : REAL;   // dc_i_high (float)
+    DCCurrentLow      : REAL;   // dc_i_low (float)
+    DCCC_SpeedState   : UDINT;  // cc_speed_state (uint32)
+    DCCV_SpeedState   : UDINT;  // cv_speed_state (uint32)
+    DCPowerHigh       : REAL;   // power_high (float)
+    DCPowerLow        : REAL;   // power_low (float)
+    DCSlewMode        : UDINT;  // Slew mode (uint32)
+    DCOnlyLoad        : UDINT;  // Only Load (uint32)
+    DCBatterySim      : UDINT;  // Battery Simulation (uint32)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,274 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="abs_fb_Device" Id="{c0d40816-85e7-4d26-bd04-870ed1b64f4b}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK ABSTRACT abs_fb_Device
+VAR_INPUT
+	inpAuto 			: BOOL;
+	inpReset 			: BOOL;
+	inpInterlockBypass	: BOOL;
+	faultMonitor		: POINTER TO fb_FaultMonitor;
+
+END_VAR
+VAR_OUTPUT
+	stsFaulted 			: BOOL;
+	stsFaultDescription : STRING;
+END_VAR
+VAR
+	_deviceName			: STRING;
+	_init				: BOOL;	//DO NOT TOGGLE MANUALLY, WILL DUPLICATE ALARM ENTRY
+	_initEventClass		: BOOL;
+	_enabled			: BOOL;
+	_inAuto				: BOOL;
+	Interlock			: fb_Interlock;
+	_dataInterlock		: st_interlock;
+	_deviceFault		: FB_TcAlarm;
+	_deviceMsg			: FB_TcMessage;
+	_deviceFaultRaised  : BOOL;
+	_clear				: BOOL;
+	_warnChannels		: ARRAY [1..20] OF STRING;
+	_logChannels		: ARRAY [1..20] OF STRING;
+	HMIbasedevice		: ST_Device_HMI_Interface;
+	_extraFaults		: ARRAY [1..10] OF STRING;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[]]></ST>
+    </Implementation>
+    <Property Name="cfgDeviceName" Id="{b257ac1c-68a2-4648-8d14-3adcf22c6b0d}">
+      <Declaration><![CDATA[PROPERTY cfgDeviceName : STRING]]></Declaration>
+      <Get Name="Get" Id="{1fa3951c-32a6-4fe4-b473-8eba5bca6550}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgDeviceName := _deviceName;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{bbf94cd7-f630-4fce-a932-4211c52371f9}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_deviceName := cfgDeviceName;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgEnable" Id="{f20b50ad-c81b-46f3-b7ef-3826b5194fa4}">
+      <Declaration><![CDATA[PROPERTY cfgEnable : BOOL]]></Declaration>
+      <Get Name="Get" Id="{317b525b-c427-4110-be9a-f0973313adad}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgEnable := _enabled;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{8d5b9cb5-4bb6-4c5d-bdcf-0bc8e84d18cc}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_enabled := cfgEnable;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgInitEventClass" Id="{df9f8854-9cad-49f8-86d7-365378b44fce}">
+      <Declaration><![CDATA[PROPERTY cfgInitEventClass : Bool]]></Declaration>
+      <Get Name="Get" Id="{e9b6d705-0dca-4211-add1-63c2fd654764}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgInitEventClass := _initEventClass;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{c8d86c44-4a8e-481a-a4d9-9cfceec4f7c3}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_initEventClass := cfgInitEventClass;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdReset" Id="{d3bd9842-cc9c-46ad-8bb8-483bc86fd8cd}">
+      <Declaration><![CDATA[METHOD cmdReset : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdSetInterlock" Id="{305f3524-0474-4682-b08b-8e2d5d62cfd8}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdSetInterlock : BOOL
+VAR_INPUT
+	interlockIndex : INT;
+	description : STRING;
+	condition: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_dataInterlock.conditions[interlockIndex] := condition;
+_dataInterlock.descriptions[interlockIndex] := description;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="DeviceLogic" Id="{1d52efe7-7134-4d17-916b-7e4ee50c5ea0}">
+      <Declaration><![CDATA[METHOD PROTECTED DeviceLogic : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF NOT _init AND _initEventClass THEN
+	_init := TRUE;
+	setInit();
+END_IF
+
+_inAuto := inpAuto;
+
+Interlock.name 			:= _DeviceName;
+Interlock(inpConfig 	:= _dataInterlock, inpGlobalBypass := inpInterlockBypass );
+
+//Fault Handling
+IF stsFaulted AND NOT(_deviceFaultRaised) THEN
+	_deviceFaultRaised := TRUE;
+	_deviceFault.ipArguments.Clear();
+	_deviceFault.ipArguments.AddString(_deviceName).AddString(stsFaultDescription);
+	_deviceFault.Raise(nTimeStamp :=0);
+END_IF
+
+IF NOT(stsFaulted) THEN
+	_deviceFaultRaised := FALSE;
+	_deviceFault.Clear(0);
+END_IF
+
+IF inpReset THEN
+	cmdReset();
+END_IF
+
+HMIbasedevice.deviceName		  := _devicename;
+HMIbasedevice.enabled			  := _enabled;
+HMIbasedevice.stsInAuto			  := _inAuto;
+HMIbasedevice.interlock 		  := Interlock.getHMIdata();
+HMIbasedevice.stsFaulted		  := stsFaulted;
+HMIbasedevice.stsFaultDescription := stsFaultDescription;
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{95b641db-40c6-4a91-a370-f8c012829af4}">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init: BOOL
+VAR_INPUT
+    bInitRetains: BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode: BOOL;  // TRUE: the instance will be copied to the copy code afterward (online change)   
+	cfgDeviceName 		: STRING;
+	cfgEnable			: BOOL;
+	cfgInitEventClass	: BOOL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 		:= 		cfgDeviceName; 
+THIS^.cfgEnable				:=		cfgEnable;
+THIS^.cfgInitEventClass		:= 		cfgInitEventClass;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="sendLog" Id="{797c1a77-98c9-487a-a820-4243e1e1331e}">
+      <Declaration><![CDATA[METHOD INTERNAL sendLog : BOOL
+VAR_INPUT
+	message : STRING;
+	channel : USINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF message <> _logChannels[channel] THEN
+	_logchannels[channel] := message;
+	_deviceMsg.CreateEx(TC_Events.absDevice.Logger,0);
+	_deviceMsg.ipArguments.AddString(_deviceName).AddString(message);
+	_deviceMsg.Send(0);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="sendWarning" Id="{2bffa93e-ae52-49a1-a179-18725dedf4ea}">
+      <Declaration><![CDATA[METHOD INTERNAL sendWarning : BOOL
+VAR_INPUT
+	message : STRING;
+	channel : USINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF message <> _warnChannels[channel] THEN
+	_warnChannels[channel] := message;
+	_deviceMsg.CreateEx(TC_Events.absDevice.Warning,0);
+	_deviceMsg.ipArguments.AddString(_deviceName).AddString(message);
+	_deviceMsg.Send(0);	
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setFault" Id="{dc495555-8dd1-4a1b-ae03-305f91748780}">
+      <Declaration><![CDATA[METHOD INTERNAL setFault : BOOL
+VAR_INPUT
+	faultState			: BOOL;
+	faultDescription	: STRING;
+END_VAR
+VAR
+	i            : DINT;
+	alreadyAdded : BOOL;	// per call: was this description already reported as an additional fault?
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// alreadyAdded is LOCAL on purpose. It was an FB member that was only cleared when the fault
+// was reset, so after one repeated additional fault every later, DIFFERENT one was dropped.
+IF faultState THEN
+	//if already faulted, send out additional faults as warnings
+	IF stsFaulted AND NOT(faultDescription = stsFaultDescription) THEN
+		//Check if already added
+		FOR i:= 1 TO UPPER_BOUND(_extraFaults,1) DO
+			IF faultDescription = _extraFaults[i] THEN
+				alreadyAdded := TRUE;
+				EXIT;
+			END_IF
+		END_FOR
+		IF NOT alreadyAdded AND (_extraFaults[10] = '') THEN
+			sendWarning(CONCAT('Additional Fault - ', faultDescription),20);
+			FOR i:= 1 TO UPPER_BOUND(_extraFaults,1) DO
+				IF _extraFaults[i] = '' THEN
+					_extraFaults[i] := faultDescription;
+					EXIT;
+				END_IF
+			END_FOR
+		END_IF
+	ELSE
+		stsFaulted := TRUE;
+		stsFaultDescription := faultDescription;
+	END_IF
+
+ELSE
+	stsFaulted := FALSE;
+	stsFaultDescription := '';
+	MEMSET(destAddr := ADR(_extraFaults), fillByte := 0, n:= SIZEOF(_extraFaults));
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setInit" Id="{3acbbd44-9b4c-40d0-8c79-ae8ed39cb491}">
+      <Declaration><![CDATA[METHOD INTERNAL setInit : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF faultMonitor <> 0 THEN
+	faultMonitor^.addDeviceFault(faultStatus := ADR(stsFaulted), faultDescription := ADR(stsFaultDescription), deviceName := ADR(_deviceName));
+END_IF
+_deviceFault.CreateEx(stEventEntry:=TC_Events.absDevice.Faulted, bWithConfirmation := FALSE, ipSourceInfo := 0);
+_deviceMsg.CreateEx(stEventEntry:=TC_events.absDevice.Warning,ipSourceInfo:=0);
+_deviceMsg.CreateEx(stEventEntry:=TC_events.absDevice.Logger,ipSourceInfo:=0);
+
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

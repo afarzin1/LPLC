@@ -1,0 +1,21 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_AnalogSensor_HMI_Interface" Id="{d156e232-fa8b-479e-b1f7-da3c6715dd5f}">
+    <Declaration><![CDATA[TYPE ST_AnalogSensor_HMI_Interface :
+STRUCT
+	HMIbaseDevice		: ST_Device_HMI_Interface;
+	stsSensorRawSignal	: LREAL;
+	stsEngValue			: LREAL;
+	cfgAlarmEnable		: BOOL;
+	cfgAlarmL			: LREAL;
+	cfgAlarmLL			: LREAL;
+	cfgAlarmH			: LREAL;
+	cfgAlarmHH			: LREAL;
+	cfgEngUnit			: STRING;
+	cfgCalOffset		: LREAL;
+	cfgCalGain			: LREAL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

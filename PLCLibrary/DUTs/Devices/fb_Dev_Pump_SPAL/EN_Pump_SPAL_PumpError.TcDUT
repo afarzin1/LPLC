@@ -1,0 +1,28 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="EN_Pump_SPAL_PumpError" Id="{4e677bd6-c902-4b73-865f-95caa8443fd9}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+TYPE EN_Pump_SPAL_PumpError :
+(
+	Normal_Operation,
+	Unable_to_start,
+	OverV_Protection_Shutdown,
+	UnderV_Protection_Shutdown,
+	OverT_Protection_Shutdown,
+	Speed_Limited_Due_To_Current,
+	Speed_Limited_Due_To_Capability,
+	Speed_Limited_Due_To_Torque,
+	Speed_Limited_Due_To_OverT,
+	Reserved1,
+	Reserved2,
+	Reserved3,
+	Reserved4,
+	Reserved5,
+	Dry_Run	
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

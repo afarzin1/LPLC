@@ -1,0 +1,89 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_ControlValve_Modulating" Id="{89888e0f-f91a-4412-8354-ec910db7043f}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_ControlValve_Modulating EXTENDS abs_fb_Device
+VAR_INPUT
+	inpValvePosition	: LREAL;
+END_VAR
+
+VAR
+	transMantoAuto	: R_TRIG;
+	transAutoToMan	: F_TRIG;
+END_VAR
+
+VAR PERSISTENT
+	HMI				: ST_ControlValve_Modulating_HMI_Interface;
+	_valvePosition	: LREAL;
+END_VAR
+
+
+VAR_OUTPUT
+	outValvePosition	: LREAL;
+	stsValveFeedback	: LREAL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+Interlock.name := _DeviceName;
+Interlock(inpConfig := _dataInterlock);
+
+faultHandler();
+
+transManToAuto(CLK:=_inAuto);
+transAutoToMan(CLK:=_inAuto);
+
+stsValveFeedback := inpValvePosition;
+
+// Maintain valve position during man/auto machine state changes
+IF transManToAuto.Q THEN
+	_valvePosition := HMI.ocmdValvePosition;
+END_IF
+
+IF transAutoToMan.Q THEN
+	HMI.ocmdValvePosition := _valvePosition;
+END_IF
+
+IF NOT stsFaulted AND Interlock.outInterlockOK THEN
+	IF _inAuto THEN
+		outValvePosition := _valvePosition;
+	ELSE
+		outValvePosition := HMI.ocmdValvePosition;
+	END_IF
+END_IF
+
+HMI.stsValveFeedback := stsValveFeedback;
+HMI.stsValvePosition := outValvePosition;
+HMI.HMIbaseDevice := HMIBaseDevice;]]></ST>
+    </Implementation>
+    <Method Name="faultHandler" Id="{adf71b67-ffd5-4f27-bbed-e6c2244bc31f}">
+      <Declaration><![CDATA[METHOD faultHandler : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsValveFeedback < -1 AND _warnChannels[1] = '' THEN
+	sendWarning('Valve feedback not present', 1);
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="valvePosition" Id="{fd4b2016-bcc6-4cab-895b-90d88535bd1f}">
+      <Declaration><![CDATA[PROPERTY valvePosition : LREAL]]></Declaration>
+      <Get Name="Get" Id="{b82cfbac-57a6-4808-bcff-8cb24271bbb6}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[valvePosition := _valvePosition;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{802320db-e8e9-4dc2-bba0-e1b6ceff50e0}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_valvePosition := valvePosition;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+  </POU>
+</TcPlcObject>

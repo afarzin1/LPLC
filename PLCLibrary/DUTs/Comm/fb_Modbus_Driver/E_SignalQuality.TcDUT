@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="E_SignalQuality" Id="{182781b4-018b-4181-aae4-73847ac012ed}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_SignalQuality :
+(
+    Good                := 0,
+    BadComm             := 1,
+    BadConfig           := 2,
+    BadDeviceFault      := 3,
+    UncertainStale      := 4,
+    UncertainInit       := 5
+) UINT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

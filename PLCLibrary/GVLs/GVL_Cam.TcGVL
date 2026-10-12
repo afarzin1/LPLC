@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <GVL Name="GVL_Cam" Id="{6ab7b6e6-2e0f-4b88-94b0-531b5608b3d1}">
+    <Declaration><![CDATA[// Shared constants for the cam-teach subsystem (fb_CamTeach / fb_CamTeachFile).
+// Kept in a GVL so the working-point array bound is a single source of truth
+// across the FB, its persistence sub-FB, and any pre-created NC tables.
+VAR_GLOBAL CONSTANT
+    MAX_CAM_POINTS : INT := 4096;   // >= 360/rev x 7 revs + margin; array bound for cam point buffers
+END_VAR
+]]></Declaration>
+  </GVL>
+</TcPlcObject>

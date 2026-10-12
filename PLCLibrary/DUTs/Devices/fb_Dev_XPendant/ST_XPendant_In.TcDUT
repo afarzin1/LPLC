@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_XPendant_In" Id="{59d6d720-dc05-4630-b061-a8f5c7e15cdb}">
+    <Declaration><![CDATA[// Written over ADS by the lhmi `xpendant` sidecar app (lhmi-core apps/xpendant),
+// which reads a USB Xbox controller on the IPC. This is a RAW EXTERNAL MIRROR, so
+// members are unprefixed PascalCase (CONVENTIONS.md §2 exception) — the member
+// names ARE the ADS write contract: the service writes <instance>.inpPad.<member>.
+// PLC logic must never write into this struct.
+TYPE ST_XPendant_In :
+STRUCT
+    Connected : BOOL;   // controller present AND service feeding
+    Watchdog  : UINT;   // rolls 0..65535 every ~500 ms — stale => treat as disconnected
+
+    // Face / shoulder / menu buttons
+    BtnA      : BOOL;
+    BtnB      : BOOL;
+    BtnX      : BOOL;
+    BtnY      : BOOL;
+    BumpL     : BOOL;   // left bumper (LB)
+    BumpR     : BOOL;   // right bumper (RB)
+    Start     : BOOL;
+    Back      : BOOL;
+    ThumbL    : BOOL;   // left-stick click (L3)
+    ThumbR    : BOOL;   // right-stick click (R3)
+
+    // D-pad
+    DpadUp    : BOOL;
+    DpadDown  : BOOL;
+    DpadLeft  : BOOL;
+    DpadRight : BOOL;
+
+    // Analog sticks: -1.0 .. 1.0, dead zone applied by the service, up/right = +
+    StickLX   : LREAL;
+    StickLY   : LREAL;
+    StickRX   : LREAL;
+    StickRY   : LREAL;
+
+    // Analog triggers: 0.0 .. 1.0
+    TrigL     : LREAL;
+    TrigR     : LREAL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

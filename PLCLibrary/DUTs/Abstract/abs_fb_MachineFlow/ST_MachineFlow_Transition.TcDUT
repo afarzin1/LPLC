@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_MachineFlow_Transition" Id="{b354fbc9-21de-42eb-aaca-67608afa403f}">
+    <Declaration><![CDATA[// One transition of an abs_fb_MachineFlow sequence - the ONLY relationship
+// object between steps. Fires when ALL source steps are active AND done AND
+// the permissive is TRUE; firing consumes the source tokens and activates all
+// targets. 1->N = AND-divergence, N->1 = AND-convergence, two transitions from
+// one step with opposing permissives = OR-choice, a backward target = a loop.
+TYPE ST_MachineFlow_Transition :
+STRUCT
+    name       : STRING(63);   // the CONDITION text shown on the HMI (e.g. 'cycles < 3'); no double quotes
+    sources    : ARRAY[1..4] OF INT;   // step ids; 0 = unused slot
+    targets    : ARRAY[1..4] OF INT;   // step ids; 0 = unused slot
+    // The gate, and the ONLY thing the engine knows about it. Set with setPermissive(); sticky, and
+    // reset to TRUE on reset. Where the gate is really an fb_Permissive, the machine ANDs it in at
+    // the call site — setPermissive(t, PermUnload.stsPermissiveOK) — exactly as it reports a step
+    // with stepDone(id). An earlier revision carried a POINTER TO fb_Permissive here instead, so the
+    // engine dereferenced an object it did not own on every scan; removed 2026-07-26, because the
+    // boolean already expresses the effective gate, the HMI reads each permissive's conditions
+    // straight from that instance, and a stored pointer can go stale where a value cannot.
+    permissive : BOOL := TRUE;
+    fired      : BOOL;   // has fired at least once this run (reset with the run)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

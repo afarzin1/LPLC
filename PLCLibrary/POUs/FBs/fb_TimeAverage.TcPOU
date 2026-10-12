@@ -1,0 +1,58 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_TimeAverage" Id="{72e173a3-1652-4520-8e65-13fbb0ea202c}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_TimeAverage
+VAR_INPUT
+    inpSignal         : LREAL;         // The input signal to be averaged
+    inpSampleTime     : TIME := T#10MS; // The cycle time of the task calling this FB (e.g., 10ms)
+    inpAverageTime    : TIME := T#1s;   // The desired time window for the average (e.g., 1s)
+END_VAR
+VAR_OUTPUT
+    outAverage        : LREAL;         // The calculated average value over the specified time
+END_VAR
+VAR
+    rSum            : LREAL;        // Use LREAL for the sum to avoid precision loss with many additions
+    nSampleCount    : DINT;         // Counter for the number of samples collected
+    nMaxSamples     : DINT;         // The total number of samples required for the averaging period
+    bInitialize     : BOOL := TRUE; // Flag to initialize on the first scan
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[IF bInitialize THEN
+    // Ensure tSampleTime is not zero to prevent division by zero error.
+    IF inpSampleTime > T#0S THEN
+        // Calculate the number of samples needed to fill the averaging time window.
+        // We convert TIME to DINT (in nanoseconds) for the calculation.
+        nMaxSamples := TIME_TO_DINT(inpAverageTime) / TIME_TO_DINT(inpSampleTime);
+    ELSE
+        // If sample time is zero, set max samples to 1 to avoid errors.
+        nMaxSamples := 1;
+    END_IF;
+    
+    // Reset internal variables to start a fresh calculation
+    rSum := 0.0;
+    nSampleCount := 0;
+    
+    // Initialization is complete.
+    bInitialize := FALSE;
+END_IF
+
+// Accumulate the signal value and increment the sample counter in every scan.
+nSampleCount := nSampleCount + 1;
+rSum := rSum + inpSignal;
+
+// Check if the required number of samples for the averaging period has been collected.
+IF nSampleCount >= nMaxSamples THEN
+    // Calculate the average value.
+    // Check nSampleCount to be safe, although it should equal nMaxSamples here.
+    IF nSampleCount > 0 THEN
+        outAverage := rSum / nSampleCount;
+    END_IF;
+    
+    // Reset the sum and counter to begin the next averaging window.
+    rSum := 0.0;
+    nSampleCount := 0;
+END_IF;]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

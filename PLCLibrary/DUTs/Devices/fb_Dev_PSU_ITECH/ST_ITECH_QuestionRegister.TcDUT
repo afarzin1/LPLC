@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ITECH_QuestionRegister" Id="{23c9e50e-25dd-422f-9a47-a9f034a62d3a}">
+    <Declaration><![CDATA[TYPE ST_ITECH_QuestionRegister :
+STRUCT
+	overVoltageProtection : BOOL;
+	overCurrentProtection : BOOL;
+	overPowerProtection	  : BOOL;
+	underVoltageProtection: BOOL;
+	overTempProtection	  : BOOL;
+	underCurrentProtection: BOOL;
+	senseFault			  : BOOL;
+	currentSharingFault   : BOOL;
+	reserved			  : BOOL;
+	externalInhibit		  : BOOL;
+	faultProtection		  : BOOL;
+	loopOscFailure		  : BOOL;
+	outputNotRegulated    : BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

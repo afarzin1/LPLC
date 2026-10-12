@@ -1,0 +1,1049 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_PSU_ITECH" Id="{f214abb7-35a5-423d-b173-d28adcac2f46}" SpecialFunc="None">
+    <Declaration><![CDATA[(*
+    fb_Dev_PSU_ITECH — ITECH programmable DC supply (IT6000 / IT6600C) over Modbus TCP.
+
+    All traffic goes through fb_Modbus_Driver: one connection, requests strictly in series,
+    a pause of the type's scan time between transactions (these supplies are slow and do not
+    like to be rushed).
+
+    COMMS LATCH. The FIRST failed read or write stops ALL traffic to the supply — no retries,
+    no reconnect loop — and raises a fault. Nothing is sent again until a reset (inpReset,
+    an HMI reset, or cmdReset()). ITECHs misbehave when they are polled while they are
+    refusing requests, so the block waits for a person rather than hammering them.
+
+    BASELINE BEFORE WRITE. After every (re)start the block reads the supply's current settings
+    first and seeds its command image from them; writes are held until then, so a restart
+    never sends zeros or stale setpoints. When the restart follows a comms fault, the output
+    is commanded OFF as part of that baseline: the PLC lost sight of the supply, so an
+    operator re-enables it deliberately. A reset never re-energises anything.
+
+    Usage:
+        PSU1 : fb_Dev_PSU_ITECH(cfgDeviceName := 'PSU1', cfgEnable := TRUE, cfgInitEventClass := TRUE);
+        PSU1.cfgModbusConfig := cfg;        // IP, port (0 = 502), unit id, timeout (0 = 1 s)
+        PSU1(ITECH_Type := 'IT6600C', IOIn_OKToUnInhibit := ..., IOOut_Inhibit := ADR(...));
+*)
+FUNCTION_BLOCK fb_Dev_PSU_ITECH EXTENDS abs_fb_Device
+VAR_INPUT
+    ITECH_Type          : STRING;           // 'IT6600C' or 'IT6000'
+    IOIn_OKToUnInhibit  : BOOL;
+    IOOut_Inhibit       : POINTER TO BOOL;
+END_VAR
+
+VAR_OUTPUT
+    stsDCSourceState    : UDINT;
+    stsDCMode           : UDINT;
+    stsDCSource_V_SP    : REAL;
+    stsDCMeterV         : REAL;
+    stsDCMeterI         : REAL;
+    stsDCMeterP         : REAL;
+    stsCommFaulted      : BOOL;             // comms stopped by the latch; cleared by a reset
+END_VAR
+
+VAR PERSISTENT
+    HMI_DeviceSignals   : ST_ITECH_HMI_DeviceSignals;
+END_VAR
+
+VAR
+    // Modbus — all comms go through the driver
+    _modbus_cfg         : ST_Modbus_Device_Config;
+    _mb                 : fb_Modbus_Driver;
+    _arrReadConfig      : ARRAY[1..47] OF ST_MBSignalConfig;
+    _arrReadResults     : ARRAY[1..47] OF ST_MBReadResult;
+    _arrWriteConfig     : ARRAY[1..34] OF ST_MBSignalConfig;
+    _arrWriteData       : ARRAY[1..34] OF ST_MBWriteData;
+    // one-shot protection-reset write (a register that must NOT be written every cycle)
+    _mbReset            : fb_Modbus_Driver;
+    _arrResetConfig     : ARRAY[1..1] OF ST_MBSignalConfig;
+    _arrResetData       : ARRAY[1..1] OF ST_MBWriteData;
+
+    // register map of the selected type
+    _mapValid           : BOOL;
+    _hasExtStatus       : BOOL;             // IT6600C publishes 8 system-status values, IT6000 two
+    _scanTime           : TIME;
+    _regDCMeter         : UINT;
+    _regDCSource        : UINT;
+    _regSystemStatus    : UINT;
+    _regProtection      : UINT;
+    _regSoftwareFaults  : UINT;
+    _regOnOff           : UINT;
+    _regResetFault      : UINT;
+    _activeType         : STRING;
+    _mapChanged         : BOOL;
+
+    // comms state
+    _commRun            : BOOL;
+    _commRunPrev        : BOOL;
+    _commFaulted        : BOOL;
+    _commFaultSeen      : BOOL;             // set by the latch; the next baseline commands OFF
+    _baselineTaken      : BOOL;
+    _readCount          : UINT;
+    _lastReadCycles     : UDINT;
+    _wdTime             : TIME;
+    _tonReadWatchdog    : TON;
+    _resetCalled        : BOOL;
+    _resetTrig          : R_TRIG;
+    _deviceResetPending : BOOL;
+    _resetRun           : BOOL;
+    _resetRunPrev       : BOOL;
+    _baselineCurrentLimit : REAL := 20.5;
+
+    // device images
+    _device             : ST_ITECH_DeviceSignals;   // what the supply reports
+    _command            : ST_ITECH_DeviceSignals;   // what this block writes
+    _swFaultReg         : UDINT;
+    _SoftwareFaults     : ST_ITECH_SoftwareFaults;
+    _DeviceFaults       : ST_ITECH_QuestionRegister;
+END_VAR
+
+VAR CONSTANT
+    // read table layout (index offsets into _arrReadConfig / _arrReadResults)
+    cRD_METER           : UINT := 0;    // 1..6    DC meter
+    cRD_SOURCE          : UINT := 6;    // 7..21   DC source
+    cRD_PROT            : UINT := 21;   // 22..38  protection
+    cRD_SWF             : UINT := 39;   // 39      software faults
+    cRD_SYS             : UINT := 39;   // 40..47  system status (IT6000: 40..41 only)
+    // write table layout
+    cWR_ONOFF           : UINT := 0;    // 1..2    on/off (two 16-bit registers, see writeImage)
+    cWR_SOURCE          : UINT := 2;    // 3..17   DC source
+    cWR_PROT            : UINT := 17;   // 18..34  protection
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+setInterlock();
+
+IF IOOut_Inhibit <> 0 THEN
+    IOOut_Inhibit^ := IOIn_OKToUnInhibit;
+END_IF
+
+selectRegisterMap();
+
+IF _enabled THEN
+    FaultHandler();
+    IF _baselineTaken THEN
+        setCommandValues();
+    END_IF
+END_IF
+
+runComms();
+
+IF _baselineTaken AND NOT _commFaulted THEN
+    setStatusValues();
+END_IF
+
+stsCommFaulted := _commFaulted;
+updateHMI();
+]]></ST>
+    </Implementation>
+    <Folder Name="Privates" Id="{acc69599-b757-42ea-90c9-1b74a8bf0b91}">
+      <Folder Name="ModbusComms" Id="{e0d38373-e7f1-4568-bc7b-82289669c47d}" />
+    </Folder>
+    <Property Name="cfgBaselineCurrentLimit" Id="{09307595-6a9f-43a1-9259-d4744c6b1dc3}">
+      <Declaration><![CDATA[// Current limit applied as +/- to the command image when it is seeded from the supply
+// after a (re)start. Default 20.5 A (the value this block has always applied); 0 = keep the
+// supply's own limits.
+PROPERTY cfgBaselineCurrentLimit : REAL
+]]></Declaration>
+      <Get Name="Get" Id="{06cc48d2-8553-4ff3-84b5-7790b5348793}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgBaselineCurrentLimit := _baselineCurrentLimit;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{445ee801-d59c-4bda-9b20-559de1e90631}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_baselineCurrentLimit := cfgBaselineCurrentLimit;
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgModbusConfig" Id="{de0869a3-7bbd-4343-99d3-ce4e023f4907}">
+      <Declaration><![CDATA[PROPERTY cfgModbusConfig : ST_Modbus_Device_Config
+]]></Declaration>
+      <Get Name="Get" Id="{a43918a8-e2ce-4fd0-8286-bb4f9b5ed227}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgModbusConfig := _modbus_cfg;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{7c582354-2b3d-48be-acf6-1d779ba45a18}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[// Applied the next time comms (re)start (enable, reset after a comms fault, type change).
+_modbus_cfg := cfgModbusConfig;
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="checkDeviceFaults" Id="{174019ee-0980-42d5-a613-54173297db81}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE checkDeviceFaults : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _DeviceFaults.overVoltageProtection THEN
+    setFault(1, 'Internal Fault - Overvoltage protection');
+END_IF
+IF _DeviceFaults.overCurrentProtection THEN
+    setFault(1, 'Internal Fault - Overcurrent protection');
+END_IF
+IF _DeviceFaults.overPowerProtection THEN
+    setFault(1, 'Internal Fault - Overpower protection');
+END_IF
+IF _DeviceFaults.underVoltageProtection THEN
+    setFault(1, 'Internal Fault - Undervoltage protection');
+END_IF
+IF _DeviceFaults.overTempProtection THEN
+    setFault(1, 'Internal Fault - Overtemperature protection');
+END_IF
+IF _DeviceFaults.underCurrentProtection THEN
+    setFault(1, 'Internal Fault - Undercurrent protection');
+END_IF
+IF _DeviceFaults.senseFault THEN
+    setFault(1, 'Internal Fault - Sense fault');
+END_IF
+IF _DeviceFaults.currentSharingFault THEN
+    setFault(1, 'Internal Fault - Current sharing fault');
+END_IF
+IF _DeviceFaults.externalInhibit THEN
+    setFault(1, 'Device inhibited');
+END_IF
+IF _DeviceFaults.faultProtection THEN
+    setFault(1, 'Internal Fault - Device fault protection active');
+END_IF
+IF _DeviceFaults.loopOscFailure THEN
+    setFault(1, 'Internal Fault - Loop oscillation failure');
+END_IF
+IF _DeviceFaults.outputNotRegulated THEN
+    setFault(1, 'Internal Fault - Output not regulated');
+END_IF
+
+IF _SoftwareFaults.outputReverseProtection THEN
+    sendWarning('Output reverse protection', 10);
+END_IF
+IF _SoftwareFaults.multiMasterUnitsAbnormal THEN
+    sendWarning('Multimaster unit abnormal', 11);
+END_IF
+IF _SoftwareFaults.opticalFiberUnlocked_singleMaster THEN
+    sendWarning('Optical fiber NOK', 12);
+END_IF
+IF _SoftwareFaults.moduleCheckingFailure THEN
+    sendWarning('Inconsistent master and slave module parameters', 13);
+END_IF
+IF _SoftwareFaults.unevenCurrentProtection THEN
+    sendWarning('Uneven current protection', 14);
+END_IF
+IF _SoftwareFaults.masterUnitPowerFailureProtection THEN
+    sendWarning('Master unit power failure protection', 15);
+END_IF
+IF _SoftwareFaults.capacitorOverCurrentprotection THEN
+    sendWarning('Capacitor overcurrent protection', 16);
+END_IF
+IF _SoftwareFaults.slaveUnitPowerFailureProtection THEN
+    sendWarning('Slave unit power failure protection', 17);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdDCSourceEnable" Id="{c08e16d7-e92b-4bae-8cd8-8cff5abede06}">
+      <Declaration><![CDATA[METHOD cmdDCSourceEnable : BOOL
+VAR_INPUT
+    onRequest   : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF onRequest THEN
+    _command.System.ON_OFF := 1;
+ELSE
+    _command.System.ON_OFF := 0;
+    HMI_DeviceSignals.deviceSignals_write.System.ON_OFF := 0;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{b4b24131-327f-414f-9b17-ee8f60813b91}">
+      <Declaration><![CDATA[METHOD cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Called every scan while inpReset is held (abs_fb_Device.DeviceLogic); runComms acts on the
+// rising edge only, so holding reset does not turn into a retry loop against the supply.
+IF stsFaulted THEN
+    setFault(0, '');
+END_IF
+_resetCalled := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdSetCurrentLimits" Id="{b5e20e6c-cbb2-4ce2-808d-1ae93688f1e1}">
+      <Declaration><![CDATA[METHOD cmdSetCurrentLimits : BOOL
+VAR_INPUT
+    currentLimitHigh : REAL;
+    currentLimitLow  : REAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_command.DCSource.DCCurrentHigh := currentLimitHigh;
+_command.DCSource.DCCurrentLow  := currentLimitLow;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdSetVoltageSP" Id="{686f71b3-4514-4ba3-bbee-556d3b45e8be}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdSetVoltageSP : BOOL
+VAR_INPUT
+    voltageSP   : REAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_command.DCSource.DCVoltSP := voltageSP;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="configureDriver" Id="{12476507-c392-4fde-8e51-176e7493a741}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE configureDriver : BOOL
+VAR
+    _timeout    : TIME;
+    _port       : UINT;
+    _i          : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Called on the scan comms (re)start, BEFORE the enable edge reaches the driver: the driver
+// only accepts properties while it is not initialised.
+_timeout := _modbus_cfg.cfgTimeout;
+IF _timeout = T#0S THEN
+    _timeout := T#1S;
+END_IF
+_port := _modbus_cfg.cfgTCPPort;
+IF _port = 0 THEN
+    _port := 502;
+END_IF
+
+_mb.ipAddress            := _modbus_cfg.cfgIP_address;
+_mb.port                 := _port;
+_mb.unitId               := _modbus_cfg.cfgUnitID;
+_mb.timeout              := _timeout;
+_mb.pollInterval         := _scanTime;
+_mb.commandDelay         := _scanTime;      // pause between transactions, as these supplies need
+_mb.writeCycleInterval   := _scanTime;
+_mb.wordOrder            := E_WordOrder.BigEndian;
+// This block latches on the FIRST failure itself; keep the driver's own retry logic out of the way.
+_mb.maxConsecFails       := 1000;
+_mb.maxReconnectAttempts := 1000;
+_mb.staleThreshold       := T#10S;
+
+// ── reads ──────────────────────────────────────────────────────────────────────────────────
+// DC meter
+setRead(cRD_METER + 1,  _regDCMeter + 0,  TRUE);    // Vrms
+setRead(cRD_METER + 2,  _regDCMeter + 2,  TRUE);    // Irms
+setRead(cRD_METER + 3,  _regDCMeter + 4,  TRUE);    // Prms (IT6000: kW, IT6600C: W)
+setRead(cRD_METER + 4,  _regDCMeter + 6,  FALSE);   // operation register
+setRead(cRD_METER + 5,  _regDCMeter + 8,  FALSE);   // state register
+setRead(cRD_METER + 6,  _regDCMeter + 10, FALSE);   // questionable register
+// DC source
+setRead(cRD_SOURCE + 1,  _regDCSource + 0,  FALSE); // mode
+setRead(cRD_SOURCE + 2,  _regDCSource + 2,  TRUE);  // voltage SP
+setRead(cRD_SOURCE + 3,  _regDCSource + 4,  TRUE);  // voltage rise
+setRead(cRD_SOURCE + 4,  _regDCSource + 6,  TRUE);  // voltage fall
+setRead(cRD_SOURCE + 5,  _regDCSource + 8,  TRUE);  // current SP
+setRead(cRD_SOURCE + 6,  _regDCSource + 10, TRUE);  // current rise
+setRead(cRD_SOURCE + 7,  _regDCSource + 12, TRUE);  // current fall
+setRead(cRD_SOURCE + 8,  _regDCSource + 14, TRUE);  // voltage high
+setRead(cRD_SOURCE + 9,  _regDCSource + 16, TRUE);  // voltage low
+setRead(cRD_SOURCE + 10, _regDCSource + 18, TRUE);  // current high
+setRead(cRD_SOURCE + 11, _regDCSource + 20, TRUE);  // current low
+setRead(cRD_SOURCE + 12, _regDCSource + 22, FALSE); // CC speed state
+setRead(cRD_SOURCE + 13, _regDCSource + 24, FALSE); // CV speed state
+setRead(cRD_SOURCE + 14, _regDCSource + 26, TRUE);  // power high
+setRead(cRD_SOURCE + 15, _regDCSource + 28, TRUE);  // power low
+// protection: OVP, OCP, OPP (state, level, delay), UCP, UVP (state, level, delay, warm-up)
+FOR _i := 0 TO 2 DO
+    setRead(cRD_PROT + 1 + _i * 3, _regProtection + _i * 6 + 0, FALSE);
+    setRead(cRD_PROT + 2 + _i * 3, _regProtection + _i * 6 + 2, TRUE);
+    setRead(cRD_PROT + 3 + _i * 3, _regProtection + _i * 6 + 4, TRUE);
+END_FOR
+FOR _i := 0 TO 1 DO
+    setRead(cRD_PROT + 10 + _i * 4, _regProtection + 18 + _i * 8 + 0, FALSE);
+    setRead(cRD_PROT + 11 + _i * 4, _regProtection + 18 + _i * 8 + 2, TRUE);
+    setRead(cRD_PROT + 12 + _i * 4, _regProtection + 18 + _i * 8 + 4, TRUE);
+    setRead(cRD_PROT + 13 + _i * 4, _regProtection + 18 + _i * 8 + 6, TRUE);
+END_FOR
+// software faults
+setRead(cRD_SWF, _regSoftwareFaults, FALSE);
+// system status
+setRead(cRD_SYS + 1, _regSystemStatus + 0, FALSE);  // on/off
+setRead(cRD_SYS + 2, _regSystemStatus + 2, TRUE);   // sense voltage
+IF _hasExtStatus THEN
+    setRead(cRD_SYS + 3, _regSystemStatus + 4,  FALSE); // heartbeat
+    setRead(cRD_SYS + 4, _regSystemStatus + 6,  FALSE); // timer on/off
+    setRead(cRD_SYS + 5, _regSystemStatus + 8,  FALSE); // remote sense status
+    setRead(cRD_SYS + 6, _regSystemStatus + 10, TRUE);  // remote sense level
+    setRead(cRD_SYS + 7, _regSystemStatus + 12, FALSE); // output R zero
+    setRead(cRD_SYS + 8, _regSystemStatus + 14, FALSE); // measure cycle
+    _readCount := cRD_SYS + 8;
+ELSE
+    _readCount := cRD_SYS + 2;
+END_IF
+_mb.readSignalCount := _readCount;
+
+// ── writes ─────────────────────────────────────────────────────────────────────────────────
+_arrWriteConfig[cWR_ONOFF + 1].modbusAddr := 400001 + UINT_TO_UDINT(_regOnOff);
+_arrWriteConfig[cWR_ONOFF + 1].dataType   := E_MBDataType.mbUInt16;
+_arrWriteConfig[cWR_ONOFF + 2].modbusAddr := 400001 + UINT_TO_UDINT(_regOnOff) + 1;
+_arrWriteConfig[cWR_ONOFF + 2].dataType   := E_MBDataType.mbUInt16;
+FOR _i := 1 TO 15 DO
+    // same 15 values, same order and types as the DC-source read block
+    setWrite(cWR_SOURCE + _i, _regDCSource + (_i - 1) * 2,
+             _arrReadConfig[cRD_SOURCE + _i].dataType = E_MBDataType.mbReal32);
+END_FOR
+FOR _i := 1 TO 17 DO
+    setWrite(cWR_PROT + _i, _regProtection + (_i - 1) * 2,
+             _arrReadConfig[cRD_PROT + _i].dataType = E_MBDataType.mbReal32);
+END_FOR
+_mb.writeSignalCount := cWR_PROT + 17;
+
+FOR _i := 1 TO cWR_PROT + 17 DO
+    _arrWriteData[_i].writeError   := FALSE;
+    _arrWriteData[_i].writeSuccess := FALSE;
+END_FOR
+
+// watchdog on read-cycle progress: generous against a normal cycle, short against a stuck one
+_wdTime := MAX(T#5S, UDINT_TO_TIME(6 * TIME_TO_UDINT(_scanTime + _timeout)));
+_activeType := ITECH_Type;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="deviceResetWrite" Id="{e2f1f52d-fa60-4c8b-9e2c-a050908fac15}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE deviceResetWrite : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// The supply clears its latched protection on a write to the reset register (value 0, as it
+// always was). It must be written ONCE per reset, never on every write cycle, so it gets its
+// own driver instance that runs only while a reset is pending.
+_resetRun := _deviceResetPending AND _baselineTaken AND NOT _commFaulted;
+
+IF _resetRun AND NOT _resetRunPrev THEN
+    _mbReset.ipAddress            := _mb.ipAddress;
+    _mbReset.port                 := _mb.port;
+    _mbReset.unitId               := _mb.unitId;
+    _mbReset.timeout              := _mb.timeout;
+    _mbReset.pollInterval         := T#1S;
+    _mbReset.commandDelay         := _scanTime;
+    _mbReset.writeCycleInterval   := T#10MS;
+    _mbReset.wordOrder            := E_WordOrder.BigEndian;
+    _mbReset.maxConsecFails       := 1000;
+    _mbReset.maxReconnectAttempts := 1000;
+    _mbReset.readSignalCount      := 0;
+    _mbReset.writeSignalCount     := 1;
+    _arrResetConfig[1].modbusAddr := 400001 + UINT_TO_UDINT(_regResetFault);
+    _arrResetConfig[1].dataType   := E_MBDataType.mbUInt32;
+    _arrResetData[1].valueUdint   := 0;
+    _arrResetData[1].writeError   := FALSE;
+    _arrResetData[1].writeSuccess := FALSE;
+END_IF
+_resetRunPrev := _resetRun;
+
+_mbReset(
+    inpEnable           := _resetRun,
+    inpPtrReadConfig    := 0,
+    inpPtrReadResults   := 0,
+    inpPtrWriteConfig   := ADR(_arrResetConfig),
+    inpPtrWriteData     := ADR(_arrResetData));
+_mbReset.cycle();
+
+IF _resetRun THEN
+    IF _arrResetData[1].writeError THEN
+        latchCommFault('Modbus write failed (protection reset) - comms stopped until reset');
+    ELSIF _arrResetData[1].writeSuccess THEN
+        _deviceResetPending := FALSE;   // next scan disables the one-shot driver
+    END_IF
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FaultHandler" Id="{2eed08e3-dac8-4f65-b29c-3dfcf82d1877}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE FaultHandler : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Turn off if already on and the interlock drops
+IF NOT(Interlock.outInterlockOK) AND stsDCSourceState = 1 THEN
+    cmdDCSourceEnable(0);
+    setFault(1, Interlock.stsFirstOut);
+END_IF
+
+// Short-circuit detection
+IF stsDCSourceState = 1 AND stsDCMode = 1 THEN
+    IF (stsDCMeterV - stsDCSource_V_SP) < 20 AND stsDCMeterI > 5 THEN
+        setFault(1, 'Shortcircuit current detected');
+    END_IF
+END_IF
+
+IF stsFaulted OR NOT(Interlock.outInterlockOK) THEN
+    cmdDCSourceEnable(0);
+    HMI_DeviceSignals.deviceSignals_write.System.ON_OFF := 0;
+END_IF
+
+IF NOT _mapValid THEN
+    setFault(1, CONCAT('Unknown ITECH_Type: ', ITECH_Type));
+END_IF
+
+IF _baselineTaken AND NOT _commFaulted THEN
+    parseFaults();
+    checkDeviceFaults();
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{521777ca-5566-4dad-a5e3-77969579ead1}" FolderPath="Privates\">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init : BOOL
+VAR_INPUT
+    bInitRetains        : BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode         : BOOL; // TRUE: the instance will be copied to the copy code afterward (online change)
+    cfgDeviceName       : STRING;
+    cfgEnable           : BOOL;
+    cfgInitEventClass   : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName     := cfgDeviceName;
+THIS^.cfgEnable         := cfgEnable;
+THIS^.cfgInitEventClass := cfgInitEventClass;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="initParameters" Id="{f0d6bcbd-c4c1-4042-b509-cc10bb2913e7}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE initParameters : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// The operator's editable values start from what the supply is actually set to.
+HMI_DeviceSignals.deviceSignals_write := _device;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="latchCommFault" Id="{e42ec808-e44a-4a1e-b190-1ee4c773fe1e}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE latchCommFault : BOOL
+VAR_INPUT
+    inpMessage  : STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Stop ALL traffic to the supply in THIS scan, before the driver can send anything else,
+// and stay stopped until a reset.
+_commFaulted := TRUE;
+_commFaultSeen := TRUE;
+setFault(1, inpMessage);
+
+_mb(inpEnable := FALSE);
+_mb.cycle();
+_mbReset(inpEnable := FALSE);
+_mbReset.cycle();
+
+_commRunPrev        := FALSE;
+_resetRunPrev       := FALSE;
+_baselineTaken      := FALSE;
+_deviceResetPending := FALSE;
+_tonReadWatchdog(IN := FALSE);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="parseFaults" Id="{4ed95df0-77e4-446a-aed3-4753b1d10b80}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE parseFaults : BOOL
+VAR
+    _q  : UDINT;
+    _s  : UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_q := _device.DCMeter.DCQuesReg;
+_s := _swFaultReg;
+
+IF ITECH_Type = 'IT6600C' THEN
+    _DeviceFaults.overVoltageProtection  := _q.0;
+    _DeviceFaults.overCurrentProtection  := _q.1;
+    _DeviceFaults.overPowerProtection    := _q.2;
+    _DeviceFaults.underVoltageProtection := _q.3;
+    _DeviceFaults.overTempProtection     := _q.4;
+    _DeviceFaults.underCurrentProtection := _q.5;
+    _DeviceFaults.senseFault             := _q.6;
+    _DeviceFaults.currentSharingFault    := _q.7;
+    _DeviceFaults.externalInhibit        := _q.9;
+    _DeviceFaults.faultProtection        := _q.10;
+    _DeviceFaults.loopOscFailure         := _q.11;
+    _DeviceFaults.outputNotRegulated     := _q.12;
+
+    _SoftwareFaults.overVoltageProtection         := _s.0;
+    _SoftwareFaults.positiveOverCurrentProtection := _s.1;
+    _SoftwareFaults.negativeOverCurrentProtection := _s.2;
+    _SoftwareFaults.positiveOverPowerProtection   := _s.3;
+    _SoftwareFaults.negativeOverPowerProtection   := _s.4;
+    _SoftwareFaults.underCurrentProtection        := _s.5;
+    _SoftwareFaults.underVoltageProtection        := _s.6;
+    _SoftwareFaults.overTemperatureProtection     := _s.7;
+END_IF
+
+IF ITECH_Type = 'IT6000' THEN
+    _DeviceFaults.overVoltageProtection  := _q.0;
+    _DeviceFaults.overCurrentProtection  := _q.1 OR _q.2;
+    _DeviceFaults.overPowerProtection    := _q.3 OR _q.4;
+    _DeviceFaults.underVoltageProtection := _q.5;
+    _DeviceFaults.overTempProtection     := _q.6;
+    _DeviceFaults.underCurrentProtection := _q.7;
+    _DeviceFaults.senseFault             := _q.8;
+    _DeviceFaults.currentSharingFault    := _q.9;
+    // bit 10: output reversed (reported through the software-fault register instead)
+    _DeviceFaults.externalInhibit        := _q.11;
+    _DeviceFaults.faultProtection        := _q.12;
+    _DeviceFaults.loopOscFailure         := _q.13;
+END_IF
+
+_SoftwareFaults.senseAbnormal                     := _s.8;
+_SoftwareFaults.senseReverseProtection            := _s.9;
+_SoftwareFaults.outputReverseProtection           := _s.10;
+_SoftwareFaults.multiMasterUnitsAbnormal          := _s.11;
+_SoftwareFaults.opticalFiberUnlocked_multiMaster  := _s.12;
+_SoftwareFaults.opticalFiberUnlocked_singleMaster := _s.13;
+_SoftwareFaults.moduleCheckingFailure             := _s.14;
+_SoftwareFaults.unevenCurrentProtection           := _s.15;
+_SoftwareFaults.hardwareProtection                := _s.16;
+_SoftwareFaults.masterUnitPowerFailureProtection  := _s.17;
+_SoftwareFaults.inhibit_latchmode                 := _s.18;
+_SoftwareFaults.inhibit_livingMode                := _s.19;
+_SoftwareFaults.capacitorOverCurrentprotection    := _s.20;
+_SoftwareFaults.slaveUnitPowerFailureProtection   := _s.21;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="rdReal" Id="{ca7b7ec7-6a1d-48f3-acf5-0b4d1b00cfe5}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE rdReal : REAL
+VAR_INPUT
+    inpIdx      : UINT;
+    inpKeep     : REAL;     // returned unchanged unless this signal's last read was good
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpIdx <= _readCount AND _arrReadResults[inpIdx].quality = E_SignalQuality.Good THEN
+    rdReal := _arrReadResults[inpIdx].valueReal;
+ELSE
+    rdReal := inpKeep;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="rdUdint" Id="{85e74f17-0483-42b3-bc2e-0a12f9f9a31f}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE rdUdint : UDINT
+VAR_INPUT
+    inpIdx      : UINT;
+    inpKeep     : UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpIdx <= _readCount AND _arrReadResults[inpIdx].quality = E_SignalQuality.Good THEN
+    rdUdint := _arrReadResults[inpIdx].valueUdint;
+ELSE
+    rdUdint := inpKeep;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="readImage" Id="{e1241ffa-3878-4fcf-8a97-9d5383f0d1ee}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE readImage : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_device.DCMeter.DCVrms     := rdReal(cRD_METER + 1, _device.DCMeter.DCVrms);
+_device.DCMeter.DCIrms     := rdReal(cRD_METER + 2, _device.DCMeter.DCIrms);
+_device.DCMeter.DCPrms     := rdReal(cRD_METER + 3, _device.DCMeter.DCPrms);
+_device.DCMeter.DCOperReg  := rdUdint(cRD_METER + 4, _device.DCMeter.DCOperReg);
+_device.DCMeter.DCStateReg := rdUdint(cRD_METER + 5, _device.DCMeter.DCStateReg);
+_device.DCMeter.DCQuesReg  := rdUdint(cRD_METER + 6, _device.DCMeter.DCQuesReg);
+
+_device.DCSource.DCMode          := rdUdint(cRD_SOURCE + 1,  _device.DCSource.DCMode);
+_device.DCSource.DCVoltSP        := rdReal(cRD_SOURCE + 2,   _device.DCSource.DCVoltSP);
+_device.DCSource.DCVoltRise      := rdReal(cRD_SOURCE + 3,   _device.DCSource.DCVoltRise);
+_device.DCSource.DCVoltFall      := rdReal(cRD_SOURCE + 4,   _device.DCSource.DCVoltFall);
+_device.DCSource.DCCurrentSP     := rdReal(cRD_SOURCE + 5,   _device.DCSource.DCCurrentSP);
+_device.DCSource.DCCurrentRise   := rdReal(cRD_SOURCE + 6,   _device.DCSource.DCCurrentRise);
+_device.DCSource.DCCurrentFall   := rdReal(cRD_SOURCE + 7,   _device.DCSource.DCCurrentFall);
+_device.DCSource.DCVoltHigh      := rdReal(cRD_SOURCE + 8,   _device.DCSource.DCVoltHigh);
+_device.DCSource.DCVoltLow       := rdReal(cRD_SOURCE + 9,   _device.DCSource.DCVoltLow);
+_device.DCSource.DCCurrentHigh   := rdReal(cRD_SOURCE + 10,  _device.DCSource.DCCurrentHigh);
+_device.DCSource.DCCurrentLow    := rdReal(cRD_SOURCE + 11,  _device.DCSource.DCCurrentLow);
+_device.DCSource.DCCC_SpeedState := rdUdint(cRD_SOURCE + 12, _device.DCSource.DCCC_SpeedState);
+_device.DCSource.DCCV_SpeedState := rdUdint(cRD_SOURCE + 13, _device.DCSource.DCCV_SpeedState);
+_device.DCSource.DCPowerHigh     := rdReal(cRD_SOURCE + 14,  _device.DCSource.DCPowerHigh);
+_device.DCSource.DCPowerLow      := rdReal(cRD_SOURCE + 15,  _device.DCSource.DCPowerLow);
+
+_device.Protection.OVPState  := rdUdint(cRD_PROT + 1,  _device.Protection.OVPState);
+_device.Protection.OVPLevel  := rdReal(cRD_PROT + 2,   _device.Protection.OVPLevel);
+_device.Protection.OVPDelay  := rdReal(cRD_PROT + 3,   _device.Protection.OVPDelay);
+_device.Protection.OCPState  := rdUdint(cRD_PROT + 4,  _device.Protection.OCPState);
+_device.Protection.OCPLevel  := rdReal(cRD_PROT + 5,   _device.Protection.OCPLevel);
+_device.Protection.OCPDelay  := rdReal(cRD_PROT + 6,   _device.Protection.OCPDelay);
+_device.Protection.OPPState  := rdUdint(cRD_PROT + 7,  _device.Protection.OPPState);
+_device.Protection.OPPLevel  := rdReal(cRD_PROT + 8,   _device.Protection.OPPLevel);
+_device.Protection.OPPDelay  := rdReal(cRD_PROT + 9,   _device.Protection.OPPDelay);
+_device.Protection.UCPState  := rdUdint(cRD_PROT + 10, _device.Protection.UCPState);
+_device.Protection.UCPLevel  := rdReal(cRD_PROT + 11,  _device.Protection.UCPLevel);
+_device.Protection.UCPDelay  := rdReal(cRD_PROT + 12,  _device.Protection.UCPDelay);
+_device.Protection.UCPWarmup := rdReal(cRD_PROT + 13,  _device.Protection.UCPWarmup);
+_device.Protection.UVPState  := rdUdint(cRD_PROT + 14, _device.Protection.UVPState);
+_device.Protection.UVPLevel  := rdReal(cRD_PROT + 15,  _device.Protection.UVPLevel);
+_device.Protection.UVPDelay  := rdReal(cRD_PROT + 16,  _device.Protection.UVPDelay);
+_device.Protection.UVPWarmup := rdReal(cRD_PROT + 17,  _device.Protection.UVPWarmup);
+
+_swFaultReg := rdUdint(cRD_SWF, _swFaultReg);
+
+_device.System.ON_OFF            := rdUdint(cRD_SYS + 1, _device.System.ON_OFF);
+_device.System.SenseVolt         := rdReal(cRD_SYS + 2,  _device.System.SenseVolt);
+_device.System.Heartbeat         := rdUdint(cRD_SYS + 3, _device.System.Heartbeat);
+_device.System.Timer_ON_OFF      := rdUdint(cRD_SYS + 4, _device.System.Timer_ON_OFF);
+_device.System.RemoteSenseStatus := rdUdint(cRD_SYS + 5, _device.System.RemoteSenseStatus);
+_device.System.RemoteSenseLevel  := rdReal(cRD_SYS + 6,  _device.System.RemoteSenseLevel);
+_device.System.OutputRZero       := rdUdint(cRD_SYS + 7, _device.System.OutputRZero);
+_device.System.MeasureCycle      := rdUdint(cRD_SYS + 8, _device.System.MeasureCycle);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="runComms" Id="{6c862d22-4aff-42f0-afc4-02615013584a}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE runComms : BOOL
+VAR
+    _i      : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// A reset (rising edge) re-arms comms and queues the supply's own protection reset.
+_resetTrig(CLK := _resetCalled);
+_resetCalled := FALSE;
+IF _resetTrig.Q THEN
+    _commFaulted := FALSE;
+    _deviceResetPending := TRUE;
+END_IF
+
+// A type change while running takes comms down for one scan so the driver re-reads its tables.
+_mapChanged := _commRunPrev AND (ITECH_Type <> _activeType);
+_commRun := _enabled AND _mapValid AND NOT _commFaulted AND NOT _mapChanged;
+
+IF _commRun AND NOT _commRunPrev THEN
+    configureDriver();
+    _baselineTaken  := FALSE;
+    _lastReadCycles := 0;
+    _tonReadWatchdog(IN := FALSE);
+END_IF
+_commRunPrev := _commRun;
+
+IF _baselineTaken THEN
+    writeImage();
+END_IF
+
+_mb(
+    inpEnable           := _commRun,
+    inpHoldWrites       := NOT _baselineTaken,
+    inpPtrReadConfig    := ADR(_arrReadConfig),
+    inpPtrWriteConfig   := ADR(_arrWriteConfig),
+    inpPtrReadResults   := ADR(_arrReadResults),
+    inpPtrWriteData     := ADR(_arrWriteData));
+_mb.cycle();
+
+IF NOT _commRun THEN
+    _tonReadWatchdog(IN := FALSE);
+    deviceResetWrite();         // keeps the one-shot driver disabled
+    RETURN;
+END_IF
+
+// ── the latch: the FIRST failed transaction stops everything ────────────────────────────────
+IF _mb.stsError THEN
+    latchCommFault('Modbus driver configuration error - comms stopped until reset');
+    RETURN;
+END_IF
+FOR _i := 1 TO _readCount DO
+    IF _arrReadResults[_i].quality = E_SignalQuality.BadComm THEN
+        latchCommFault('Modbus read failed - comms stopped until reset');
+        RETURN;
+    END_IF
+END_FOR
+FOR _i := 1 TO cWR_PROT + 17 DO
+    IF _arrWriteData[_i].writeError THEN
+        latchCommFault('Modbus write failed - comms stopped until reset');
+        RETURN;
+    END_IF
+END_FOR
+
+// A driver that stops completing read cycles without reporting an error is a fault too.
+IF _mb.stsStatus.totalReadCycles <> _lastReadCycles THEN
+    _lastReadCycles := _mb.stsStatus.totalReadCycles;
+    _tonReadWatchdog(IN := FALSE);
+END_IF
+_tonReadWatchdog(IN := TRUE, PT := _wdTime);
+IF _tonReadWatchdog.Q THEN
+    latchCommFault('Modbus read watchdog: no read cycle completed - comms stopped until reset');
+    RETURN;
+END_IF
+
+readImage();
+
+// First complete, clean read cycle since (re)start: seed the command image from the supply,
+// then release writes.
+IF NOT _baselineTaken AND _mb.stsStatus.totalReadCycles > 0 THEN
+    _command := _device;
+    IF _baselineCurrentLimit > 0 THEN
+        cmdSetCurrentLimits(currentLimitHigh := _baselineCurrentLimit,
+                            currentLimitLow  := -_baselineCurrentLimit);
+    END_IF
+    initParameters();
+    IF _commFaultSeen THEN
+        cmdDCSourceEnable(FALSE);       // also zeroes the operator's ON/OFF request
+        _commFaultSeen := FALSE;
+    END_IF
+    _baselineTaken := TRUE;
+END_IF
+
+deviceResetWrite();
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="selectRegisterMap" Id="{18c01964-4996-4195-bec7-6efe9925ad7c}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE selectRegisterMap : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_mapValid := TRUE;
+
+IF ITECH_Type = 'IT6600C' THEN
+    _regDCMeter         := 1401;
+    _regDCSource        := 1201;
+    _regSystemStatus    := 1001;
+    _regProtection      := 1701;
+    _regSoftwareFaults  := 1803;
+    _regOnOff           := 1001;
+    _regResetFault      := 1801;
+    _scanTime           := T#100MS;
+    _hasExtStatus       := TRUE;
+ELSIF ITECH_Type = 'IT6000' THEN
+    _regDCMeter         := 1107;
+    _regDCSource        := 1019;
+    _regSystemStatus    := 1001;
+    _regProtection      := 1169;
+    _regSoftwareFaults  := 1225;
+    _regOnOff           := 1001;
+    _regResetFault      := 1223;
+    _scanTime           := T#250MS;
+    _hasExtStatus       := FALSE;
+ELSE
+    _mapValid := FALSE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setCommandValues" Id="{501d959d-536c-4908-90f3-64a5963662b6}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD setCommandValues : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF NOT inpAuto THEN
+    IF NOT stsFaulted THEN
+        _command.System.ON_OFF     := HMI_DeviceSignals.deviceSignals_write.System.ON_OFF;
+        _command.DCSource.DCMode   := HMI_DeviceSignals.deviceSignals_write.DCSource.DCMode;
+    END_IF
+    _command.DCSource.DCPowerHigh   := HMI_DeviceSignals.deviceSignals_write.DCSource.DCPowerHigh;
+    _command.DCSource.DCPowerLow    := HMI_DeviceSignals.deviceSignals_write.DCSource.DCPowerLow;
+    _command.DCSource.DCCurrentSP   := HMI_DeviceSignals.deviceSignals_write.DCSource.DCCurrentSP;
+    _command.DCSource.DCCurrentRise := HMI_DeviceSignals.deviceSignals_write.DCSource.DCCurrentRise;
+    _command.DCSource.DCCurrentFall := HMI_DeviceSignals.deviceSignals_write.DCSource.DCCurrentFall;
+    _command.DCSource.DCCurrentHigh := HMI_DeviceSignals.deviceSignals_write.DCSource.DCCurrentHigh;
+    _command.DCSource.DCCurrentLow  := HMI_DeviceSignals.deviceSignals_write.DCSource.DCCurrentLow;
+    _command.DCSource.DCVoltSP      := HMI_DeviceSignals.deviceSignals_write.DCSource.DCVoltSP;
+    _command.DCSource.DCVoltRise    := HMI_DeviceSignals.deviceSignals_write.DCSource.DCVoltRise;
+    _command.DCSource.DCVoltFall    := HMI_DeviceSignals.deviceSignals_write.DCSource.DCVoltFall;
+    _command.DCSource.DCVoltHigh    := HMI_DeviceSignals.deviceSignals_write.DCSource.DCVoltHigh;
+    _command.DCSource.DCVoltLow     := HMI_DeviceSignals.deviceSignals_write.DCSource.DCVoltLow;
+
+    _command.Protection.OCPState    := HMI_DeviceSignals.deviceSignals_write.Protection.OCPState;
+    _command.Protection.OCPLevel    := HMI_DeviceSignals.deviceSignals_write.Protection.OCPLevel;
+    _command.Protection.OCPDelay    := HMI_DeviceSignals.deviceSignals_write.Protection.OCPDelay;
+    _command.Protection.OVPState    := HMI_DeviceSignals.deviceSignals_write.Protection.OVPState;
+    _command.Protection.OVPLevel    := HMI_DeviceSignals.deviceSignals_write.Protection.OVPLevel;
+    _command.Protection.OVPDelay    := HMI_DeviceSignals.deviceSignals_write.Protection.OVPDelay;
+    _command.Protection.UCPState    := HMI_DeviceSignals.deviceSignals_write.Protection.UCPState;
+    _command.Protection.UCPLevel    := HMI_DeviceSignals.deviceSignals_write.Protection.UCPLevel;
+    _command.Protection.UCPDelay    := HMI_DeviceSignals.deviceSignals_write.Protection.UCPDelay;
+    _command.Protection.UVPState    := HMI_DeviceSignals.deviceSignals_write.Protection.UVPState;
+    _command.Protection.UVPLevel    := HMI_DeviceSignals.deviceSignals_write.Protection.UVPLevel;
+    _command.Protection.UVPDelay    := HMI_DeviceSignals.deviceSignals_write.Protection.UVPDelay;
+    _command.Protection.OPPState    := HMI_DeviceSignals.deviceSignals_write.Protection.OPPState;
+    _command.Protection.OPPLevel    := HMI_DeviceSignals.deviceSignals_write.Protection.OPPLevel;
+    _command.Protection.OPPDelay    := HMI_DeviceSignals.deviceSignals_write.Protection.OPPDelay;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setConfigs" Id="{b03b40f7-f62a-46ed-b662-8ed3ac0016bc}">
+      <Declaration><![CDATA[METHOD setConfigs : BOOL
+VAR_INPUT
+    configs : ST_ITECH_SetConfigs;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_command.DCSource.DCMode         := configs.dcSource.DCMode;
+_command.DCSource.DCPowerHigh    := configs.dcSource.DCPowerHigh;
+_command.DCSource.DCPowerLow     := configs.dcSource.DCPowerLow;
+_command.DCSource.DCCurrentSP    := configs.dcSource.DCCurrentSP;
+_command.DCSource.DCCurrentRise  := configs.dcSource.DCCurrentRise;
+_command.DCSource.DCCurrentFall  := configs.dcSource.DCCurrentFall;
+_command.DCSource.DCCurrentHigh  := configs.dcSource.DCCurrentHigh;
+_command.DCSource.DCCurrentLow   := configs.dcSource.DCCurrentLow;
+_command.DCSource.DCVoltSP       := configs.dcSource.DCVoltSP;
+_command.DCSource.DCVoltRise     := configs.dcSource.DCVoltRise;
+_command.DCSource.DCVoltFall     := configs.dcSource.DCVoltFall;
+_command.DCSource.DCVoltHigh     := configs.dcSource.DCVoltHigh;
+_command.DCSource.DCVoltLow      := configs.dcSource.DCVoltLow;
+
+_command.Protection.OCPLevel     := configs.protection.OCPLevel;
+_command.Protection.OCPDelay     := configs.protection.OCPDelay;
+_command.Protection.UCPLevel     := configs.protection.UCPLevel;
+_command.Protection.UCPDelay     := configs.protection.UCPDelay;
+_command.Protection.OVPLevel     := configs.protection.OVPLevel;
+_command.Protection.OVPDelay     := configs.protection.OVPDelay;
+_command.Protection.UVPLevel     := configs.protection.UVPLevel;
+_command.Protection.UVPDelay     := configs.protection.UVPDelay;
+_command.Protection.OPPLevel     := configs.protection.OPPLevel;
+_command.Protection.OPPDelay     := configs.protection.OPPDelay;
+
+_command.Protection.UCPState     := configs.protection.UCPState;
+_command.Protection.UVPState     := configs.protection.UVPState;
+_command.Protection.OCPState     := configs.protection.OCPState;
+_command.Protection.OVPState     := configs.protection.OVPState;
+_command.Protection.OPPState     := configs.protection.OPPState;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setInterlock" Id="{0f017085-a500-4ad6-953c-be24ca5e5073}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD setInterlock : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[Interlock.name := _DeviceName;
+Interlock(inpConfig := _dataInterlock);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setRead" Id="{4f88b54e-8142-4967-a0a0-0fa2613599dd}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE setRead : BOOL
+VAR_INPUT
+    inpIdx      : UINT;
+    inpReg      : UINT;     // protocol (0-based) holding-register address
+    inpIsReal   : BOOL;     // TRUE = 32-bit float, FALSE = 32-bit unsigned
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_arrReadConfig[inpIdx].modbusAddr := 400001 + UINT_TO_UDINT(inpReg);
+IF inpIsReal THEN
+    _arrReadConfig[inpIdx].dataType := E_MBDataType.mbReal32;
+ELSE
+    _arrReadConfig[inpIdx].dataType := E_MBDataType.mbUInt32;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStatusValues" Id="{7ef8b92e-4bb7-4488-9595-bbbd461ed349}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD setStatusValues : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stsDCSourceState := _device.System.ON_OFF;
+stsDCMode        := _device.DCSource.DCMode;
+stsDCSource_V_SP := _device.DCSource.DCVoltSP;
+stsDCMeterV      := _device.DCMeter.DCVrms;
+stsDCMeterI      := _device.DCMeter.DCIrms;
+stsDCMeterP      := _device.DCMeter.DCPrms;
+sendLog(CONCAT('DC Source state changed to ', TO_STRING(stsDCSourceState)), 1);
+sendLog(CONCAT('DC Source Voltage setpoint set to ', TO_STRING(stsDCSource_V_SP)), 2);
+sendLog(CONCAT('DC Source mode set to ', TO_STRING(stsDCMode)), 3);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setWrite" Id="{f4322405-b781-41b1-932d-bc9079a1f55d}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE setWrite : BOOL
+VAR_INPUT
+    inpIdx      : UINT;
+    inpReg      : UINT;
+    inpIsReal   : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_arrWriteConfig[inpIdx].modbusAddr := 400001 + UINT_TO_UDINT(inpReg);
+IF inpIsReal THEN
+    _arrWriteConfig[inpIdx].dataType := E_MBDataType.mbReal32;
+ELSE
+    _arrWriteConfig[inpIdx].dataType := E_MBDataType.mbUInt32;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="updateHMI" Id="{edd6ae4a-3ac3-4552-90be-28c0c78505b7}">
+      <Declaration><![CDATA[METHOD PRIVATE updateHMI : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[HMI_DeviceSignals.deviceSignals_read := _device;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="writeImage" Id="{92e2b849-97ee-4aeb-a27b-d0e3f26c95e9}" FolderPath="Privates\ModbusComms\">
+      <Declaration><![CDATA[METHOD PRIVATE writeImage : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// ON/OFF goes out as two 16-bit registers, LOW word first — exactly the bytes the previous
+// implementation sent (it wrote the raw UDINT, not the word-swapped image every other value
+// uses). Kept byte-for-byte because the supplies run on it; it is the one asymmetry with the
+// read side (which takes the register pair high word first), so verify against the supply's
+// manual before "fixing" it.
+_arrWriteData[cWR_ONOFF + 1].valueUint := UDINT_TO_UINT(_command.System.ON_OFF AND 16#FFFF);
+_arrWriteData[cWR_ONOFF + 2].valueUint := UDINT_TO_UINT(SHR(_command.System.ON_OFF, 16));
+
+// IT6000 power values are in kW, IT6600C power values in W
+_arrWriteData[cWR_SOURCE + 1].valueUdint := _command.DCSource.DCMode;
+_arrWriteData[cWR_SOURCE + 2].valueReal  := _command.DCSource.DCVoltSP;
+_arrWriteData[cWR_SOURCE + 3].valueReal  := _command.DCSource.DCVoltRise;
+_arrWriteData[cWR_SOURCE + 4].valueReal  := _command.DCSource.DCVoltFall;
+_arrWriteData[cWR_SOURCE + 5].valueReal  := _command.DCSource.DCCurrentSP;
+_arrWriteData[cWR_SOURCE + 6].valueReal  := _command.DCSource.DCCurrentRise;
+_arrWriteData[cWR_SOURCE + 7].valueReal  := _command.DCSource.DCCurrentFall;
+_arrWriteData[cWR_SOURCE + 8].valueReal  := _command.DCSource.DCVoltHigh;
+_arrWriteData[cWR_SOURCE + 9].valueReal  := _command.DCSource.DCVoltLow;
+_arrWriteData[cWR_SOURCE + 10].valueReal := _command.DCSource.DCCurrentHigh;
+_arrWriteData[cWR_SOURCE + 11].valueReal := _command.DCSource.DCCurrentLow;
+_arrWriteData[cWR_SOURCE + 12].valueUdint := _command.DCSource.DCCC_SpeedState;
+_arrWriteData[cWR_SOURCE + 13].valueUdint := _command.DCSource.DCCV_SpeedState;
+_arrWriteData[cWR_SOURCE + 14].valueReal := _command.DCSource.DCPowerHigh;
+_arrWriteData[cWR_SOURCE + 15].valueReal := _command.DCSource.DCPowerLow;
+
+_arrWriteData[cWR_PROT + 1].valueUdint  := _command.Protection.OVPState;
+_arrWriteData[cWR_PROT + 2].valueReal   := _command.Protection.OVPLevel;
+_arrWriteData[cWR_PROT + 3].valueReal   := _command.Protection.OVPDelay;
+_arrWriteData[cWR_PROT + 4].valueUdint  := _command.Protection.OCPState;
+_arrWriteData[cWR_PROT + 5].valueReal   := _command.Protection.OCPLevel;
+_arrWriteData[cWR_PROT + 6].valueReal   := _command.Protection.OCPDelay;
+_arrWriteData[cWR_PROT + 7].valueUdint  := _command.Protection.OPPState;
+_arrWriteData[cWR_PROT + 8].valueReal   := _command.Protection.OPPLevel;
+_arrWriteData[cWR_PROT + 9].valueReal   := _command.Protection.OPPDelay;
+_arrWriteData[cWR_PROT + 10].valueUdint := _command.Protection.UCPState;
+_arrWriteData[cWR_PROT + 11].valueReal  := _command.Protection.UCPLevel;
+_arrWriteData[cWR_PROT + 12].valueReal  := _command.Protection.UCPDelay;
+_arrWriteData[cWR_PROT + 13].valueReal  := _command.Protection.UCPWarmup;
+_arrWriteData[cWR_PROT + 14].valueUdint := _command.Protection.UVPState;
+_arrWriteData[cWR_PROT + 15].valueReal  := _command.Protection.UVPLevel;
+_arrWriteData[cWR_PROT + 16].valueReal  := _command.Protection.UVPDelay;
+_arrWriteData[cWR_PROT + 17].valueReal  := _command.Protection.UVPWarmup;
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

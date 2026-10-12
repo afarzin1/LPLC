@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_VFD_DuraPulse_Telemetry" Id="{a2b00002-0000-4000-8000-000000000001}">
+    <Declaration><![CDATA[TYPE ST_VFD_DuraPulse_Telemetry :
+STRUCT
+	outputFreq		: LREAL;	// Hz, signed (sign reflects direction bits 3-4 of SW)
+	motorRPM		: LREAL;	// rpm, signed
+	motorCurrent	: LREAL;	// A (raw reg 0x2104 / 100)
+	dcBusVoltage	: LREAL;	// VDC (raw reg 0x2105 / 10)
+	outputVoltage	: LREAL;	// VAC (raw reg 0x2106 / 10)
+	motorTorque		: LREAL;	// % (raw reg 0x210B / 10)
+	inverterTemp	: LREAL;	// degC (raw reg 0x220E / 10)
+	faultCode		: USINT;	// 0x2100 low byte
+	warningCode		: USINT;	// 0x2100 high byte
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

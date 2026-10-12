@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="ST_MBReadResult" Id="{e08f7c07-a259-4e67-bef4-3e0f545ff8e7}">
+    <Declaration><![CDATA[TYPE ST_MBReadResult :
+STRUCT
+    valueReal           : REAL;
+    valueDint           : DINT;
+    valueUdint          : UDINT;
+    valueInt            : INT;
+    valueUint           : UINT;
+    valueWord           : WORD;
+    valueBool           : BOOL;
+
+    quality             : E_SignalQuality := E_SignalQuality.UncertainInit;
+    updateCount         : UDINT;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

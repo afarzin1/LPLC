@@ -1,0 +1,242 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_StackLight3SegHV_BannerTL50Pro" Id="{81d739c1-3e8c-44e3-a21e-d69051dd6f3c}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_StackLight3SegHV_BannerTL50Pro
+VAR_INPUT
+	IOOut_BannerTL503Pro: POINTER TO ST_Banner_TL503Pro_Raw;
+	inpFaulted			: BOOL;
+	inpSafetyFaultActive: BOOL;
+	inpHVOn				: BOOL;
+	inpMotionPresent	: BOOL;
+	inpAuto				: BOOL;
+	inpRunningInAuto	: BOOL;
+	inpDoneInAuto		: BOOL;
+	
+END_VAR
+
+VAR
+	_stackLightState	: INT;
+	_stackLight			: ST_Banner_TL503Pro;
+	
+END_VAR
+
+
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//Constant values
+_stackLight.Segment1Color1.Num := TO_USINT(EN_Banner_TL503Pro_Colors.Orange);
+_stackLight.Segment2Color2.Num := TO_USINT(EN_Banner_TL503Pro_Colors.Orange);
+_stackLight.Segment3Color1.Num := TO_USINT(EN_Banner_TL503Pro_Colors.Red);
+
+//Temp logic for segment2 until state machine exists
+IF NOT(inpAuto) THEN
+	IF inpMotionPresent  THEN
+		_stackLightState := 1;
+	ELSE
+		_stackLightState := 0;
+	END_IF
+ELSE
+	IF inpRunningInAuto THEN
+		IF inpMotionPresent THEN
+			_stackLightState := 12;
+		ELSE
+			_stackLightState := 11;
+		END_IF
+	ELSE
+		IF inpDoneInAuto THEN
+			_stackLightState := 20;
+		ELSE
+			_stackLightState := 10;
+		END_IF
+	END_IF
+END_IF
+
+IF inpHVOn THEN
+	_stackLight.Segment1AnimationType.Num 		:= TO_USINT(EN_Banner_TL503Pro_Animation.Steady);
+ELSE
+	_stackLight.Segment1AnimationType.Num 		:= TO_USINT(EN_Banner_TL503Pro_Animation.Off);
+END_IF
+
+IF inpFaulted THEN
+	_stackLight.Segment3AnimationType.Num 		:= TO_USINT(EN_Banner_TL503Pro_Animation.Steady);
+END_IF
+
+IF inpSafetyFaultActive THEN
+	_stackLight.Segment3AnimationType.Num 		:= TO_USINT(EN_Banner_TL503Pro_Animation.IntensitySweep);
+END_IF
+
+IF (NOT inpFaulted) AND (NOT inpSafetyFaultActive) THEN
+	_stackLight.Segment3AnimationType.Num 		:= TO_USINT(EN_Banner_TL503Pro_Animation.off);
+END_IF
+
+CASE _stackLightState OF
+    0:
+    // Manual, Not running    
+        _stackLight.Segment2Color1.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.White);
+        _stackLight.Segment2AnimationType.Num 	:= TO_USINT(EN_Banner_TL503Pro_Animation.Steady);
+    1:
+    // Manual, Motion
+        _stackLight.Segment2Color1.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.White);
+        _stackLight.Segment2AnimationType.Num 	:= TO_USINT(EN_Banner_TL503Pro_Animation.FiftyFiftyRotate);
+	2:
+	//Manual, coolant but no motion
+		_stackLight.Segment2Color1.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.White);
+		_stackLight.Segment2Color2.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.Blue);
+		_stackLight.Segment2AnimationType.Num 	:= TO_USINT(EN_Banner_TL503Pro_Animation.Chase);
+    10:
+    // Auto, Not Running, No Motion
+        _stackLight.Segment2Color1.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.Green);
+        _stackLight.Segment2AnimationType.Num 	:= TO_USINT(EN_Banner_TL503Pro_Animation.IntensitySweep);
+    11:
+	// Auto, Running, No Motion
+        _stackLight.Segment2Color1.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.Green);
+        _stackLight.Segment2AnimationType.Num 	:= TO_USINT(EN_Banner_TL503Pro_Animation.Steady);
+
+    12:
+    // Auto, Running, Motion
+        // (Segment 1 is the HV indicator and is driven ONLY by inpHVOn above. This state used to
+        // force it on, so the light showed HV ON with HV off whenever the machine ran in auto.)
+        _stackLight.Segment2Color1.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.Green);
+        _stackLight.Segment2AnimationType.Num 	:= TO_USINT(EN_Banner_TL503Pro_Animation.FiftyFiftyRotate);
+		
+	20:
+	//Auto, Done
+		_stackLight.Segment2Color1.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.Blue);
+        _stackLight.Segment2AnimationType.Num 	:= TO_USINT(EN_Banner_TL503Pro_Animation.IntensitySweep);
+
+	ELSE
+	// Unknown state: flash segment 2 blue. Segment 1 (HV) is never repurposed.
+		_stackLight.Segment2Color1.Num 			:= TO_USINT(EN_Banner_TL503Pro_Colors.Blue);
+		_stackLight.Segment2AnimationType.Num 	:= TO_USINT(EN_Banner_TL503Pro_Animation.Flash);
+
+END_CASE
+
+writeToPDO(_stackLight,IOOut_BannerTL503Pro);
+]]></ST>
+    </Implementation>
+    <Method Name="writeToPDO" Id="{bb049c76-84a3-4b5c-9655-8f15982e717f}">
+      <Declaration><![CDATA[METHOD PRIVATE writeToPDO : BOOL
+VAR_INPUT
+	SignalArray : ST_Banner_TL503Pro;
+	OutputArray : POINTER TO ST_Banner_TL503Pro_Raw;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//Segment1 Color1
+OutputArray^.PDOs[30].0 := SignalArray.Segment1Color1.Bits[1].Bit1;
+OutputArray^.PDOs[30].1 := SignalArray.Segment1Color1.Bits[1].Bit2;
+OutputArray^.PDOs[30].2 := SignalArray.Segment1Color1.Bits[1].Bit3;
+OutputArray^.PDOs[30].3 := SignalArray.Segment1Color1.Bits[1].Bit4;
+
+//Segment1 Color Intensity
+OutputArray^.PDOs[30].4 := SignalArray.Segment1Color1Intensity.Bits[1].Bit1;
+OutputArray^.PDOs[30].5 := SignalArray.Segment1Color1Intensity.Bits[1].Bit2;
+OutputArray^.PDOs[30].6 := SignalArray.Segment1Color1Intensity.Bits[1].Bit3;
+OutputArray^.PDOs[30].7 := SignalArray.Segment1Color1Intensity.Bits[1].Bit4;
+
+//Segment1 Animation Type
+OutputArray^.PDOs[29].0 := SignalArray.Segment1AnimationType.Bits[1].Bit1;
+OutputArray^.PDOs[29].1 := SignalArray.Segment1AnimationType.Bits[1].Bit2;
+OutputArray^.PDOs[29].2 := SignalArray.Segment1AnimationType.Bits[1].Bit3;
+
+//Segment1 Speed
+OutputArray^.PDOs[29].3 := SignalArray.Segment1Speed.Bits[1].Bit1;
+OutputArray^.PDOs[29].4 := SignalArray.Segment1Speed.Bits[1].Bit2;
+
+//Segment1 Pulse Pattern
+OutputArray^.PDOs[29].5 := SignalArray.Segment1PulsePattern.Bits[1].Bit1;
+OutputArray^.PDOs[29].6 := SignalArray.Segment1PulsePattern.Bits[1].Bit2;
+
+//Segment1 Color2
+OutputArray^.PDOs[28].0 := SignalArray.Segment1Color2.Bits[1].Bit1;
+OutputArray^.PDOs[28].1 := SignalArray.Segment1Color2.Bits[1].Bit2;
+OutputArray^.PDOs[28].2 := SignalArray.Segment1Color2.Bits[1].Bit3;
+OutputArray^.PDOs[28].3 := SignalArray.Segment1Color2.Bits[1].Bit4;
+
+//Segment1 Color2 Intensity
+OutputArray^.PDOs[28].4 := SignalArray.Segment1Color2Intensity.Bits[1].Bit1;
+OutputArray^.PDOs[28].5 := SignalArray.Segment1Color2Intensity.Bits[1].Bit2;
+OutputArray^.PDOs[28].6 := SignalArray.Segment1Color2Intensity.Bits[1].Bit3;
+
+//Segment1 Rotate
+OutputArray^.PDOs[28].7 := SignalArray.Segment1RotationDir;
+
+//Segment2 Color1
+OutputArray^.PDOs[27].0 := SignalArray.Segment2Color1.Bits[1].Bit1;
+OutputArray^.PDOs[27].1 := SignalArray.Segment2Color1.Bits[1].Bit2;
+OutputArray^.PDOs[27].2 := SignalArray.Segment2Color1.Bits[1].Bit3;
+OutputArray^.PDOs[27].3 := SignalArray.Segment2Color1.Bits[1].Bit4;
+
+//Segment2 Color1 Intensity
+OutputArray^.PDOs[27].4 := SignalArray.Segment2Color1Intensity.Bits[1].Bit1;
+OutputArray^.PDOs[27].5 := SignalArray.Segment2Color1Intensity.Bits[1].Bit2;
+OutputArray^.PDOs[27].6 := SignalArray.Segment2Color1Intensity.Bits[1].Bit3;
+
+//Segment2 Animation Type
+OutputArray^.PDOs[26].0 := SignalArray.Segment2AnimationType.Bits[1].Bit1;
+OutputArray^.PDOs[26].1 := SignalArray.Segment2AnimationType.Bits[1].Bit2;
+OutputArray^.PDOs[26].2 := SignalArray.Segment2AnimationType.Bits[1].Bit3;
+
+//Segment2 Speed
+OutputArray^.PDOs[26].3 := SignalArray.Segment2Speed.Bits[1].Bit1;
+OutputArray^.PDOs[26].4 := SignalArray.Segment2Speed.Bits[1].Bit2;
+
+//Segment2 Pulse Pattern
+OutputArray^.PDOs[26].5 := SignalArray.Segment2PulsePattern.Bits[1].Bit1;
+OutputArray^.PDOs[26].6 := SignalArray.Segment2PulsePattern.Bits[1].Bit2;
+
+//Segment 2 Color 2
+OutputArray^.PDOs[25].0 := SignalArray.Segment2Color2.Bits[1].Bit1;
+OutputArray^.PDOs[25].1 := SignalArray.Segment2Color2.Bits[1].Bit2;
+OutputArray^.PDOs[25].2 := SignalArray.Segment2Color2.Bits[1].Bit3;
+OutputArray^.PDOs[25].3 := SignalArray.Segment2Color2.Bits[1].Bit4;
+
+//Segment 2 Color 2 Intensity
+OutputArray^.PDOs[25].4 := SignalArray.Segment2Color2Intensity.Bits[1].Bit1;
+OutputArray^.PDOs[25].5 := SignalArray.Segment2Color2Intensity.Bits[1].Bit2;
+OutputArray^.PDOs[25].6 := SignalArray.Segment2Color2Intensity.Bits[1].Bit3;
+
+//Segment 2 Rotate
+OutputArray^.PDOs[25].7 := SignalArray.Segment2RotationDir;
+
+//Segment 3 Color 1
+OutputArray^.PDOs[24].0 := SignalArray.Segment3Color1.Bits[1].Bit1;
+OutputArray^.PDOs[24].1 := SignalArray.Segment3Color1.Bits[1].Bit2;
+OutputArray^.PDOs[24].2 := SignalArray.Segment3Color1.Bits[1].Bit3;
+OutputArray^.PDOs[24].3 := SignalArray.Segment3Color1.Bits[1].Bit4;
+
+//Segment 3 Color1 Intensity
+OutputArray^.PDOs[24].4 := SignalArray.Segment3Color1Intensity.Bits[1].Bit1;
+OutputArray^.PDOs[24].5 := SignalArray.Segment3Color1Intensity.Bits[1].Bit2;
+OutputArray^.PDOs[24].6 := SignalArray.Segment3Color1Intensity.Bits[1].Bit3;
+
+//Segment3 Animation Type
+OutputArray^.PDOs[23].0 := SignalArray.Segment3AnimationType.Bits[1].Bit1;
+OutputArray^.PDOs[23].1 := SignalArray.Segment3AnimationType.Bits[1].Bit2;
+OutputArray^.PDOs[23].2 := SignalArray.Segment3AnimationType.Bits[1].Bit3;
+
+//Segment 3 Speed
+OutputArray^.PDOs[23].3 := SignalArray.Segment3Speed.Bits[1].Bit1;
+OutputArray^.PDOs[23].4 := SignalArray.Segment3Speed.Bits[1].Bit2;
+
+//Segment 3 Pulse Pattern
+OutputArray^.PDOs[23].5 := SignalArray.Segment3PulsePattern.Bits[1].Bit1;
+OutputArray^.PDOs[23].6 := SignalArray.Segment3PulsePattern.Bits[1].Bit2;
+
+//Segment 3 Rotate
+OutputArray^.PDOs[22].7 := SignalArray.Segment3RotationDir;
+
+//Segment 3 Color 2
+OutputArray^.PDOs[22].0 := SignalArray.Segment3Color2.Bits[1].Bit1;
+OutputArray^.PDOs[22].1 := SignalArray.Segment3Color2.Bits[1].Bit2;
+OutputArray^.PDOs[22].2 := SignalArray.Segment3Color2.Bits[1].Bit3;
+OutputArray^.PDOs[22].3 := SignalArray.Segment3Color2.Bits[1].Bit4;
+
+//Segment 3 Color 2 Intensity
+OutputArray^.PDOs[22].4 := SignalArray.Segment3Color2Intensity.Bits[1].Bit1;
+OutputArray^.PDOs[22].5 := SignalArray.Segment3Color2Intensity.Bits[1].Bit2;
+OutputArray^.PDOs[22].6 := SignalArray.Segment3Color2Intensity.Bits[1].Bit3;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

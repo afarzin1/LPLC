@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ITECH_DeviceSignals" Id="{bec3b2f9-dbe2-435f-8705-ed3c2d1140c1}">
+    <Declaration><![CDATA[TYPE ST_ITECH_DeviceSignals :
+STRUCT
+	DCMeter		:ST_ITECH_DCMeter;
+	DCSource	:ST_ITECH_DCSource;
+	Protection	:ST_ITECH_Protection;
+	System		:ST_ITECH_SystemStatus;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="E_DriverState" Id="{d8693581-b8b1-4af6-87f2-4bddeb5500fb}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_DriverState :
+(
+    Init                := 0,
+    ParseConfig         := 1,
+    OptimizeBlocks      := 2,
+
+    Connecting          := 5,
+    ConnectWait         := 6,
+    Ready               := 10,
+
+    ReadStart           := 20,
+    ReadSend            := 21,
+    ReadWait            := 22,
+    ReadProcess         := 23,
+    ReadDelay           := 24,
+    ReadComplete        := 29,
+
+    WriteStart          := 30,
+    WriteSend           := 31,
+    WriteWait           := 32,
+    WriteDelay          := 33,
+    WriteComplete       := 39,
+
+    RmwReadSend         := 40,
+    RmwReadWait         := 41,
+    RmwModify           := 42,
+    RmwWriteSend        := 43,
+    RmwWriteWait        := 44,
+    RmwDelay            := 45,
+
+    Disconnecting       := 80,
+    DisconnectWait      := 81,
+    ReconnectWait       := 85,
+
+    Error               := 90,
+    Faulted             := 99
+) UINT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

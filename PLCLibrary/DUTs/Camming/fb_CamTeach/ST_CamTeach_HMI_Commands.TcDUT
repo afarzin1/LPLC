@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamTeach_HMI_Commands" Id="{965449d1-42a8-4fc7-9aac-22bbedcbb6c8}">
+    <Declaration><![CDATA[// HMI -> PLC operator commands for one cam-teach instance.
+// Every ocmd* flag is a self-clearing one-shot: the HMI writes TRUE, fb_CamTeach
+// acts on it and immediately writes it back to FALSE (same convention as fb_Axis).
+// Operand fields (ocmd*Master / ocmd*Index / ...) are read on the scan the paired
+// flag is seen, so the HMI must set them before (or with) the flag.
+TYPE ST_CamTeach_HMI_Commands :
+STRUCT
+    // Record: append one raw taught point. The caller/HMI supplies BOTH values
+    // (teach-by-value, not by axis) - master and slave are scalars.
+    ocmdRecord          : BOOL;   // one-shot: append (ocmdRecordMaster, ocmdRecordSlave)
+    ocmdRecordMaster    : LREAL;  // [master unit] master value for the recorded point
+    ocmdRecordSlave     : LREAL;  // [slave unit]  slave value for the recorded point
+
+    // Delete the most recently recorded point from the working set.
+    ocmdDeleteLast      : BOOL;   // one-shot: remove last point
+
+    // Spot-edit one existing point (offline, before convert/download).
+    ocmdEditPoint       : BOOL;   // one-shot: overwrite point ocmdEditIndex
+    ocmdEditIndex       : INT;    // 1..stsNumPoints target point index
+    ocmdEditMaster      : LREAL;  // [master unit] new master value
+    ocmdEditSlave       : LREAL;  // [slave unit]  new slave value
+
+    // Empty the working set (returns toward eIdle).
+    ocmdClear           : BOOL;   // one-shot: clear all taught points
+
+    // Persist raw points -> file (async, via fb_CamTeachFile). ocmdFileName is the
+    // bare file name; the directory is the FB's cfgFileDir concern.
+    ocmdSave            : BOOL;   // one-shot: start async save
+    ocmdFileName        : STRING; // file name to save to (also seeds/echoes Config.fileName)
+
+    // File -> raw points (async). Loads from Config.fileName / last used name.
+    ocmdLoad            : BOOL;   // one-shot: start async load
+
+    // Post-process + build the motion function -> eConverted.
+    ocmdConvert         : BOOL;   // one-shot: convert raw points to _mfPoints[]
+
+    // Download _mfPoints[] to the NC table then read-back verify -> eVerified.
+    ocmdDownload        : BOOL;   // one-shot: MC_WriteMotionFunction + verify
+
+    // Online (live) point edit while cammed: update the slave of one point and apply
+    // it at a defined master position (not immediately). Re-saves the file to stay truthful.
+    ocmdEditOnline      : BOOL;   // one-shot: live edit point ocmdEditOnlineIndex
+    ocmdEditOnlineIndex : INT;    // 1..stsNumPoints target point index
+    ocmdEditOnlineSlave : LREAL;  // [slave unit] new slave value for the live edit
+
+    // Clear a fault / return the FB to eIdle.
+    ocmdReset           : BOOL;   // one-shot: reset (mirrors inpReset)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamCoupler_HMI_Commands" Id="{8931e1cf-7dcf-46de-a34a-eb84798fc00a}">
+    <Declaration><![CDATA[// HMI -> PLC operator commands for the cam coupler.
+// All ocmd* flags are self-clearing one-shots: the FB consumes and resets them the scan it sees them.
+TYPE ST_CamCoupler_HMI_Commands :
+STRUCT
+    ocmdCouple          : BOOL;   // request engage (yield -> select -> cam-in)
+    ocmdDecouple        : BOOL;   // request controlled decouple (cam-out -> stop -> release yield)
+    ocmdReset           : BOOL;   // clear a latched coupler error and return to idle
+
+    // Live cam-offset trim (no decouple): write the offset operand then pulse the matching set flag.
+    ocmdSetMasterOffset : BOOL;   // apply ocmdMasterOffset as the new master offset (re-issues MC_CamIn)
+    ocmdMasterOffset    : LREAL;  // [master unit] new cam master offset
+    ocmdSetSlaveOffset  : BOOL;   // apply ocmdSlaveOffset as the new slave offset (re-issues MC_CamIn)
+    ocmdSlaveOffset     : LREAL;  // [slave unit] new cam slave offset
+
+    // Superimposed correction (no decouple): a bounded corrective move on top of the running cam.
+    ocmdSuperImpose     : BOOL;   // run MC_MoveSuperImposed with the operands below
+    ocmdSuperImposeDist : LREAL;  // [slave unit] corrective distance added on top of the cam
+    ocmdSuperImposeVelo : LREAL;  // [slave unit/s] additional velocity for the correction
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

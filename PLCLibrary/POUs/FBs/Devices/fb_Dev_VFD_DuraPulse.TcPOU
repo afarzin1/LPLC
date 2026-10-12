@@ -1,0 +1,703 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_VFD_DuraPulse" Id="{a2b10000-0000-4000-8000-000000000001}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_VFD_DuraPulse EXTENDS abs_fb_Device
+VAR_INPUT
+	inpESTOPs_OK		: BOOL;		// 1 = ESTOPs healthy, 0 = ESTOP active
+	inpMachineSTOP		: BOOL;
+	inpCWAuxBitMask		: WORD;		// OR'd into outbound CW (0x2000) for app-specific bits
+	inpExtFault			: BOOL;		// Trigger E.F. on the drive (0x2002 bit 0)
+END_VAR
+
+VAR PERSISTENT
+	HMI					: ST_VFD_DuraPulse_HMI_Interface;
+END_VAR
+
+VAR
+	_logSetpoint		: BOOL;
+	// Embedded Modbus TCP client
+	_modbus				: fb_Modbus_Driver;
+	_modbusInit			: BOOL;
+
+	// Read signal config. Two contiguous blocks reduce FC03 round-trips:
+	//   - 0x2100..0x2106 (regs 1..7) cyclic status + primary telemetry
+	//   - 0x210B..0x210C (regs 8..9) torque + rpm
+	//   - 0x220E         (reg 10)    IGBT temperature
+	_arrReadConfig		: ARRAY[1..10] OF ST_MBSignalConfig := [
+		(modbusAddr := 48449, dataType := E_MBDataType.mbUInt16, tag := 'FaultWarn'),	// 0x2100
+		(modbusAddr := 48450, dataType := E_MBDataType.mbUInt16, tag := 'SW'),			// 0x2101
+		(modbusAddr := 48451, dataType := E_MBDataType.mbUInt16, tag := 'FCmdEcho'),	// 0x2102
+		(modbusAddr := 48452, dataType := E_MBDataType.mbUInt16, tag := 'OutFreq'),		// 0x2103
+		(modbusAddr := 48453, dataType := E_MBDataType.mbUInt16, tag := 'OutCurrent'),	// 0x2104
+		(modbusAddr := 48454, dataType := E_MBDataType.mbUInt16, tag := 'DCBus'),		// 0x2105
+		(modbusAddr := 48455, dataType := E_MBDataType.mbUInt16, tag := 'OutVoltage'),	// 0x2106
+		(modbusAddr := 48460, dataType := E_MBDataType.mbInt16,  tag := 'Torque'),		// 0x210B
+		(modbusAddr := 48461, dataType := E_MBDataType.mbInt16,  tag := 'MotorRPM'),	// 0x210C
+		(modbusAddr := 48719, dataType := E_MBDataType.mbUInt16, tag := 'IGBTTemp')];	// 0x220E
+	_arrReadResults		: ARRAY[1..10] OF ST_MBReadResult;
+
+	// Write signal config: CW + Freq + bit-cmd (contiguous => single FC16)
+	_arrWriteConfig		: ARRAY[1..3] OF ST_MBSignalConfig := [
+		(modbusAddr := 48193, dataType := E_MBDataType.mbUInt16, tag := 'CW'),			// 0x2000
+		(modbusAddr := 48194, dataType := E_MBDataType.mbUInt16, tag := 'FreqCmd'),		// 0x2001
+		(modbusAddr := 48195, dataType := E_MBDataType.mbUInt16, tag := 'BitCmd')];		// 0x2002
+	_arrWriteData		: ARRAY[1..3] OF ST_MBWriteData;
+
+	// Application-level control signals
+	_ctrlRunMode		: USINT;		// 0=stop, 1=fwd, 2=reverse
+	_ctrlSetpoint		: LREAL;		// absolute Hz, 0..cfgMaxFreqHz
+	_resetTrig			: R_TRIG;
+
+	// Event-logging edge detection
+	_lastLoggedRunMode	: USINT;
+	_lastLoggedSetpoint	: LREAL;
+	_trippedTrig		: R_TRIG;
+
+	// CW state machine
+	_cwState			: INT;			// 0=Idle, 1=Running, 2=FaultPending, 3=ResetSequence
+	_cwCurrent			: WORD := 16#0001;	// init Stop (bits 1-0 = 01)
+	_bitCmdCurrent		: WORD := 16#0000;	// 0x2002 bit commands (Reset, EF)
+	_resetTimeout		: TON;
+	_safetyStopActive	: BOOL;
+
+	// Parsed status word
+	_swRaw				: WORD;
+	_stsRunBits			: BYTE;		// SW bits 0-1
+	_stsDirBits			: BYTE;		// SW bits 3-4
+	_stsJog				: BOOL;
+	_stsFreqFromComm	: BOOL;		// SW bit 8
+	_stsRemote			: BOOL;		// SW bit 10 — command via comm
+	_stsParamsLocked	: BOOL;
+	_stsRunning			: BOOL;		// SW bit 12
+	_stsTripped			: BOOL;		// derived: low byte of 0x2100 != 0
+	_stsAlarm			: BOOL;		// derived: high byte of 0x2100 != 0
+	_stsDirection		: INT;		// +1 fwd, -1 rev, 0 stopped/transitioning
+
+	// Engineering-unit telemetry
+	_telemetry			: ST_VFD_DuraPulse_Telemetry;
+	_stateString		: STRING;
+
+	// Interlock array
+	_interlocks			: ARRAY[1..10] OF BOOL;
+
+	// Modbus configuration mirrors (set via cfg* properties before enable)
+	_ipAddress			: STRING(15) := '192.168.1.50';
+	_unitId				: BYTE := 1;
+	_maxFreqHz			: LREAL := 60.0;	// must match drive P01.00
+END_VAR
+
+VAR_OUTPUT
+	stsRunning			: BOOL;
+	stsRemote			: BOOL;
+	stsAlarm			: BOOL;
+	stsTripped			: BOOL;
+	stsDirection		: INT;		// +1 fwd, -1 rev, 0 stopped
+	stsOutputFreq		: LREAL;	// Hz, signed
+	stsMotorRPM			: LREAL;	// rpm, signed
+	stsMotorCurrent		: LREAL;	// A
+	stsDCBusVoltage		: LREAL;	// VDC
+	stsOutputVoltage	: LREAL;	// VAC
+	stsMotorTorque		: LREAL;	// %
+	stsInverterTemp		: LREAL;	// degC
+	stsFaultCode		: USINT;	// 0 unless drive is actively tripped
+	stsFaultText		: STRING;
+	stsWarningCode		: USINT;	// 0 unless warning active
+	stsWarningText		: STRING;
+	stsCommsConnected	: BOOL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+
+// One-time Modbus driver configuration (properties lock after _initialized := TRUE)
+IF NOT _modbusInit THEN
+	_modbus.ipAddress				:= _ipAddress;
+	_modbus.unitId					:= _unitId;
+	_modbus.port					:= 502;
+	_modbus.timeout					:= T#500MS;
+	_modbus.pollInterval			:= T#50MS;
+	_modbus.writeCycleInterval		:= T#100MS;
+	_modbus.wordOrder				:= E_WordOrder.BigEndian;
+	_modbus.maxConsecFails			:= 3;
+	_modbus.reconnectDelay			:= T#2S;
+	_modbus.maxReconnectAttempts	:= 10;
+	_modbus.staleThreshold			:= T#2S;
+	_modbus.readSignalCount			:= 10;
+	_modbus.writeSignalCount		:= 3;
+	_modbusInit := TRUE;
+END_IF
+
+// Drive the embedded Modbus client
+_modbus(
+	inpEnable			:= _enabled,
+	inpPtrReadConfig	:= ADR(_arrReadConfig),
+	inpPtrWriteConfig	:= ADR(_arrWriteConfig),
+	inpPtrReadResults	:= ADR(_arrReadResults),
+	inpPtrWriteData		:= ADR(_arrWriteData));
+_modbus.cycle();
+
+parseDriveFeedback();
+
+// Interlocks
+_interlocks[1] := inpESTOPs_OK;
+cmdSetInterlock(1, 'ESTOPs OK', _interlocks[1]);
+
+_interlocks[2] := NOT inpMachineSTOP;
+cmdSetInterlock(2, 'Machine STOP Not Active', _interlocks[2]);
+
+_interlocks[3] := _modbus.stsStatus.connected AND NOT _modbus.stsStatus.faulted;
+cmdSetInterlock(3, 'Modbus comms OK', _interlocks[3]);
+
+_interlocks[4] := _stsRemote;
+cmdSetInterlock(4, 'Drive in Remote (comm) mode', _interlocks[4]);
+
+_safetyStopActive := (NOT inpESTOPs_OK) OR inpMachineSTOP;
+
+// HMI command surface — only honoured in manual mode
+IF _enabled THEN
+	IF NOT _inAuto THEN
+		_ctrlRunMode	:= HMI.ocmdRunMode;
+		_ctrlSetpoint	:= HMI.ocmdSetpoint;
+	END_IF
+END_IF
+
+_resetTrig(CLK := HMI.ocmdReset);
+IF _resetTrig.Q THEN
+	cmdReset();
+END_IF
+
+FaultHandler();
+
+// Interlock enforcement
+IF NOT interlock.outInterlockOK THEN
+	_ctrlRunMode	:= 0;
+	HMI.ocmdRunMode	:= 0;
+END_IF
+
+controlWordSequencer();
+
+// Marshal CW + freq + bit-cmd into Modbus write buffers
+_arrWriteData[1].valueUint	:= WORD_TO_UINT(_cwCurrent OR inpCWAuxBitMask);
+_arrWriteData[2].valueUint	:= LREAL_TO_UINT(LIMIT(0.0, _ctrlSetpoint, _maxFreqHz) * 100.0);
+// 0x2002 bit 0 = E.F. trigger (pulse from caller), bit 1 = reset (managed by sequencer)
+_arrWriteData[3].valueUint	:= WORD_TO_UINT(_bitCmdCurrent OR BOOL_TO_WORD(inpExtFault));
+
+// Event-based logging
+IF _ctrlRunMode <> _lastLoggedRunMode THEN
+	CASE _ctrlRunMode OF
+		0:	sendLog('Stop command', 1);
+		1:	sendLog(CONCAT(CONCAT('Run forward @ ', LREAL_TO_STRING(_ctrlSetpoint)), ' Hz'), 1);
+		2:	sendLog(CONCAT(CONCAT('Run reverse @ ', LREAL_TO_STRING(_ctrlSetpoint)), ' Hz'), 1);
+	END_CASE
+	_lastLoggedRunMode := _ctrlRunMode;
+END_IF
+
+IF ABS(_ctrlSetpoint - _lastLoggedSetpoint) >= 0.1 THEN
+	IF _logSetpoint THEN
+		sendLog(CONCAT(CONCAT('Setpoint = ', LREAL_TO_STRING(_ctrlSetpoint)), ' Hz'), 2);
+		_lastLoggedSetpoint := _ctrlSetpoint;
+	END_IF
+END_IF
+
+_trippedTrig(CLK := _stsTripped);
+IF _trippedTrig.Q THEN
+	sendLog(CONCAT('Drive tripped, fault code ', USINT_TO_STRING(_telemetry.faultCode)), 3);
+END_IF
+
+updateHMI();
+
+// Public outputs
+stsRunning			:= _stsRunning;
+stsRemote			:= _stsRemote;
+stsAlarm			:= _stsAlarm;
+stsTripped			:= _stsTripped;
+stsDirection		:= _stsDirection;
+stsOutputFreq		:= _telemetry.outputFreq;
+stsMotorRPM			:= _telemetry.motorRPM;
+stsMotorCurrent		:= _telemetry.motorCurrent;
+stsDCBusVoltage		:= _telemetry.dcBusVoltage;
+stsOutputVoltage	:= _telemetry.outputVoltage;
+stsMotorTorque		:= _telemetry.motorTorque;
+stsInverterTemp		:= _telemetry.inverterTemp;
+// Gate fault/warning text by active condition. The drive does not latch
+// these codes once the condition clears, but we still want explicit text
+// suppression on the operator-facing outputs.
+IF _stsTripped THEN
+	stsFaultCode	:= _telemetry.faultCode;
+	stsFaultText	:= decodeAlarmCode(_telemetry.faultCode);
+ELSE
+	stsFaultCode	:= 0;
+	stsFaultText	:= '';
+END_IF
+IF _stsAlarm THEN
+	stsWarningCode	:= _telemetry.warningCode;
+	stsWarningText	:= decodeAlarmCode(_telemetry.warningCode);
+ELSE
+	stsWarningCode	:= 0;
+	stsWarningText	:= '';
+END_IF
+// AND with signal quality so this agrees with the 'No Comms' state string.
+// Driver's connected flag lags reality (only drops after maxConsecFails);
+// signal quality flips on the first failed read.
+stsCommsConnected	:= _modbus.stsStatus.connected AND (_arrReadResults[2].quality = E_SignalQuality.Good);
+]]></ST>
+    </Implementation>
+    <Property Name="cfgIPAddress" Id="{a2b10000-0000-4000-8000-000000000002}">
+      <Declaration><![CDATA[PROPERTY cfgIPAddress : STRING(15)
+]]></Declaration>
+      <Get Name="Get" Id="{a2b10000-0000-4000-8000-000000000003}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgIPAddress := _ipAddress;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a2b10000-0000-4000-8000-000000000004}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_ipAddress := cfgIPAddress;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgLogSetpoint" Id="{3f82ae02-c760-4641-8258-25b1a67e17f3}">
+      <Declaration><![CDATA[PROPERTY cfgLogSetpoint : BOOL]]></Declaration>
+      <Get Name="Get" Id="{ea52ba38-c4b7-4abb-ba47-c5819da7329f}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgLogSetpoint := _logSetpoint;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a702ec40-cc17-4979-bf1a-ebb76efe94e4}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_logsetpoint := cfgLogSetpoint;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgMaxFreqHz" Id="{a2b10000-0000-4000-8000-000000000008}">
+      <Declaration><![CDATA[// Drive-side maximum frequency (P01.00). Used to clamp setpoint client-side.
+PROPERTY cfgMaxFreqHz : LREAL
+]]></Declaration>
+      <Get Name="Get" Id="{a2b10000-0000-4000-8000-000000000009}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgMaxFreqHz := _maxFreqHz;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a2b10000-0000-4000-8000-00000000000a}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF cfgMaxFreqHz > 0.0 THEN
+	_maxFreqHz := cfgMaxFreqHz;
+END_IF
+]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgUnitID" Id="{a2b10000-0000-4000-8000-000000000005}">
+      <Declaration><![CDATA[PROPERTY cfgUnitID : BYTE
+]]></Declaration>
+      <Get Name="Get" Id="{a2b10000-0000-4000-8000-000000000006}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgUnitID := _unitId;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a2b10000-0000-4000-8000-000000000007}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_unitId := cfgUnitID;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdEnable" Id="{a2b10000-0000-4000-8000-000000000010}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdEnable : BOOL
+VAR_INPUT
+	command		: USINT;	// 0=stop, 1=run forward, 2=run reverse
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF command <= 2 THEN
+	_ctrlRunMode := command;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{a2b10000-0000-4000-8000-000000000012}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[setFault(0, '');
+IF _stsTripped THEN
+	_cwState := 3;
+END_IF
+// A driver that gave up after maxReconnectAttempts restarts on reset (it no longer needs a
+// PLC restart to recover).
+IF _modbus.stsStatus.faulted THEN
+	_modbus.cmdReset();
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdSetpoint" Id="{a2b10000-0000-4000-8000-000000000011}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdSetpoint : BOOL
+VAR_INPUT
+	setpoint	: LREAL;	// absolute Hz, 0..cfgMaxFreqHz
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_ctrlSetpoint := LIMIT(0.0, setpoint, _maxFreqHz);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="controlWordSequencer" Id="{a2b10000-0000-4000-8000-000000000013}">
+      <Declaration><![CDATA[METHOD PRIVATE controlWordSequencer : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// DuraPulse CW values (register 0x2000):
+//   0x0001 = Stop (bits 1-0 = 01)
+//   0x0012 = Run forward (run + FWD)
+//   0x0022 = Run reverse (run + REV)
+//
+// Reset is performed via 0x2002 bit 1 (separate register), pulsed by state 3.
+// The drive does not require an ABB-style "ready" precondition — it will
+// accept Run directly from Stop once any fault is cleared.
+
+// Default to no bit commands (reset bit clears outside state 3)
+_bitCmdCurrent := 16#0000;
+
+CASE _cwState OF
+	0:	// Idle / Stopped
+		_cwCurrent := 16#0001;
+		IF _ctrlRunMode > 0
+		   AND NOT _stsTripped
+		   AND NOT _safetyStopActive THEN
+			_cwState := 1;
+		ELSIF _stsTripped THEN
+			_cwState := 2;
+		END_IF
+
+	1:	// Running
+		IF _stsTripped THEN
+			_cwState := 2;
+		ELSIF _ctrlRunMode = 0 OR _safetyStopActive THEN
+			_cwState := 0;
+		ELSIF _ctrlRunMode = 1 THEN
+			_cwCurrent := 16#0012;		// run forward
+		ELSIF _ctrlRunMode = 2 THEN
+			_cwCurrent := 16#0022;		// run reverse
+		END_IF
+
+	2:	// FaultPending — wait for reset
+		_cwCurrent := 16#0001;
+		IF NOT _stsTripped THEN
+			_cwState := 0;
+		END_IF
+
+	3:	// ResetSequence — hold reset bit until fault clears (max 3s)
+		_cwCurrent := 16#0001;
+		_bitCmdCurrent := 16#0002;		// 0x2002 bit 1 = reset
+		_resetTimeout(IN := TRUE, PT := T#3S);
+		IF NOT _stsTripped THEN
+			_cwState := 0;
+			_resetTimeout(IN := FALSE);
+		ELSIF _resetTimeout.Q THEN
+			setFault(1, 'Fault reset did not clear after 3s');
+			_cwState := 2;
+			_resetTimeout(IN := FALSE);
+		END_IF
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="decodeAlarmCode" Id="{a2b10000-0000-4000-8000-000000000018}">
+      <Declaration><![CDATA[METHOD PRIVATE decodeAlarmCode : STRING
+VAR_INPUT
+	code : USINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Common GS20(X) / Delta MS300 fault & warning codes. Not exhaustive — full
+// list is in GS20 manual Chapter 6 (Maintenance and Troubleshooting).
+// Both fault (low byte of 0x2100) and warning (high byte) use the same
+// numbering scheme, so one decode function covers both.
+CASE code OF
+	0:		decodeAlarmCode := '';
+	1:		decodeAlarmCode := 'Overcurrent during acceleration (ocA)';
+	2:		decodeAlarmCode := 'Overcurrent during deceleration (ocd)';
+	3:		decodeAlarmCode := 'Overcurrent during steady state (ocn)';
+	4:		decodeAlarmCode := 'Ground fault (GFF)';
+	5:		decodeAlarmCode := 'IGBT short circuit (occ)';
+	6:		decodeAlarmCode := 'Overcurrent at stop (ocS)';
+	7:		decodeAlarmCode := 'Overvoltage during acceleration (ovA)';
+	8:		decodeAlarmCode := 'Overvoltage during deceleration (ovd)';
+	9:		decodeAlarmCode := 'Overvoltage during steady state (ovn)';
+	10:		decodeAlarmCode := 'Overvoltage at stop (ovS)';
+	11:		decodeAlarmCode := 'Low voltage during acceleration (LvA)';
+	12:		decodeAlarmCode := 'Low voltage during deceleration (Lvd)';
+	13:		decodeAlarmCode := 'Low voltage during steady state (Lvn)';
+	14:		decodeAlarmCode := 'Low voltage at stop (LvS)';
+	15:		decodeAlarmCode := 'Phase loss protection (OrP)';
+	16:		decodeAlarmCode := 'IGBT overheat (oH1)';
+	17:		decodeAlarmCode := 'Capacitor overheat (oH2)';
+	18:		decodeAlarmCode := 'IGBT temperature sensor error (tH1o)';
+	19:		decodeAlarmCode := 'Capacitor temperature sensor error (tH2o)';
+	21:		decodeAlarmCode := 'Drive overload (oL)';
+	22:		decodeAlarmCode := 'Electronic thermal relay 1 (EoL1)';
+	23:		decodeAlarmCode := 'Electronic thermal relay 2 (EoL2)';
+	24:		decodeAlarmCode := 'Motor PTC overheat (oH3)';
+	26:		decodeAlarmCode := 'Over-torque 1 (ot1)';
+	27:		decodeAlarmCode := 'Over-torque 2 (ot2)';
+	28:		decodeAlarmCode := 'Low current (uC)';
+	31:		decodeAlarmCode := 'EEPROM read error (cF2)';
+	33:		decodeAlarmCode := 'U-phase current detection error (cd1)';
+	34:		decodeAlarmCode := 'V-phase current detection error (cd2)';
+	35:		decodeAlarmCode := 'W-phase current detection error (cd3)';
+	36:		decodeAlarmCode := 'Clamp current detection error (Hd0)';
+	37:		decodeAlarmCode := 'Over-current detection error (Hd1)';
+	40:		decodeAlarmCode := 'Auto-tuning error (AUE)';
+	41:		decodeAlarmCode := 'PID feedback loss (AFE)';
+	48:		decodeAlarmCode := 'Analog current input loss (ACE)';
+	49:		decodeAlarmCode := 'External fault input (EF)';
+	50:		decodeAlarmCode := 'Emergency stop (EF1)';
+	51:		decodeAlarmCode := 'External base block (bb)';
+	52:		decodeAlarmCode := 'Password fault (Pcod)';
+	54:		decodeAlarmCode := 'Communication error (CE1)';
+	55:		decodeAlarmCode := 'Communication error (CE2)';
+	56:		decodeAlarmCode := 'Communication error (CE3)';
+	57:		decodeAlarmCode := 'Communication error (CE4)';
+	58:		decodeAlarmCode := 'Modbus comm time-out (CE10)';
+	60:		decodeAlarmCode := 'Brake transistor error (bF)';
+	61:		decodeAlarmCode := 'Y-connection / delta-connection switch error (ydc)';
+	62:		decodeAlarmCode := 'Deceleration energy backup error (dEb)';
+	72:		decodeAlarmCode := 'STO loss 1 (STL1)';
+	76:		decodeAlarmCode := 'Safe torque off (STo)';
+	77:		decodeAlarmCode := 'STO loss 2 (STL2)';
+	78:		decodeAlarmCode := 'STO loss 3 (STL3)';
+	79:		decodeAlarmCode := 'U-phase output phase loss (OPHL)';
+	80:		decodeAlarmCode := 'V-phase output phase loss (OPHL)';
+	81:		decodeAlarmCode := 'W-phase output phase loss (OPHL)';
+	82:		decodeAlarmCode := 'Output phase loss (OPHL)';
+	87:		decodeAlarmCode := 'Drive overload (oL3)';
+	101:	decodeAlarmCode := 'CANopen software disconnect 1 (CGdE)';
+	121:	decodeAlarmCode := 'Internal communication error (CP20)';
+ELSE
+	decodeAlarmCode := 'Unknown code';
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FaultHandler" Id="{a2b10000-0000-4000-8000-000000000015}">
+      <Declaration><![CDATA[METHOD PRIVATE FaultHandler : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Each fault condition calls setFault separately so the base class can
+// promote the first one to the primary fault and report subsequent ones
+// as 'Additional Fault - ...' warnings.
+
+IF _stsTripped THEN
+	setFault(1, CONCAT(CONCAT(CONCAT('Drive Fault: ', decodeAlarmCode(_telemetry.faultCode)),
+		' (code '), CONCAT(USINT_TO_STRING(_telemetry.faultCode), ')')));
+END_IF
+
+// Modbus driver exhausted reconnects (terminal)
+IF _modbus.stsStatus.faulted THEN
+	setFault(1, 'Modbus driver faulted (max reconnect attempts)');
+END_IF
+
+// No comms fault — fires whenever reads have been failing for >5s
+IF _enabled AND _modbus.stsStatus.timeSinceLastGoodRead > T#5S THEN
+	setFault(1, 'No Modbus comms');
+END_IF
+
+// Non-latching warnings
+IF _stsAlarm THEN
+	sendWarning(CONCAT(CONCAT(CONCAT('Drive warning: ', decodeAlarmCode(_telemetry.warningCode)),
+		' (code '), CONCAT(USINT_TO_STRING(_telemetry.warningCode), ')')), 10);
+END_IF
+
+IF _enabled
+   AND _arrReadResults[2].quality = E_SignalQuality.Good
+   AND NOT _stsRemote THEN
+	sendWarning('Drive command source is not Communication (local/keypad)', 11);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{a2b10000-0000-4000-8000-000000000017}">
+      <Declaration><![CDATA[METHOD FB_Init : BOOL
+VAR_INPUT
+	bInitRetains		: BOOL;	// TRUE: retain variables are initialized (reset warm / cold)
+	bInCopyCode			: BOOL;	// TRUE: instance copied to copy code (online change)
+	cfgDeviceName		: STRING;
+	cfgEnable			: BOOL;
+	cfgInitEventClass	: BOOL;
+	cfgIPAddress		: STRING(15);
+	cfgUnitID			: BYTE;
+	cfgMaxFreqHz		: LREAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName		:= cfgDeviceName;
+THIS^.cfgEnable			:= cfgEnable;
+THIS^.cfgInitEventClass	:= cfgInitEventClass;
+THIS^.cfgIPAddress		:= cfgIPAddress;
+THIS^.cfgUnitID			:= cfgUnitID;
+IF cfgMaxFreqHz > 0.0 THEN
+	THIS^.cfgMaxFreqHz	:= cfgMaxFreqHz;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="parseDriveFeedback" Id="{a2b10000-0000-4000-8000-000000000014}">
+      <Declaration><![CDATA[METHOD PRIVATE parseDriveFeedback : BOOL
+VAR
+	_faultWarn	: WORD;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// 0x2100: low byte = fault, high byte = warning
+IF _arrReadResults[1].quality = E_SignalQuality.Good THEN
+	_faultWarn				:= UINT_TO_WORD(_arrReadResults[1].valueUint);
+	_telemetry.faultCode	:= WORD_TO_USINT(_faultWarn AND 16#00FF);
+	_telemetry.warningCode	:= WORD_TO_USINT(SHR(_faultWarn AND 16#FF00, 8));
+	_stsTripped				:= _telemetry.faultCode <> 0;
+	_stsAlarm				:= _telemetry.warningCode <> 0;
+END_IF
+
+// 0x2101: status word
+IF _arrReadResults[2].quality = E_SignalQuality.Good THEN
+	_swRaw				:= UINT_TO_WORD(_arrReadResults[2].valueUint);
+	_stsRunBits			:= WORD_TO_BYTE(_swRaw AND 16#0003);				// bits 0-1
+	_stsJog				:= (_swRaw AND 16#0004) <> 0;						// bit 2
+	_stsDirBits			:= WORD_TO_BYTE(SHR(_swRaw AND 16#0018, 3));		// bits 3-4
+	_stsFreqFromComm	:= (_swRaw AND 16#0100) <> 0;						// bit 8
+	_stsRemote			:= (_swRaw AND 16#0400) <> 0;						// bit 10
+	_stsParamsLocked	:= (_swRaw AND 16#0800) <> 0;						// bit 11
+	_stsRunning			:= (_swRaw AND 16#1000) <> 0;						// bit 12
+
+	// Direction (0=fwd, 3=rev, 1/2=transition)
+	CASE _stsDirBits OF
+		0:	_stsDirection := SEL(_stsRunning, 0, 1);	// fwd only meaningful while running
+		3:	_stsDirection := -1;
+	ELSE
+		_stsDirection := 0;		// transitioning
+	END_CASE
+END_IF
+
+// 0x2103: output frequency (UInt, 0.01 Hz). Sign from direction.
+IF _arrReadResults[4].quality = E_SignalQuality.Good THEN
+	_telemetry.outputFreq	:= UINT_TO_LREAL(_arrReadResults[4].valueUint) / 100.0;
+	IF _stsDirection < 0 THEN
+		_telemetry.outputFreq := -_telemetry.outputFreq;
+	END_IF
+END_IF
+
+// 0x2104: output current (0.01 A)
+IF _arrReadResults[5].quality = E_SignalQuality.Good THEN
+	_telemetry.motorCurrent	:= UINT_TO_LREAL(_arrReadResults[5].valueUint) / 100.0;
+END_IF
+
+// 0x2105: DC bus voltage (0.1 VDC)
+IF _arrReadResults[6].quality = E_SignalQuality.Good THEN
+	_telemetry.dcBusVoltage	:= UINT_TO_LREAL(_arrReadResults[6].valueUint) / 10.0;
+END_IF
+
+// 0x2106: output voltage (0.1 VAC)
+IF _arrReadResults[7].quality = E_SignalQuality.Good THEN
+	_telemetry.outputVoltage := UINT_TO_LREAL(_arrReadResults[7].valueUint) / 10.0;
+END_IF
+
+// 0x210B: output torque (signed 0.1 %)
+IF _arrReadResults[8].quality = E_SignalQuality.Good THEN
+	_telemetry.motorTorque	:= INT_TO_LREAL(_arrReadResults[8].valueInt) / 10.0;
+END_IF
+
+// 0x210C: actual motor speed (signed rpm)
+IF _arrReadResults[9].quality = E_SignalQuality.Good THEN
+	_telemetry.motorRPM		:= INT_TO_LREAL(_arrReadResults[9].valueInt);
+END_IF
+
+// 0x220E: IGBT temperature (0.1 degC)
+IF _arrReadResults[10].quality = E_SignalQuality.Good THEN
+	_telemetry.inverterTemp	:= UINT_TO_LREAL(_arrReadResults[10].valueUint) / 10.0;
+END_IF
+
+// State label for HMI
+IF _stsTripped THEN
+	_stateString := 'Tripped';
+ELSIF _arrReadResults[2].quality <> E_SignalQuality.Good THEN
+	_stateString := 'No Comms';
+ELSIF NOT _stsRemote THEN
+	_stateString := 'Local Mode';
+ELSIF _stsRunBits = 2#11 THEN
+	_stateString := 'Running';
+ELSIF _stsRunBits = 2#10 THEN
+	_stateString := 'Standby';
+ELSIF _stsRunBits = 2#01 THEN
+	_stateString := 'Decelerating';
+ELSE
+	_stateString := 'Stopped';
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="updateHMI" Id="{a2b10000-0000-4000-8000-000000000016}">
+      <Declaration><![CDATA[METHOD PRIVATE updateHMI : BOOL
+VAR
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[HMI.HMIbaseDevice		:= HMIbaseDevice;
+HMI.stsInterlocks		:= interlock.getHMIdata();
+
+HMI.stsRunMode			:= _ctrlRunMode;
+HMI.stsSetpoint			:= _ctrlSetpoint;
+
+HMI.stsState			:= _stateString;
+HMI.stsRunning			:= _stsRunning;
+HMI.stsRemote			:= _stsRemote;
+HMI.stsTripped			:= _stsTripped;
+HMI.stsAlarm			:= _stsAlarm;
+HMI.stsDirection		:= _stsDirection;
+
+HMI.stsOutputFreq		:= _telemetry.outputFreq;
+HMI.stsMotorRPM			:= _telemetry.motorRPM;
+HMI.stsMotorCurrent		:= _telemetry.motorCurrent;
+HMI.stsDCBusVoltage		:= _telemetry.dcBusVoltage;
+HMI.stsOutputVoltage	:= _telemetry.outputVoltage;
+HMI.stsMotorTorque		:= _telemetry.motorTorque;
+HMI.stsInverterTemp		:= _telemetry.inverterTemp;
+HMI.stsFaultCode		:= stsFaultCode;
+HMI.stsFaultText		:= stsFaultText;
+HMI.stsWarningCode		:= stsWarningCode;
+HMI.stsWarningText		:= stsWarningText;
+
+HMI.stsCWRaw			:= _cwCurrent;
+HMI.stsSWRaw			:= _swRaw;
+HMI.stsCommsConnected	:= stsCommsConnected;
+HMI.stsCommsFaulted		:= _modbus.stsStatus.faulted;
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

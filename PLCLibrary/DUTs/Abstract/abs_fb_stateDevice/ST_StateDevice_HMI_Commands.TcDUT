@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_StateDevice_HMI_Commands" Id="{bbd71691-a6ef-414c-a5d5-4b3eb8fdd925}">
+    <Declaration><![CDATA[TYPE ST_StateDevice_HMI_Commands :
+STRUCT
+	ocmdRun				: BOOL;
+	ocmdReset			: BOOL;
+	ocmdAbort			: BOOL;
+	ocmdRetry			: BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

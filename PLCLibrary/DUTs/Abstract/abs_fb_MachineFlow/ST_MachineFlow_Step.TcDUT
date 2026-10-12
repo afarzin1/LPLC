@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_MachineFlow_Step" Id="{962aa746-f0e4-45a7-997a-eb8b26d04d61}">
+    <Declaration><![CDATA[// One step of an abs_fb_MachineFlow sequence. Declared via addStep(); the
+// runtime members are ENGINE-OWNED (step bodies use stepDone()/stepElapsed(),
+// never these members directly).
+TYPE ST_MachineFlow_Step :
+STRUCT
+    name        : STRING(63);    // shown on the HMI; no double quotes (embedded in the def JSON)
+    description : STRING(125);   // WHAT the step does - shown in the HMI's step popup; no double quotes
+    timeout     : TIME;          // T#0S = none; engine faults (retryable) when elapsed exceeds it
+    active      : BOOL;         // token present
+    done        : BOOL;         // step body reported complete; cleared when a transition consumes the token
+    entered     : BOOL;         // step body has run at least one scan since activation
+    kickTimer   : BOOL;         // one-scan request to restart the step's elapsed clock
+    hasOutgoing : BOOL;         // derived from the transitions; done + terminal => sequence Done
+    visited    : BOOL;   // completed at least once this run (token consumed by a firing transition)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

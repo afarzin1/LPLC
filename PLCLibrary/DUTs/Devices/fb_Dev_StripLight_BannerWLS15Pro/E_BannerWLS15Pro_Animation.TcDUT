@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_BannerWLS15Pro_Animation" Id="{9195b865-214b-423e-8eb0-edb973e747c4}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+// Run Mode animation, subindex 1 (219132 Rev. A, section 1.3.2).
+TYPE E_BannerWLS15Pro_Animation :
+(
+    eOff             := 0,
+    eSteady          := 1,
+    eFlash           := 2,
+    eTwoColorFlash   := 3,
+    eTwoColorShift   := 4,
+    eEndsSteady      := 5,
+    eEndsFlash       := 6,
+    eScroll          := 7,
+    eCenterScroll    := 8,
+    eBounce          := 9,
+    eCenterBounce    := 10,
+    eIntensitySweep  := 11,
+    eTwoColorSweep   := 12,
+    eSpectrum        := 13,
+    eSingleEndSteady := 14,
+    eSingleEndFlash  := 15
+) BYTE;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,298 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_XPendant" Id="{2bc4efb9-05ed-4d43-84bd-08dab938f8b2}" SpecialFunc="None">
+    <Declaration><![CDATA[(*
+    fb_Dev_XPendant — Xbox-controller pendant endpoint.
+
+    The lhmi sidecar app `xpendant` (lhmi-core apps/xpendant) reads a USB Xbox
+    controller on the IPC and writes its state into the public Pad member over local ADS — the
+    FB instance path is passed to that service as an argument, and the member
+    names of ST_XPendant_In are the write contract (<instance>.Pad.<member>). This FB only OUTPUTS what
+    the controller is doing; wiring those outputs to motion is machine logic, outside this FB.
+
+    Analog outputs = DIRECTION + SPEED (jog-ready). Each stick axis and each trigger
+    is broken into an ST_XPendant_Axis { Value, Pos, Neg, Throttle }:
+      Pos/Neg = which way it's pushed past cfgActivateThreshold (jog direction);
+        sticks are bidirectional (Pos = up/right, Neg = down/left), triggers are
+        one-sided (Pos = pulled, Neg always FALSE).
+      Throttle = 0..100 % magnitude ("how far") = a custom speed override; 0 unless
+        Pos or Neg is set.
+    So "left analog up @ 70 %" is stsLeftStickY.Pos = TRUE, stsLeftStickY.Throttle = 70.
+
+    Liveness contract: the service bumps Pad.Watchdog every ~500 ms and holds
+    Pad.Connected while a controller is present. stsFeedAlive drops when the
+    watchdog stops changing for cfgFeedTimeout (default T#1S500MS = 3 missed
+    beats); ALL outputs are zeroed unless stsConnected. Consumers must still
+    apply their own gating (e.g. a held dead-man on an axis) — this FB is an
+    input device, never a safety path.
+
+    Supervision: inpActive (machine logic) declares when the pendant is EXPECTED —
+    unplugged is the normal state for a teach pendant, so absence is only
+    warning-worthy while inpActive is TRUE (the IPC service reads the mirror
+    HMI.Status.stsInService and drives the HMI warning). inpActive does not gate outputs.
+
+    Usage:
+        XPendant : fb_Dev_XPendant(cfgDeviceName := 'XPendant', cfgEnable := TRUE,
+                                   cfgInitEventClass := TRUE, cfgFeedTimeout := T#1S500MS);
+        XPendant(inpAuto := Machine.stsInAuto, inpReset := Machine.cmdReset,
+                 inpInterlockBypass := FALSE, faultMonitor := ADR(FaultMonitor),
+                 inpActive := <machine logic: pendant operation selected>);
+        // jog an axis from the left stick's Y (up/down), speed from how far it's pushed:
+        Axis1(inpPendantJogPos := XPendant.stsLeftStickY.Pos,
+              inpPendantJogNeg := XPendant.stsLeftStickY.Neg,
+              inpPendantJogVelo := cfgJogMax * XPendant.stsLeftStickY.Throttle / 100.0);
+*)
+FUNCTION_BLOCK fb_Dev_XPendant EXTENDS abs_fb_Device
+VAR_INPUT
+    // SUPERVISION flag, driven by machine logic: TRUE = the pendant is expected /
+    // in service right now (e.g. manual mode + pendant operation selected). A teach
+    // pendant is exceptional equipment — unplugged is the NORMAL state — so while
+    // FALSE (the default) nothing anywhere complains about an absent controller;
+    // while TRUE, absence is warning-worthy (the IPC service reads the mirror
+    // HMI.Status.stsInService and raises the HMI warning). Does NOT gate the pad
+    // outputs: a plugged, live controller always passes through — consumers keep
+    // their own gating.
+    inpActive : BOOL;
+END_VAR
+
+VAR_OUTPUT
+    stsConnected : BOOL;    // controller present AND feed alive AND device enabled
+    stsFeedAlive : BOOL;    // service watchdog fresh (Pad.Watchdog changed within cfgFeedTimeout)
+    stsActive    : BOOL;    // inpActive AND stsConnected — "pendant in service and usable now"
+
+    // Gated pad state — all FALSE / 0.0 while NOT stsConnected:
+    stsBtnA      : BOOL;
+    stsBtnB      : BOOL;
+    stsBtnX      : BOOL;
+    stsBtnY      : BOOL;
+    stsBumpL     : BOOL;
+    stsBumpR     : BOOL;
+    stsStart     : BOOL;
+    stsBack      : BOOL;
+    stsThumbL    : BOOL;    // left-stick click (L3)
+    stsThumbR    : BOOL;    // right-stick click (R3)
+    stsDpadUp    : BOOL;
+    stsDpadDown  : BOOL;
+    stsDpadLeft  : BOOL;
+    stsDpadRight : BOOL;
+
+    // Analog controls as DIRECTION + SPEED pairs (ST_XPendant_Axis). Sticks are
+    // bidirectional (Pos = up/right, Neg = down/left); triggers are one-sided (Pos
+    // = pulled, Neg always FALSE). Throttle = 0..100 %. See the header for wiring.
+    stsLeftStickX  : ST_XPendant_Axis;
+    stsLeftStickY  : ST_XPendant_Axis;
+    stsRightStickX : ST_XPendant_Axis;
+    stsRightStickY : ST_XPendant_Axis;
+    stsTriggerL    : ST_XPendant_Axis;   // LT
+    stsTriggerR    : ST_XPendant_Axis;   // RT
+END_VAR
+
+VAR
+    // Written over ADS by the xpendant IPC service (raw external mirror — never
+    // drive from PLC logic). A plain VAR on purpose: FB VAR_INPUT members are not
+    // reliably in the ADS symbol download (the cfgUnit/1808 lesson), while public
+    // VAR members — the same surface as HMI below — are.
+    Pad          : ST_XPendant_In;
+
+    HMI          : ST_XPendant_HMI_Interface;   // Public HMI interface — bind <instance>.HMI
+    _wdLast      : UINT;                        // last seen watchdog count
+    _wdStale     : TON;                         // runs while the watchdog is UNCHANGED
+    _feedTimeout : TIME := T#1S500MS;           // see cfgFeedTimeout
+    _activateThreshold : LREAL := 0.05;         // deflection (fraction) before Pos/Neg engage — see cfgActivateThreshold
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ── 1. Base device logic (init, interlock, faults, reset, HMIbaseDevice) ──
+DeviceLogic();
+
+// ── 2. Feed liveness. The service bumps Pad.Watchdog every ~500 ms; the TON
+//       runs while the count is UNCHANGED, so expiry = the feed went stale/dead
+//       (same time-since-last-good-data idiom as the Modbus driver). ──
+_wdStale(IN := (Pad.Watchdog = _wdLast), PT := _feedTimeout);
+stsFeedAlive := NOT _wdStale.Q;
+IF Pad.Watchdog <> _wdLast THEN
+    _wdLast := Pad.Watchdog;
+END_IF
+
+stsConnected := Pad.Connected AND stsFeedAlive AND _enabled;
+stsActive    := inpActive AND stsConnected;
+
+// ── 3a. Buttons: gated pass-through — outputs mirror the pad ONLY while connected ──
+IF stsConnected THEN
+    stsBtnA      := Pad.BtnA;
+    stsBtnB      := Pad.BtnB;
+    stsBtnX      := Pad.BtnX;
+    stsBtnY      := Pad.BtnY;
+    stsBumpL     := Pad.BumpL;
+    stsBumpR     := Pad.BumpR;
+    stsStart     := Pad.Start;
+    stsBack      := Pad.Back;
+    stsThumbL    := Pad.ThumbL;
+    stsThumbR    := Pad.ThumbR;
+    stsDpadUp    := Pad.DpadUp;
+    stsDpadDown  := Pad.DpadDown;
+    stsDpadLeft  := Pad.DpadLeft;
+    stsDpadRight := Pad.DpadRight;
+ELSE
+    stsBtnA      := FALSE;
+    stsBtnB      := FALSE;
+    stsBtnX      := FALSE;
+    stsBtnY      := FALSE;
+    stsBumpL     := FALSE;
+    stsBumpR     := FALSE;
+    stsStart     := FALSE;
+    stsBack      := FALSE;
+    stsThumbL    := FALSE;
+    stsThumbR    := FALSE;
+    stsDpadUp    := FALSE;
+    stsDpadDown  := FALSE;
+    stsDpadLeft  := FALSE;
+    stsDpadRight := FALSE;
+END_IF
+
+// ── 3b. Analogs -> direction trigger + 0..100 % throttle (deriveAxis). Feed the
+//        gated raw value: 0.0 when not connected yields a fully-zeroed axis. ──
+IF stsConnected THEN
+    stsLeftStickX  := deriveAxis(Pad.StickLX, TRUE);
+    stsLeftStickY  := deriveAxis(Pad.StickLY, TRUE);
+    stsRightStickX := deriveAxis(Pad.StickRX, TRUE);
+    stsRightStickY := deriveAxis(Pad.StickRY, TRUE);
+    stsTriggerL    := deriveAxis(Pad.TrigL, FALSE);
+    stsTriggerR    := deriveAxis(Pad.TrigR, FALSE);
+ELSE
+    stsLeftStickX  := deriveAxis(0.0, TRUE);
+    stsLeftStickY  := deriveAxis(0.0, TRUE);
+    stsRightStickX := deriveAxis(0.0, TRUE);
+    stsRightStickY := deriveAxis(0.0, TRUE);
+    stsTriggerL    := deriveAxis(0.0, FALSE);
+    stsTriggerR    := deriveAxis(0.0, FALSE);
+END_IF
+
+// ── 4. Publish to HMI ──
+HMI.HMIbaseDevice        := HMIbaseDevice;
+HMI.Status.stsConnected  := stsConnected;
+HMI.Status.stsFeedAlive  := stsFeedAlive;
+HMI.Status.stsActive     := stsActive;
+HMI.Status.stsInService  := inpActive;   // supervision mirror — the IPC service READS this
+HMI.Status.stsBtnA       := stsBtnA;
+HMI.Status.stsBtnB       := stsBtnB;
+HMI.Status.stsBtnX       := stsBtnX;
+HMI.Status.stsBtnY       := stsBtnY;
+HMI.Status.stsBumpL      := stsBumpL;
+HMI.Status.stsBumpR      := stsBumpR;
+HMI.Status.stsStart      := stsStart;
+HMI.Status.stsBack       := stsBack;
+HMI.Status.stsThumbL     := stsThumbL;
+HMI.Status.stsThumbR     := stsThumbR;
+HMI.Status.stsDpadUp     := stsDpadUp;
+HMI.Status.stsDpadDown   := stsDpadDown;
+HMI.Status.stsDpadLeft   := stsDpadLeft;
+HMI.Status.stsDpadRight  := stsDpadRight;
+HMI.Status.stsLeftStickX  := stsLeftStickX;
+HMI.Status.stsLeftStickY  := stsLeftStickY;
+HMI.Status.stsRightStickX := stsRightStickX;
+HMI.Status.stsRightStickY := stsRightStickY;
+HMI.Status.stsTriggerL    := stsTriggerL;
+HMI.Status.stsTriggerR    := stsTriggerR;
+]]></ST>
+    </Implementation>
+    <Property Name="cfgFeedTimeout" Id="{dd0033a8-d68c-48a2-8211-a06b9306c34a}">
+      <Declaration><![CDATA[// Watchdog staleness threshold. Service beats ~500 ms; default 1.5 s = 3 missed beats.
+PROPERTY cfgFeedTimeout : TIME]]></Declaration>
+      <Get Name="Get" Id="{f01bdf40-2f99-4ded-9ac7-17aba902fbc9}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgFeedTimeout := _feedTimeout;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{8563aa24-5270-4a34-928b-ea7dfb04bb5e}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF cfgFeedTimeout > T#0MS THEN
+    _feedTimeout := cfgFeedTimeout;
+END_IF]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgActivateThreshold" Id="{f1cde978-8cd1-4be8-a54d-5d7b372c984c}">
+      <Declaration><![CDATA[// Deflection (0..1 fraction) a stick/trigger must exceed before Pos/Neg engage and
+// Throttle leaves 0. The service already applies XInput dead zones and rescales to
+// 0..1, so this is a small extra jog-arming margin (default 0.05 = 5 %). Property
+// only (no FB_Init param) so it never disturbs an existing instance declaration.
+PROPERTY cfgActivateThreshold : LREAL]]></Declaration>
+      <Get Name="Get" Id="{d87d5897-135d-449d-9cd1-b43733adc6f0}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgActivateThreshold := _activateThreshold;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{08936ecd-f6e4-4e85-9f2b-4377c293676d}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[IF cfgActivateThreshold >= 0.0 AND cfgActivateThreshold < 1.0 THEN
+    _activateThreshold := cfgActivateThreshold;
+END_IF]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="deriveAxis" Id="{93bc7dfb-e802-47b1-9aea-55da7b0aee5b}">
+      <Declaration><![CDATA[// Break one raw analog value into a DIRECTION trigger + a 0..100 % speed throttle.
+// allowNeg = TRUE for sticks (bidirectional), FALSE for triggers (+ only).
+METHOD PRIVATE deriveAxis : ST_XPendant_Axis
+VAR_INPUT
+    value    : LREAL;
+    allowNeg : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[deriveAxis.Value := value;
+deriveAxis.Pos   := value > _activateThreshold;
+deriveAxis.Neg   := allowNeg AND (value < (-1.0 * _activateThreshold));
+IF deriveAxis.Pos OR deriveAxis.Neg THEN
+    deriveAxis.Throttle := LIMIT(0.0, ABS(value) * 100.0, 100.0);
+ELSE
+    deriveAxis.Throttle := 0.0;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{ef844337-f573-410c-bfda-cb3125b3d8b8}">
+      <Declaration><![CDATA[METHOD FB_Init : BOOL
+VAR_INPUT
+    bInitRetains      : BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode       : BOOL; // TRUE: the instance will be copied to the copy code afterward (online change)
+    cfgDeviceName     : STRING;
+    cfgEnable         : BOOL;
+    cfgInitEventClass : BOOL;
+    cfgFeedTimeout    : TIME;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName     := cfgDeviceName;
+THIS^.cfgEnable         := cfgEnable;
+THIS^.cfgInitEventClass := cfgInitEventClass;
+IF cfgFeedTimeout > T#0MS THEN
+    _feedTimeout := cfgFeedTimeout;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="getHMIdata" Id="{2c8bf072-7150-41e8-8878-d3bcedd5eb86}">
+      <Declaration><![CDATA[// Standard accessor: expose the HMI struct to callers (house pattern, see fb_Axis).
+METHOD PUBLIC getHMIdata : ST_XPendant_HMI_Interface
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getHMIdata := HMI;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamTeach_HMI_Status" Id="{33b92952-c95f-4f6a-abae-e27f155ab39b}">
+    <Declaration><![CDATA[// PLC -> HMI status for one cam-teach instance.
+// sts* fields mirror the FB outputs plus curated readouts for the teach screen.
+TYPE ST_CamTeach_HMI_Status :
+STRUCT
+    // Lifecycle
+    stsState        : E_CamTeach_State;  // current state machine state (mirror of stsState output)
+    stsNumPoints    : INT;               // number of raw points in the working set
+    stsVerified     : BOOL;              // table downloaded AND read-back-verified (gates fb_CamCoupler)
+    stsBusy         : BOOL;              // file / download / verify in progress
+
+    // Error (own error model - this FB does not extend abs_fb_Device)
+    stsError        : BOOL;              // an operation failed; latched until reset
+    stsErrorText    : STRING;            // human-readable reason for stsError
+
+    // File I/O readout (mirrors the fb_CamTeachFile sub-FB)
+    stsFileBusy     : BOOL;              // async save/load in progress
+    stsFileName     : STRING;            // file name of the last/active save or load
+
+    // Last recorded pair - lets the HMI confirm what was just captured
+    stsLastMaster   : LREAL;            // [master unit] master of the most recent recorded point
+    stsLastSlave    : LREAL;            // [slave unit]  slave of the most recent recorded point
+
+    // Config echo - what the FB is actually configured with (read-back of cfg*/Config)
+    stsSlaveName    : STRING;            // name of the slave this table teaches
+    stsPeriodic     : BOOL;              // TRUE = periodic table (velocity wraps at the seam)
+    stsInterp       : E_CamTeach_Interp; // active interpolation strategy
+    stsSmoothWindow : INT;               // moving-average window on master column (0 = off)
+    stsTableId      : UDINT;             // NC motion-function table id bound to this instance
+
+    // Bounded points preview - a tail of the working set for HMI spot-checking.
+    // Intentionally NOT the full MAX_CAM_POINTS array: a 4096-deep LREAL array per
+    // instance is too heavy to symbol-link to the HMI, so only the last few points
+    // are exposed. stsPreviewCount says how many entries are valid (1..32).
+    stsPreviewCount : INT;                          // number of valid entries in stsPreview (0..32)
+    stsPreview      : ARRAY[1..32] OF ST_CamTeach_Point;  // tail (most recent) of the working set
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

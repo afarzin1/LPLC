@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="ST_ParsedSignal" Id="{569ede87-c53e-4b5c-b182-8e9e282ae5d2}">
+    <Declaration><![CDATA[TYPE ST_ParsedSignal :
+STRUCT
+    area                : E_MBArea;
+    baseAddress         : UINT;
+    bitIndex            : BYTE;
+    registerCount       : UINT;
+    dataType            : E_MBDataType;
+    valid               : BOOL;
+    isBitInRegister     : BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

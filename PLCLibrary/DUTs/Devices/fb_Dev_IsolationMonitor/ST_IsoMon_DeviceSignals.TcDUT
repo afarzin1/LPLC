@@ -1,0 +1,21 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_IsoMon_DeviceSignals" Id="{f7a84d8e-34f8-4a8a-93c5-daa5b778e108}">
+    <Declaration><![CDATA[TYPE ST_IsoMon_DeviceSignals :
+STRUCT
+	insulationResistance_kOhm : REAL;
+	minInsulationValue	 	: REAL;
+	voltageDCPlusToMinus 	: REAL;
+	voltageDCPlusToPE	 	: REAL;
+	voltageDCMinusToPE	 	: REAL;
+	couplingToSystem	 	: REAL;
+	couplingtoEarth		 	: REAL;
+	deviceError			 	: REAL;
+	deviceInactive			: REAL;
+	dcOffset				: REAL;
+	measurementQuality		: REAL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

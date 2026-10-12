@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamCoupler_HMI_Config" Id="{83925214-b450-4865-ade5-a26d18a50213}">
+    <Declaration><![CDATA[// HMI-editable / commissioning mirror of the cam relationship.
+// The live coupling values are wired to fb_CamCoupler VAR_INPUTs by the machine layer; this struct
+// mirrors the configured defaults for commissioning display/editing (seeded from the cfg* defaults).
+TYPE ST_CamCoupler_HMI_Config :
+STRUCT
+    masterOffset : LREAL;         // [master unit] default cam master offset
+    slaveOffset  : LREAL;         // [slave unit]  default cam slave offset
+    masterScale  : LREAL := 1.0;  // default master scaling
+    slaveScale   : LREAL := 1.0;  // default slave scaling
+    periodic     : BOOL;          // default MC_CamTableSelect periodicity
+    tableId      : UDINT;         // default NC cam table id
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

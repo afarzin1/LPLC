@@ -1,0 +1,380 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_Actuator" Id="{81e85ebb-2100-42fa-8869-8bedf307b98d}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_Actuator EXTENDS abs_fb_Device
+VAR_INPUT
+	IO_Input_Feedback : BOOL;
+END_VAR
+
+VAR_IN_OUT
+	IO_Output_Actuate : BOOL;
+END_VAR
+
+VAR
+	HMI						: ST_Actuator_HMI_Interface;
+	_setActuate 			: BOOL;
+	_retractOnFault			: BOOL;
+	_hasFeedback			: BOOL;
+	_faultH_onDelay			: TON;
+	_faultH_offDelay		: TON;
+	_faultH_OnDelay_Trigger	: BOOL;
+	_faultH_OffDelay_Trigger: BOOL;
+	_onDelay_time			: TIME;
+	_offDelay_time			: TIME;
+	_InvFeedback			: BOOL;
+	_actuatorFeedback		: BOOL;
+	_maintainAutoState		: BOOL;
+	_disableHMIControl		: BOOL;
+END_VAR
+
+VAR_OUTPUT
+	stsActuated : BOOL;
+
+END_VAR
+
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+Interlock.name := _DeviceName;
+Interlock(inpConfig := _dataInterlock);
+
+// Flip feedback if cofigured for inverted feedback
+IF _InvFeedback THEN
+	IF IO_Input_Feedback THEN
+		_actuatorFeedback := FALSE;
+	ELSE
+		_actuatorFeedback :=TRUE;
+	END_IF
+ELSE
+	IF IO_Input_Feedback THEN
+		_actuatorFeedback :=TRUE;
+	ELSE
+		_actuatorFeedback :=FALSE;
+	END_IF
+END_IF
+
+// If no IO based feedback, set actuation state for feedback
+IF _hasFeedback THEN
+	stsActuated := _actuatorFeedback;
+ELSE
+	stsActuated := _setActuate;
+END_IF
+
+// Check for timeouts
+FaultHandler(_actuatorFeedback);
+
+// Control via HMI if in manual
+// cmdActuate an cmdRetract methods only work in Auto, unless
+// device is configured for no manual control
+IF NOT _disableHMIControl THEN
+	IF NOT _inAuto THEN 
+		IF HMI.ocmdActuate THEN
+			cmdActuate();
+		ELSE
+			cmdRetract();
+		END_IF
+	ELSE
+		// if property set, change the HMI actuatoion toggle state so that
+		// transition from auto to manual does not change the state
+		// otherwise upon transition HMI will change state to whatever it was in manual last
+		IF _maintainAutoState THEN
+			HMI.ocmdActuate := _setActuate;
+		END_IF
+	END_IF
+END_IF
+// Configure retract on feedback
+IF stsFaulted AND _retractOnFault THEN
+	HMI.ocmdActuate := 0;
+	_setActuate		:= 0;
+END_IF
+
+// Log state changes
+IF _setActuate THEN
+	IO_output_actuate :=TRUE;
+	sendLog('Actuating ON',1);
+ELSE
+	IO_output_actuate :=FALSE;
+	sendLog('Actuating OFF',1);
+END_IF
+
+HMI.HMIbaseDevice := HMIbaseDevice;
+HMI.stsActuated   := stsActuated;
+HMI.setActuate    := _setActuate;
+
+
+
+
+]]></ST>
+    </Implementation>
+    <Folder Name="Privates" Id="{98a5be4d-699f-42e4-a6a5-0814ff6a062c}" />
+    <Property Name="cfgDeviceName" Id="{2aba6988-1e9a-49ec-be4d-c870e6164032}">
+      <Declaration><![CDATA[PROPERTY cfgDeviceName : string]]></Declaration>
+      <Get Name="Get" Id="{76d50d17-8d13-4ef8-8dc2-085e0561228b}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgDeviceName := _DeviceName;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{19205351-3140-4d8a-bea4-36b4987c7f42}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_DeviceName := cfgDeviceName;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgDisableHMIControl" Id="{6a47590d-e86b-4ea1-bec8-d054a068d0f8}">
+      <Declaration><![CDATA[PROPERTY cfgDisableHMIControl : BOOL]]></Declaration>
+      <Get Name="Get" Id="{bdebbfb4-23cf-4922-81ec-81865239ed10}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgDisableHMIControl := _disableHMIControl;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{5fabe481-e236-4694-9ab9-ddb5cd0b6aae}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_disableHMIControl := cfgDisableHMIControl;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgHasFeedback" Id="{6e651f8c-1b21-4f4d-9868-d1ace3f1d0ca}">
+      <Declaration><![CDATA[PROPERTY cfgHasFeedback : BOOL]]></Declaration>
+      <Get Name="Get" Id="{c7c1390b-d4b1-4e66-8872-22ebb11d73c9}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgHasFeedback := _hasFeedback;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{3a3f1ab7-e211-47e2-a854-ff9a34cbd1be}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_hasFeedback	:= cfgHasFeedback;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgInvFeedback" Id="{bd80d261-bdf7-4785-97c6-05fb89928191}">
+      <Declaration><![CDATA[PROPERTY PUBLIC cfgInvFeedback : Bool]]></Declaration>
+      <Get Name="Get" Id="{7027c690-2075-4984-8071-f53056d2d55e}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgInvFeedback := _InvFeedback;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{87ed1395-350e-49c2-b5bb-18a4482f8c88}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_InvFeedback := cfgInvFeedback;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgMaintainAutoState" Id="{6373a2c8-0ef1-491f-a176-7dd6c8964993}">
+      <Declaration><![CDATA[PROPERTY cfgMaintainAutoState : BOOL]]></Declaration>
+      <Get Name="Get" Id="{852e4d43-d893-4b31-abfb-f926ce93824f}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgMaintainAutoState	:= _maintainAutoState;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{0da50087-6028-4c91-8d46-307051213243}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_maintainAutoState := cfgMaintainAutoState;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgOffDelay" Id="{0605322d-9aa5-48dd-a138-12eb219aafbe}">
+      <Declaration><![CDATA[PROPERTY cfgOffDelay : TIME]]></Declaration>
+      <Get Name="Get" Id="{e82ca65e-b818-4216-bda5-e75bba3fef38}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgOffDelay := _offDelay_time;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{f82b13df-7f79-41ca-8253-659c448d5ac3}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_offDelay_time := cfgOffDelay;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgOnDelay" Id="{aab5577b-6b87-4620-9d52-95d00ea2e676}">
+      <Declaration><![CDATA[PROPERTY PUBLIC cfgOnDelay : Time]]></Declaration>
+      <Get Name="Get" Id="{3de0fb61-aec3-44dc-96ac-ff138be1c7ca}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgOnDelay := _onDelay_time;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{7af5c5a3-99e4-4728-b6ab-9656302c7602}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_OnDelay_time := cfgOnDelay;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Property Name="cfgRetractOnFault" Id="{27f75573-9d03-472c-9d37-97a6875b6a41}">
+      <Declaration><![CDATA[PROPERTY cfgRetractOnFault : bool]]></Declaration>
+      <Get Name="Get" Id="{d64de5a2-24bf-4d2c-bf67-ab41b582a9ec}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgRetractOnFault := _retractOnFault;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{e0248c55-875c-4cbc-9384-469b45799dad}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_retractOnFault := cfgRetractOnFault;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdActuate" Id="{0e9fda91-8d5f-4566-a5c5-acf49981b4f4}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdActuate : BOOL
+VAR_INPUT
+	
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF Interlock.outInterlockOK AND NOT stsFaulted THEN
+	_setActuate :=TRUE;
+END_IF
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{11ab5455-1962-4f91-aeda-b84e24d3ac25}">
+      <Declaration><![CDATA[METHOD cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsFaulted THEN
+	setFault(0,'');
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdRetract" Id="{a721761f-2f78-4f45-88de-6492373238ef}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdRetract : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Retracting (de-energising) is always allowed. It used to require the interlock to be met,
+// so an actuator whose interlock dropped could not be switched off, by the operator or by code,
+// unless cfgRetractOnFault happened to be set.
+_setActuate := FALSE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FaultHandler" Id="{a88fc260-ac03-4357-9f5c-cfcc4dfecdaf}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE FaultHandler : BOOL
+VAR_INPUT
+	inpFeedback : BOOL; 
+	
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[//if setActuate, set timer. If timer done and no feedback, then fault
+IF (_onDelay_Time <> T#0S) AND _hasfeedback THEN
+	_faultH_onDelay(IN:=_faultH_OnDelay_Trigger,PT:=_onDelay_time);
+	IF (NOT stsFaulted) AND _setActuate THEN
+		_faultH_OnDelay_Trigger := TRUE;
+		IF _faultH_onDelay.Q AND NOT _actuatorFeedback THEN
+			setFault(1,'actuator feedback missing.');
+		END_IF
+	ELSE
+		_faultH_OnDelay_Trigger := FALSE;
+	END_IF
+END_IF
+
+IF (_offDelay_Time <> T#0S) AND _hasfeedback THEN
+	_faultH_offDelay(IN:=_faultH_OffDelay_Trigger,PT:=_offDelay_time);
+	IF (NOT stsFaulted) AND NOT(_setActuate) THEN
+		_faultH_OffDelay_Trigger := TRUE;
+		IF _faultH_offDelay.Q AND _actuatorFeedback THEN
+			setFault(1,'Feedback present when not actuated.');
+		END_IF
+	ELSE
+		_faultH_OffDelay_Trigger := FALSE;
+	END_IF
+END_IF
+
+
+//IF _actuatorFeedback AND NOT(_setActuate) and _hasFeedback THEN
+//	setFault(1,'Feedback present when not actuated');
+//END_IF
+
+//if not actuated but feedback is in, actuator is stuck closed
+//+TODO
+
+//If enabled and cmdActuated and lost interlock, then fault
+IF NOT stsFaulted AND _setActuate THEN
+	IF NOT interlock.outInterlockOK THEN
+		setFault(1,CONCAT('I_NOK - ',Interlock.stsFirstOut));
+	END_IF
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{7407b03c-e4e5-4437-a988-6afe951e456e}" FolderPath="Privates\">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init: BOOL
+VAR_INPUT
+    bInitRetains: BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode: BOOL;  // TRUE: the instance will be copied to the copy code afterward (online change)
+	
+	cfgDeviceName 		: STRING;
+	cfgEnable 			: BOOL;
+	cfgInitEventClass	: BOOL;
+	cfgOnDelay 			: TIME;
+	cfgOffDelay			: TIME;
+	cfgRetractOnFault 	: BOOL;
+	cfgInvFeedback		: BOOL; 
+	cfgHasFeedback		: BOOL;
+
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 		:= 		cfgDeviceName; 
+THIS^.cfgEnable				:=		cfgEnable;
+THIS^.cfgInitEventClass		:= 		cfgInitEventClass;		
+THIS^.cfgOnDelay 			:= 		cfgOnDelay; 
+THIS^.cfgOffDelay			:=		cfgOffDelay;			
+THIS^.cfgRetractOnFault		:=      cfgRetractOnFault;
+THIS^.cfgInvFeedback		:=		cfgInvFeedback;
+THIS^.cfgHasFeedback		:=		cfgHasFeedback;
+
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

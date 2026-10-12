@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_CamTeach_Interp" Id="{0794eda1-2fc4-447f-865e-a5e055910e1c}">
+    <Declaration><![CDATA[// Interpolation strategy used by cmdConvert when building the motion function
+// from the raw taught points. Stored raw, so this may change and be regenerated.
+TYPE E_CamTeach_Interp :
+(
+    eLinear  := 0,   // straight segments between points (MOTIONFUNCTYPE_LINEAR)
+    eCubicC1 := 1    // POLYNOM3 + central-difference slope -> C1-smooth cubic from position-only teaching
+) INT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

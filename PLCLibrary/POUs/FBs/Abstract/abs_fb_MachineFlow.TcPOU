@@ -1,0 +1,1040 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="abs_fb_MachineFlow" Id="{25a90749-5412-41cc-ab55-c4e143997002}" SpecialFunc="None">
+    <Declaration><![CDATA[(*  abs_fb_MachineFlow - parallel machine-sequence composer (SFC-style token engine)
+    on top of abs_fb_stateDevice.
+
+    A derived FB declares its sequence as DATA in defineFlow() - addStep() for the
+    steps, flow()/flowSplit2..3()/flowJoin2..3() (or addTransition() + arcFrom()/
+    arcTo() for other shapes) for the relationships - and writes the step BODIES in
+    stepActions(), a CASE over the step ids. The engine holds a token per active
+    step: a transition fires when ALL its source steps are active AND done AND its
+    permissive is TRUE; firing consumes the source tokens and activates all targets.
+    Parallel branches, joins, choices (two transitions from one step with opposing
+    permissives) and loops are therefore plain data - no flags, no duplicated states.
+
+    Lifecycle (run/abort/retry/reset, interlocks, alarms, HMI commands) is inherited
+    unchanged from abs_fb_stateDevice; the base state variable receives the
+    transition-firing counter, so the base step timer measures time since the last
+    firing (a stall watchdog). Per-step elapsed/timeout clocks run in the engine
+    (parallel-safe); a step timeout faults with retry allowed - retry resumes with
+    the timed-out step's clock cleared and all tokens in place.
+
+    Usage:
+        FUNCTION_BLOCK fb_SEQ_Wash EXTENDS abs_fb_MachineFlow
+        Body (first line):       flowLogic();
+        STEP IDS ARE `VAR CONSTANT`, NOT VAR. stepActions() dispatches on them with
+        CASE, and IEC 61131-3 requires CASE labels to be CONSTANT - a runtime VAR
+        holding addStep()'s return value cannot be a label and will not compile. So
+        declare them as constants with explicit literal values, `c`-prefixed per
+        CONVENTIONS §2 (never a type prefix - `cStepFill`, never `sFill`):
+
+            VAR CONSTANT
+                cStepFill : INT := 1;   // ids are assigned in addStep() CALL ORDER
+                cStepHeat : INT := 2;
+                cStepStir : INT := 3;
+            END_VAR
+
+        The constants and the addStep() order must agree, and nothing enforces it -
+        inserting a step in the middle silently shifts every later id. addStep()
+        returns the id it actually assigned, so guard it:
+
+        Override defineFlow():   IF addStep('Fill tank', T#30S) <> cStepFill THEN
+                                     setCfgError('flow: step id drift'); END_IF
+                                 ...
+                                 setInitialStep(cStepFill);
+                                 flowSplit2(cStepFill, cStepHeat, cStepStir);
+        Override stepActions():  CASE inpStepId OF cStepFill: ... stepDone(cStepFill); ...
+
+        Transition ids are NOT dispatched on, so they may be plain VAR (`_transLoop`)
+        holding what flow()/addTransition() returned - setPermissive() takes a value.
+        A step completes via stepDone(id); a DONE step with no outgoing transition
+        completes the sequence (setStateLogicDone). Override actionsAbort() for a
+        controlled abort ramp (the default clears the tokens and finishes at once).
+
+    Determinism: transitions are evaluated in ascending id order each scan; firing
+    consumes tokens, so two transitions competing for one token resolve to the lower
+    id. A newly activated step always executes at least one scan before any outgoing
+    transition can fire.
+
+    SELF-CONTAINED (CONVENTIONS §5): this FB references no GVL and holds no pointer
+    to anything it does not own. A transition's gate is ONE BOOL - where the gate is
+    really an fb_Permissive, the machine ANDs stsPermissiveOK in at the setPermissive()
+    call, the same way it reports a step with stepDone(). The engine knows only tokens
+    and booleans, which is all a token engine should know.
+
+    Capacities are LITERALS, repeated in the array bounds and in every loop that walks
+    them - keep those edits together:
+      * 64 steps / 64 transitions. 64 is not arbitrary and is the one number NOT free
+        to change: the HMI publishes the active/done/visited/fired/permissive masks as
+        2 x UDINT (lo = 1..32, hi = 33..64), so raising it breaks that contract and the
+        lhmi renderer with it. Widening means new mask members, not a bigger bound.
+      * 4 sources / 4 targets per transition (ST_MachineFlow_Transition) - the widest
+        AND-split or AND-join a transition can express.
+      * 4095-byte stsFlowDef, the exported definition JSON. Truncation is reported, not
+        silent (see actionsRun); step and transition NAMES are what consume it.
+
+    HMI: HMIflow (ST_MachineFlow_HMI_Status) carries the token + permissive masks,
+    the firing counter and the STATIC definition JSON including each transition's
+    condition text (read once, on demand - ADS only, not for cyclic transport); the
+    inherited HMIstateLogic carries state/commands. While the sequence runs,
+    stsStepDescription is ENGINE-OWNED: the joined active-step names. Name every
+    permissive-gated transition - the name is the operator's answer to 'why is this
+    step stuck'. Step/transition names must not contain double quotes (def JSON).
+*)
+FUNCTION_BLOCK ABSTRACT abs_fb_MachineFlow EXTENDS abs_fb_stateDevice
+VAR_OUTPUT
+    stsActiveNames  : STRING(255);   // ' + '-joined names of the active steps
+END_VAR
+VAR
+    HMIflow         : ST_MachineFlow_HMI_Status;
+    _steps          : ARRAY[1..64] OF ST_MachineFlow_Step;
+    _trans          : ARRAY[1..64] OF ST_MachineFlow_Transition;
+    _stepTimers     : ARRAY[1..64] OF TON;
+    _initialSteps   : ARRAY[1..64] OF BOOL;
+    _stepCount      : INT;
+    _transCount     : INT;
+    _initialCount   : INT;
+    _defined        : BOOL;
+    _fireCount      : INT;    // the base state variable: transition firings this run
+    _lastFired      : INT;
+    _timeoutStep    : INT;    // step that raised the running step-timeout fault
+    _wasRunning     : BOOL;
+    _wasFaulted     : BOOL;
+    _defLen         : INT;
+    _defOverflow    : BOOL;
+    _faultedStep    : INT;   // step that raised (or timed out into) the active fault; 0 = none
+    _cfgError       : BOOL;
+    _cfgErrorText   : STRING(255);
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[]]></ST>
+    </Implementation>
+    <Folder Name="flowBuilder" Id="{7ae9374c-9c3b-4520-8bff-64cbd42159ca}" />
+    <Folder Name="flowRuntime" Id="{9d5c2015-1604-4168-a81c-fac4b8ebc62c}" />
+    <Folder Name="Privates" Id="{414c5861-c8e1-4158-872e-8aa971a8e5e9}" />
+    <Method Name="actionsAbort" Id="{ba4b5125-0d60-460c-9cae-fa8d8cd8e81b}">
+      <Declaration><![CDATA[// Default abort: drop all tokens and finish immediately. Override for a
+// controlled ramp-down (make devices safe, then call setStateDoneAborting()).
+METHOD PROTECTED actionsAbort : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[clearTokens();
+setStateDoneAborting();
+actionsAbort := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="actionsReset" Id="{99daa9d4-d9e3-4537-a38d-6c5150d03818}">
+      <Declaration><![CDATA[METHOD PROTECTED actionsReset : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    t : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[clearTokens();
+FOR t := 1 TO _transCount DO
+    _trans[t].permissive := TRUE;
+    _trans[t].fired := FALSE;
+END_FOR
+_fireCount := 0;
+_lastFired := 0;
+_timeoutStep := 0;
+_faultedStep := 0;
+actionsReset := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="actionsRun" Id="{3cbce039-b449-4145-a6db-b08b54461d5f}">
+      <Declaration><![CDATA[// The engine scan: per-step clocks/timeouts -> step bodies (once per active
+// step) -> transition firing -> done detection. Runs every cycle while Running.
+METHOD PROTECTED actionsRun : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _cfgError THEN
+    setStateLogicFault(_cfgErrorText, FALSE, 0);
+    RETURN;
+END_IF
+IF _defOverflow THEN
+    _defOverflow := FALSE;
+    sendWarning('MachineFlow: definition JSON truncated - shorten step/transition names or widen stsFlowDef (4095)');
+END_IF
+
+runStepTimers();
+IF stsFaulted THEN
+    RETURN;   // a step timeout faulted this scan
+END_IF
+dispatchSteps();
+fireTransitions();
+checkFlowDone();
+actionsRun := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="addStep" Id="{e7ac08b2-9c2b-4fd7-9814-995d0632e587}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// Declare a step (call from defineFlow()). Returns the step id used by
+// stepActions()/stepDone()/the transitions; 0 on capacity error.
+// inpDescription = WHAT the step does, shown in the HMI's step popup.
+METHOD PROTECTED addStep : INT
+VAR_INPUT
+    inpName        : STRING(63);
+    inpTimeout     : TIME := T#0S;   // T#0S = no timeout; runtime override: setStepTimeout()
+    inpDescription : STRING(125) := '';
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _stepCount >= 64 THEN
+    setCfgError('MachineFlow: addStep() capacity exceeded');
+    addStep := 0;
+    RETURN;
+END_IF
+_stepCount := _stepCount + 1;
+_steps[_stepCount].name := inpName;
+_steps[_stepCount].description := inpDescription;
+_steps[_stepCount].timeout := inpTimeout;
+addStep := _stepCount;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="addTransition" Id="{e1f46132-d311-4d37-b0fc-39c406e7354c}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// Allocate an empty transition (call from defineFlow()); attach steps with
+// arcFrom()/arcTo(). The flow*() helpers cover the common shapes.
+// inpName is the CONDITION text the HMI shows on the transition bar
+// (e.g. 'cycles < 3') - name every permissive so a held gate explains itself.
+METHOD PROTECTED addTransition : INT
+VAR_INPUT
+    inpName : STRING(63) := '';
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _transCount >= 64 THEN
+    setCfgError('MachineFlow: addTransition() capacity exceeded');
+    addTransition := 0;
+    RETURN;
+END_IF
+_transCount := _transCount + 1;
+_trans[_transCount].name := inpName;
+addTransition := _transCount;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="appendDef" Id="{3a96c2d9-bfd5-4fae-82cc-ce76c7185434}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE appendDef : BOOL
+VAR_INPUT
+    inpText : STRING(255);
+END_VAR
+VAR
+    txtLen : INT;
+    k      : INT;
+    pSrc   : POINTER TO BYTE;
+    pDst   : POINTER TO BYTE;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[txtLen := LEN(inpText);
+IF txtLen = 0 THEN
+    appendDef := TRUE;
+    RETURN;
+END_IF
+IF _defLen + txtLen >= 4095 THEN
+    _defOverflow := TRUE;
+    RETURN;
+END_IF
+pSrc := ADR(inpText);
+pDst := ADR(HMIflow.stsFlowDef);
+pDst := pDst + _defLen;
+FOR k := 0 TO txtLen - 1 DO
+    pDst[k] := pSrc[k];
+END_FOR
+_defLen := _defLen + txtLen;
+appendDef := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="arcFrom" Id="{f9720fde-5aa9-4bb5-b048-c3336b9e0a4d}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// Add a SOURCE step to a transition (all sources must be done for it to fire).
+METHOD PROTECTED arcFrom : BOOL
+VAR_INPUT
+    inpTrans  : INT;
+    inpStepId : INT;
+END_VAR
+VAR
+    a : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpTrans < 1 OR inpTrans > _transCount OR inpStepId < 1 OR inpStepId > 64 THEN
+    setCfgError('MachineFlow: arcFrom() bad transition/step id');
+    RETURN;
+END_IF
+FOR a := 1 TO 4 DO
+    IF _trans[inpTrans].sources[a] = 0 THEN
+        _trans[inpTrans].sources[a] := inpStepId;
+        arcFrom := TRUE;
+        RETURN;
+    END_IF
+END_FOR
+setCfgError('MachineFlow: arcFrom() arc capacity exceeded');
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="arcTo" Id="{e948893b-7c60-41bb-bc31-1fa4b89fc0c4}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// Add a TARGET step to a transition (all targets activate when it fires).
+METHOD PROTECTED arcTo : BOOL
+VAR_INPUT
+    inpTrans  : INT;
+    inpStepId : INT;
+END_VAR
+VAR
+    a : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpTrans < 1 OR inpTrans > _transCount OR inpStepId < 1 OR inpStepId > 64 THEN
+    setCfgError('MachineFlow: arcTo() bad transition/step id');
+    RETURN;
+END_IF
+FOR a := 1 TO 4 DO
+    IF _trans[inpTrans].targets[a] = 0 THEN
+        _trans[inpTrans].targets[a] := inpStepId;
+        arcTo := TRUE;
+        RETURN;
+    END_IF
+END_FOR
+setCfgError('MachineFlow: arcTo() arc capacity exceeded');
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="buildDefJson" Id="{737d46ea-7c35-4365-80ac-2ea338ba7e85}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE buildDefJson : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    i, t, a, sid : INT;
+    firstArc   : BOOL;
+    pEnd       : POINTER TO BYTE;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_defLen := 0;
+_defOverflow := FALSE;
+appendDef('{"v":1,"steps":[');
+FOR i := 1 TO _stepCount DO
+    IF i > 1 THEN
+        appendDef(',');
+    END_IF
+    appendDef('{"i":');
+    appendDef(INT_TO_STRING(i));
+    appendDef(',"n":"');
+    appendDef(_steps[i].name);
+    appendDef('"');
+    IF _steps[i].description <> '' THEN
+        appendDef(',"d":"');
+        appendDef(_steps[i].description);
+        appendDef('"');
+    END_IF
+    // Step TIMEOUT, in ms, and only when one is configured. Static config, so it belongs in the def
+    // (read once) rather than in a cyclic member: 64 timeouts polled every scan would cost real
+    // bandwidth for numbers that never change. Omitted when T#0S so an untimed step costs 0 bytes of
+    // the 4095 - most steps have no timeout.
+    IF _steps[i].timeout > T#0S THEN
+        appendDef(',"to":');
+        appendDef(UDINT_TO_STRING(TIME_TO_UDINT(_steps[i].timeout)));
+    END_IF
+    IF _initialSteps[i] THEN
+        appendDef(',"init":1');
+    END_IF
+    appendDef('}');
+END_FOR
+appendDef('],"trans":[');
+FOR t := 1 TO _transCount DO
+    IF t > 1 THEN
+        appendDef(',');
+    END_IF
+    appendDef('{"id":');
+    appendDef(INT_TO_STRING(t));
+    IF _trans[t].name <> '' THEN
+        appendDef(',"n":"');
+        appendDef(_trans[t].name);
+        appendDef('"');
+    END_IF
+    appendDef(',"s":[');
+    firstArc := TRUE;
+    FOR a := 1 TO 4 DO
+        sid := _trans[t].sources[a];
+        IF sid > 0 THEN
+            IF NOT firstArc THEN
+                appendDef(',');
+            END_IF
+            appendDef(INT_TO_STRING(sid));
+            firstArc := FALSE;
+        END_IF
+    END_FOR
+    appendDef('],"t":[');
+    firstArc := TRUE;
+    FOR a := 1 TO 4 DO
+        sid := _trans[t].targets[a];
+        IF sid > 0 THEN
+            IF NOT firstArc THEN
+                appendDef(',');
+            END_IF
+            appendDef(INT_TO_STRING(sid));
+            firstArc := FALSE;
+        END_IF
+    END_FOR
+    appendDef(']}');
+END_FOR
+appendDef(']}');
+pEnd := ADR(HMIflow.stsFlowDef);
+pEnd := pEnd + _defLen;
+pEnd^ := 0;
+buildDefJson := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="checkFlowDone" Id="{57cb421d-d040-49c4-9112-011b669dbaea}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE checkFlowDone : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    i               : INT;
+    anyActive       : BOOL;
+    allTerminalDone : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[allTerminalDone := TRUE;
+FOR i := 1 TO _stepCount DO
+    IF _steps[i].active THEN
+        anyActive := TRUE;
+        IF NOT _steps[i].done OR _steps[i].hasOutgoing THEN
+            allTerminalDone := FALSE;
+        END_IF
+    END_IF
+END_FOR
+IF NOT anyActive THEN
+    setStateLogicFault('MachineFlow: no active steps while running (check the flow definition)', FALSE, 0);
+ELSIF allTerminalDone THEN
+    setStateLogicDone();
+END_IF
+checkFlowDone := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="clearTokens" Id="{e71ff428-80d1-4afe-be09-b564253632b2}" FolderPath="Privates\">
+      <Declaration><![CDATA[// Drop every token (and this run's history). PROTECTED because overriding actionsAbort() for a
+// controlled ramp-down is a documented extension point, and the default it replaces ends with
+// clearTokens() + setStateDoneAborting() - a subclass could not reproduce that while this was
+// PRIVATE. Safe to expose: clearing mid-RUN is caught on the next scan by checkFlowDone, which
+// faults with 'no active steps while running' rather than hanging silently, and during an abort
+// actionsRun() is not running so the legitimate use never trips it.
+METHOD PROTECTED clearTokens : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    i : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR i := 1 TO 64 DO
+    _steps[i].active := FALSE;
+    _steps[i].done := FALSE;
+    _steps[i].visited := FALSE;
+    _steps[i].entered := FALSE;
+    _steps[i].kickTimer := TRUE;
+END_FOR
+clearTokens := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="defineFlow" Id="{cb032ed5-5433-46c1-abdf-c004ce83030c}">
+      <Declaration><![CDATA[// Override: declare the sequence graph - RELATIONSHIPS only, no step logic.
+// addStep() the steps, then connect them with flow()/flowSplit2..3()/
+// flowJoin2..3() (or addTransition() + arcFrom()/arcTo() for other shapes).
+// Called once, before the first scan. Default initial step: the first declared
+// one (override with setInitialStep(); call it more than once for parallel starts).
+METHOD PROTECTED defineFlow : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="dispatchSteps" Id="{29885c72-cd4c-4726-8b50-f542033af305}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE dispatchSteps : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    i         : INT;
+    firstScan : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR i := 1 TO _stepCount DO
+    IF _steps[i].active THEN
+        firstScan := NOT _steps[i].entered;
+        _steps[i].entered := TRUE;
+        stepActions(inpStepId := i, inpFirstScan := firstScan);
+        // ATTRIBUTE A STEP-RAISED FAULT TO ITS STEP. A step body may check a condition and call
+        // setFault() on the inherited state device: that faults the parent state machine, but the
+        // fault also belongs to THIS step, and the HMI needs to know which one so the flow chart can
+        // colour it red. Checked right after the body runs, and only claimed if nothing else has -
+        // a step timeout (runStepTimers) already sets _faultedStep, and the first claim wins so a
+        // later step in the same scan cannot steal the attribution.
+        IF stsFaulted AND _faultedStep = 0 THEN
+            _faultedStep := i;
+        END_IF
+    END_IF
+END_FOR
+dispatchSteps := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="finalizeFlow" Id="{8ad43b3c-1c37-4e39-9de8-cf191aadd296}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE finalizeFlow : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    t, a, sid : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// default initial step: the first declared one
+IF _initialCount = 0 AND _stepCount > 0 THEN
+    _initialSteps[1] := TRUE;
+    _initialCount := 1;
+END_IF
+// derive hasOutgoing + validate every arc against the declared steps
+FOR t := 1 TO _transCount DO
+    FOR a := 1 TO 4 DO
+        sid := _trans[t].sources[a];
+        IF sid > 0 THEN
+            IF sid > _stepCount THEN
+                setCfgError('MachineFlow: a transition source references an unknown step');
+            ELSE
+                _steps[sid].hasOutgoing := TRUE;
+            END_IF
+        END_IF
+        sid := _trans[t].targets[a];
+        IF sid > _stepCount THEN
+            setCfgError('MachineFlow: a transition target references an unknown step');
+        END_IF
+    END_FOR
+END_FOR
+buildDefJson();
+HMIflow.stsStepCount := _stepCount;
+HMIflow.stsTransCount := _transCount;
+finalizeFlow := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="fireTransitions" Id="{7e0a5ae5-5dac-48c7-aaaf-8f3f099cc196}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE fireTransitions : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    t, a, sid   : INT;
+    enabled   : BOOL;
+    hasSource : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR t := 1 TO _transCount DO
+    // A transition gate is ONE BOOL, and the engine knows nothing else about it. Where the gate is a
+    // full fb_Permissive, the machine ANDs it in at the call site - setPermissive(t,
+    // PermUnload.stsPermissiveOK) - exactly as it reports a step with stepDone(id). See the header:
+    // this engine holds no reference to anything outside itself.
+    enabled := _trans[t].permissive;
+    hasSource := FALSE;
+    FOR a := 1 TO 4 DO
+        sid := _trans[t].sources[a];
+        IF sid > 0 THEN
+            hasSource := TRUE;
+            IF NOT (_steps[sid].active AND _steps[sid].done) THEN
+                enabled := FALSE;
+            END_IF
+        END_IF
+    END_FOR
+    IF enabled AND hasSource THEN
+        // consume every source token first (a self-loop re-places below)
+        FOR a := 1 TO 4 DO
+            sid := _trans[t].sources[a];
+            IF sid > 0 THEN
+                _steps[sid].active := FALSE;
+                _steps[sid].done := FALSE;
+                // Consuming a token IS the moment a step completed. Recorded because the token is
+                // gone next scan, leaving nothing to distinguish "finished" from "never ran" - which
+                // the flow chart colours differently.
+                _steps[sid].visited := TRUE;
+            END_IF
+        END_FOR
+        FOR a := 1 TO 4 DO
+            sid := _trans[t].targets[a];
+            IF sid > 0 THEN
+                placeToken(sid);
+            END_IF
+        END_FOR
+        _lastFired := t;
+        _trans[t].fired := TRUE;   // this run; _lastFired only ever holds the newest
+        _fireCount := _fireCount + 1;
+    END_IF
+END_FOR
+fireTransitions := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="flow" Id="{9eae2287-a065-4375-b9a7-11aa1f5effb1}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// Simple arrow: source done -> target activates. Returns the transition id
+// (keep it to attach a runtime permissive via setPermissive(), e.g. for loop-back edges).
+// inpName = the condition text shown on the HMI bar.
+METHOD PROTECTED flow : INT
+VAR_INPUT
+    inpFrom : INT;
+    inpTo   : INT;
+    inpName : STRING(63) := '';
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[flow := addTransition(inpName := inpName);
+IF flow = 0 THEN
+    RETURN;
+END_IF
+arcFrom(inpTrans := flow, inpStepId := inpFrom);
+arcTo(inpTrans := flow, inpStepId := inpTo);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="flowJoin2" Id="{b966260c-5420-49d1-8a80-00e48764cb29}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// AND-convergence: fires when BOTH sources are done; activates the target.
+METHOD PROTECTED flowJoin2 : INT
+VAR_INPUT
+    inpFrom1 : INT;
+    inpFrom2 : INT;
+    inpTo    : INT;
+    inpName  : STRING(63) := '';
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[flowJoin2 := addTransition(inpName := inpName);
+IF flowJoin2 = 0 THEN
+    RETURN;
+END_IF
+arcFrom(inpTrans := flowJoin2, inpStepId := inpFrom1);
+arcFrom(inpTrans := flowJoin2, inpStepId := inpFrom2);
+arcTo(inpTrans := flowJoin2, inpStepId := inpTo);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="flowJoin3" Id="{52896894-2b9f-4f4b-a419-680f01545d1e}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// AND-convergence: fires when ALL THREE sources are done; activates the target.
+METHOD PROTECTED flowJoin3 : INT
+VAR_INPUT
+    inpFrom1 : INT;
+    inpFrom2 : INT;
+    inpFrom3 : INT;
+    inpTo    : INT;
+    inpName  : STRING(63) := '';
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[flowJoin3 := addTransition(inpName := inpName);
+IF flowJoin3 = 0 THEN
+    RETURN;
+END_IF
+arcFrom(inpTrans := flowJoin3, inpStepId := inpFrom1);
+arcFrom(inpTrans := flowJoin3, inpStepId := inpFrom2);
+arcFrom(inpTrans := flowJoin3, inpStepId := inpFrom3);
+arcTo(inpTrans := flowJoin3, inpStepId := inpTo);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="flowLogic" Id="{b84fd3d9-1365-43f6-9a41-32e8e9e50fae}">
+      <Declaration><![CDATA[// Call as the FIRST line of the derived FB's body (like DeviceLogic() in
+// abs_fb_Device). Builds the graph once, handles run/resume edges, then runs
+// the inherited state logic (which calls actionsRun = the engine scan).
+METHOD PROTECTED flowLogic : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF NOT _defined THEN
+    _defined := TRUE;
+    defineFlow();
+    finalizeFlow();
+END_IF
+
+// Run/resume edge: a fresh run seeds the initial tokens; a retry-resume keeps
+// the tokens in place and only restarts the timed-out step's clock.
+IF stsRunning AND NOT _wasRunning THEN
+    IF _wasFaulted THEN
+        IF _timeoutStep > 0 THEN
+            _steps[_timeoutStep].kickTimer := TRUE;
+            _timeoutStep := 0;
+_faultedStep := 0;
+        END_IF
+    ELSE
+        seedTokens();
+    END_IF
+END_IF
+_wasRunning := stsRunning;
+_wasFaulted := stsFaulted;
+
+stateLogic(ADR(_fireCount));
+publishHMI();
+flowLogic := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="flowSplit2" Id="{f7b4bf83-634f-43b3-abf4-99d3bdf235a1}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// AND-divergence: source done -> BOTH targets activate (parallel branches).
+METHOD PROTECTED flowSplit2 : INT
+VAR_INPUT
+    inpFrom : INT;
+    inpTo1  : INT;
+    inpTo2  : INT;
+    inpName : STRING(63) := '';
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[flowSplit2 := flow(inpFrom := inpFrom, inpTo := inpTo1, inpName := inpName);
+IF flowSplit2 = 0 THEN
+    RETURN;
+END_IF
+arcTo(inpTrans := flowSplit2, inpStepId := inpTo2);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="flowSplit3" Id="{8b910b48-f04f-48a5-b97c-bfba88a6f918}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// AND-divergence: source done -> ALL THREE targets activate (parallel branches).
+METHOD PROTECTED flowSplit3 : INT
+VAR_INPUT
+    inpFrom : INT;
+    inpTo1  : INT;
+    inpTo2  : INT;
+    inpTo3  : INT;
+    inpName : STRING(63) := '';
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[flowSplit3 := flow(inpFrom := inpFrom, inpTo := inpTo1, inpName := inpName);
+IF flowSplit3 = 0 THEN
+    RETURN;
+END_IF
+arcTo(inpTrans := flowSplit3, inpStepId := inpTo2);
+arcTo(inpTrans := flowSplit3, inpStepId := inpTo3);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="getFlowHMIdata" Id="{54890c2c-d0bc-4142-8837-18c665828b26}">
+      <Declaration><![CDATA[METHOD PUBLIC getFlowHMIdata : ST_MachineFlow_HMI_Status
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getFlowHMIdata := HMIflow;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="placeToken" Id="{e4889f10-40aa-4317-91ec-55c7088989bb}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE placeToken : BOOL
+VAR_INPUT
+    inpStepId : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_steps[inpStepId].active := TRUE;
+_steps[inpStepId].done := FALSE;
+_steps[inpStepId].entered := FALSE;
+_steps[inpStepId].kickTimer := TRUE;   // restart the elapsed clock (also on re-entry)
+placeToken := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="publishHMI" Id="{35ccff2f-cf60-4cf6-873b-1e92a6f10c06}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE publishHMI : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    i     : INT;
+    t     : INT;
+    lo    : UDINT;
+    hi    : UDINT;
+    dLo   : UDINT;
+    dHi   : UDINT;
+    pLo   : UDINT;
+    pHi   : UDINT;
+    vLo   : UDINT;
+    vHi   : UDINT;
+    fLo   : UDINT;
+    fHi   : UDINT;
+    names : STRING(255);
+    n     : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR i := 1 TO _stepCount DO
+    IF _steps[i].active THEN
+        IF i <= 32 THEN
+            lo := lo OR SHL(TO_UDINT(1), i - 1);
+            IF _steps[i].done THEN
+                dLo := dLo OR SHL(TO_UDINT(1), i - 1);
+            END_IF
+        ELSE
+            hi := hi OR SHL(TO_UDINT(1), i - 33);
+            IF _steps[i].done THEN
+                dHi := dHi OR SHL(TO_UDINT(1), i - 33);
+            END_IF
+        END_IF
+        IF n > 0 THEN
+            names := CONCAT(names, ' + ');
+        END_IF
+        names := CONCAT(names, _steps[i].name);
+        n := n + 1;
+    END_IF
+    // Outside the .active guard on purpose: a COMPLETED step has no token, so this bit is exactly
+    // the information the active mask cannot carry.
+    IF _steps[i].visited THEN
+        IF i <= 32 THEN
+            vLo := vLo OR SHL(TO_UDINT(1), i - 1);
+        ELSE
+            vHi := vHi OR SHL(TO_UDINT(1), i - 33);
+        END_IF
+    END_IF
+END_FOR
+FOR t := 1 TO _transCount DO
+    // This mask IS the effective gate, because the boolean is: whatever ANDs into a transition's
+    // permissive - a plain condition, an fb_Permissive's stsPermissiveOK, both - the machine ANDs in
+    // before calling setPermissive(). Reporting a ready gate on a sequence that cannot advance would
+    // be the exact symptom an operator is using the flow chart to diagnose.
+    IF _trans[t].permissive THEN
+        IF t <= 32 THEN
+            pLo := pLo OR SHL(TO_UDINT(1), t - 1);
+        ELSE
+            pHi := pHi OR SHL(TO_UDINT(1), t - 33);
+        END_IF
+    END_IF
+    IF _trans[t].fired THEN
+        IF t <= 32 THEN
+            fLo := fLo OR SHL(TO_UDINT(1), t - 1);
+        ELSE
+            fHi := fHi OR SHL(TO_UDINT(1), t - 33);
+        END_IF
+    END_IF
+END_FOR
+HMIflow.stsActiveLo := lo;
+HMIflow.stsActiveHi := hi;
+HMIflow.stsDoneLo := dLo;
+HMIflow.stsDoneHi := dHi;
+HMIflow.stsPermissiveLo := pLo;
+HMIflow.stsPermissiveHi := pHi;
+HMIflow.stsVisitedLo := vLo;
+HMIflow.stsVisitedHi := vHi;
+HMIflow.stsFiredLo := fLo;
+HMIflow.stsFiredHi := fHi;
+HMIflow.stsFaultedStep := _faultedStep;
+HMIflow.stsFireCount := _fireCount;
+HMIflow.stsLastFired := _lastFired;
+stsActiveNames := names;
+HMIflow.stsActiveNames := names;   // was declared but never written - see Docs/fb_MachineFlow_Design.md
+IF stsRunning AND n > 0 THEN
+    stsStepDescription := names;   // engine-owned while running
+END_IF
+publishHMI := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="runStepTimers" Id="{8408a303-0cc8-40ca-9c4d-49f50547d1be}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE runStepTimers : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    i : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR i := 1 TO _stepCount DO
+    // kickTimer forces one scan of IN=FALSE so the TON restarts on token placement
+    _stepTimers[i](IN := _steps[i].active AND NOT _steps[i].kickTimer, PT := T#100H);
+    IF _steps[i].kickTimer THEN
+        _steps[i].kickTimer := FALSE;
+    ELSIF _steps[i].active AND _steps[i].timeout > T#0S AND _stepTimers[i].ET > _steps[i].timeout THEN
+        _timeoutStep := i;
+        _faultedStep := i;   // a timeout is a step fault too — same red step on the chart
+        setStateLogicFault(CONCAT('Step timeout: ', _steps[i].name), TRUE, _fireCount);
+        RETURN;
+    END_IF
+END_FOR
+runStepTimers := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="seedTokens" Id="{e13412f3-8b3e-455d-b56f-26180532d1dd}" FolderPath="Privates\">
+      <Declaration><![CDATA[METHOD PRIVATE seedTokens : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    i : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[clearTokens();
+_fireCount := 0;
+_lastFired := 0;
+_timeoutStep := 0;
+_faultedStep := 0;
+FOR i := 1 TO _stepCount DO
+    IF _initialSteps[i] THEN
+        placeToken(i);
+    END_IF
+END_FOR
+seedTokens := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setCfgError" Id="{3531508c-8055-44c5-aa40-6f1dc5ea0cd8}" FolderPath="Privates\">
+      <Declaration><![CDATA[// Latch the FIRST definition error; actionsRun() faults on any run attempt.
+// Report a CONFIGURATION error - a defineFlow() mistake, not a runtime fault. actionsRun turns it
+// into a non-retryable fault, because a bad graph cannot be retried into a good one. PROTECTED so a
+// subclass's defineFlow() can report its own (e.g. the addStep() id-drift guard in the header).
+METHOD PROTECTED setCfgError : BOOL
+VAR_INPUT
+    inpMessage : STRING(255);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF NOT _cfgError THEN
+    _cfgError := TRUE;
+    _cfgErrorText := inpMessage;
+END_IF
+setCfgError := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setPermissive" Id="{cb1660d2-9b0f-49ce-96ff-78a6502e59fb}" FolderPath="flowRuntime\">
+      <Declaration><![CDATA[// Set a transition's permissive - the condition that must be MET to proceed
+// (call from stepActions(), typically in the SOURCE step's body). Permissives
+// are sticky and reset to TRUE on reset. OR-choice: opposing permissives on
+// two transitions leaving the same step.
+METHOD PROTECTED setPermissive : BOOL
+VAR_INPUT
+    inpTrans     : INT;
+    inpCondition : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpTrans >= 1 AND inpTrans <= _transCount THEN
+    _trans[inpTrans].permissive := inpCondition;
+    setPermissive := TRUE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setInitialStep" Id="{286b86d1-09fa-4da9-aa79-d74fe87d5812}" FolderPath="flowBuilder\">
+      <Declaration><![CDATA[// Mark a step as initially active on run (call from defineFlow(), AFTER the
+// steps are declared; more than once for parallel starts). Default: step 1.
+METHOD PROTECTED setInitialStep : BOOL
+VAR_INPUT
+    inpStepId : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpStepId < 1 OR inpStepId > _stepCount THEN
+    setCfgError('MachineFlow: setInitialStep() unknown step');
+    RETURN;
+END_IF
+IF NOT _initialSteps[inpStepId] THEN
+    _initialSteps[inpStepId] := TRUE;
+    _initialCount := _initialCount + 1;
+END_IF
+setInitialStep := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStepTimeout" Id="{4e0691a4-9f69-4f57-ad04-d9d2fb8205ec}" FolderPath="flowRuntime\">
+      <Declaration><![CDATA[// Runtime timeout override (e.g. from a recipe) - replaces the addStep() value.
+METHOD PROTECTED setStepTimeout : BOOL
+VAR_INPUT
+    inpStepId  : INT;
+    inpTimeout : TIME;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpStepId >= 1 AND inpStepId <= _stepCount THEN
+    _steps[inpStepId].timeout := inpTimeout;
+    setStepTimeout := TRUE;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="stepActions" Id="{c59d1cb4-51fa-446e-bd5e-56d9801c1363}">
+      <Declaration><![CDATA[// Override: the step BODIES - a CASE over the ids returned by addStep().
+// Called once per ACTIVE step per scan (parallel steps each get their call);
+// inpFirstScan is TRUE the first scan after the step's token arrives (use it
+// for one-shot commands). Report completion with stepDone(inpStepId); fault
+// via the inherited setStateLogicFault().
+METHOD PROTECTED stepActions : BOOL
+VAR_INPUT
+    inpStepId    : INT;
+    inpFirstScan : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="stepActive" Id="{568b84bb-e9ad-4523-af5e-086387da9ce1}" FolderPath="flowRuntime\">
+      <Declaration><![CDATA[METHOD PROTECTED stepActive : BOOL
+VAR_INPUT
+    inpStepId : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpStepId >= 1 AND inpStepId <= _stepCount THEN
+    stepActive := _steps[inpStepId].active;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="stepDone" Id="{d31c5ef4-359a-42c7-aa06-c84100ab9f6b}" FolderPath="flowRuntime\">
+      <Declaration><![CDATA[// Report a step complete (call from stepActions()). The token stays in place,
+// marked done, until an outgoing transition consumes it - or, if the step has
+// no outgoing transition, the sequence completes.
+METHOD PROTECTED stepDone : BOOL
+VAR_INPUT
+    inpStepId : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpStepId >= 1 AND inpStepId <= _stepCount THEN
+    IF _steps[inpStepId].active THEN
+        _steps[inpStepId].done := TRUE;
+        stepDone := TRUE;
+    END_IF
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="stepElapsed" Id="{763d77fc-0313-463c-987a-eea37dc346af}" FolderPath="flowRuntime\">
+      <Declaration><![CDATA[// Time since this step's token arrived (each step has its own clock).
+METHOD PROTECTED stepElapsed : TIME
+VAR_INPUT
+    inpStepId : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF inpStepId >= 1 AND inpStepId <= _stepCount THEN
+    stepElapsed := _stepTimers[inpStepId].ET;
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

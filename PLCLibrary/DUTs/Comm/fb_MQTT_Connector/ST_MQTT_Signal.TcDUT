@@ -1,0 +1,28 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_MQTT_Signal" Id="{fb01ac61-3dd8-4b64-8f95-0b1f63cce3bf}">
+    <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// ST_MQTT_Signal - Internal signal descriptor
+// ═══════════════════════════════════════════════════════════════════════
+TYPE ST_MQTT_Signal :
+STRUCT
+    // Configuration (set by user during registration)
+    sSubTopic           : STRING(80);           // Topic suffix, e.g. 'PIT1/stsEngValue'
+    pValue              : PVOID;                // Pointer to the PLC variable
+    eType               : E_MQTT_SignalType;    // Data type for serialization
+    ePublishMode        : E_MQTT_PublishMode;   // CoS or Periodic
+    eDirection          : E_MQTT_Direction;     // Pub / Sub / Both
+    tPublishInterval    : TIME;                 // Interval for PERIODIC mode
+    sJsonKey            : STRING(255);          // JSON key to extract (empty = raw payload mode)
+    sJsonParentKey      : STRING(80);           // Optional parent object key (e.g. 'signals')
+    
+    // Internal state (managed by FB)
+    sLastPublished      : STRING(255);          // Last published value (for CoS detection)
+    tLastPublishTime    : TIME;                 // Timestamp of last publish
+    bRegistered         : BOOL;                 // TRUE if this slot is in use
+    nConsecFails        : UINT;                 // Consecutive failures for this signal
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

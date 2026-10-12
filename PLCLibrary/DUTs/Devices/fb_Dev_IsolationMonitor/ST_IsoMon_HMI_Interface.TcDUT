@@ -1,0 +1,15 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_IsoMon_HMI_Interface" Id="{24cf9de1-fd06-492a-99f2-130270290411}">
+    <Declaration><![CDATA[TYPE ST_IsoMon_HMI_Interface :
+STRUCT
+	HMIbaseDevice		: ST_Device_HMI_Interface; 
+	ocmdTripReset		: BOOL;
+	ocmdTest			: BOOL;
+	stsDeviceAlarm		: BOOL;
+	stsDeviceWarning	: BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,15 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Modbus_Commands" Id="{2917ab2b-ff29-4ba1-b23c-52075f5eec95}">
+    <Declaration><![CDATA[TYPE ST_Modbus_Commands :
+STRUCT
+	ReadRegisters			: FB_MBReadRegs;
+	ReadInputs				: FB_MBReadInputs;
+	WriteSingleCoil			: FB_MBWriteSingleCoil;
+	WriteSingleRegister		: FB_MBWriteSingleReg;
+	WriteRegisters			: FB_MBWriteRegs;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

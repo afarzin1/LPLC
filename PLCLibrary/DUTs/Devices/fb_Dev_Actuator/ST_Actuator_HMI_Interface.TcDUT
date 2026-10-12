@@ -1,0 +1,15 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Actuator_HMI_Interface" Id="{c487ca2e-f909-46b4-90db-25707195071a}">
+    <Declaration><![CDATA[TYPE ST_Actuator_HMI_Interface :
+STRUCT
+	HMIbaseDevice		: ST_Device_HMI_Interface; 
+	stsActuated			: BOOL;
+	ocmdActuate			: BOOL;
+	ocmdReset			: BOOL;
+	setActuate			: BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,20 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs" Id="{7ceb4667-b5b7-487e-b0e0-96a8e454fbca}">
+    <Declaration><![CDATA[TYPE ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs :
+STRUCT
+	Direction 					: BYTE;
+	Percent_Width_Of_Color_1 	: BYTE;
+	Scroll_Bounce_Style			: BYTE;
+	Color_2_Intensity			: BYTE;
+	Color_2						: BYTE;
+	Pulse_Pattern				: BYTE;
+	Speed						: BYTE;
+	Color_1_Intensity			: BYTE;
+	Color_1						: BYTE;
+	Animnation					: BYTE;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

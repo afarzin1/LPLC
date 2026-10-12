@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamCoupler_HMI_Status" Id="{a3ee36e4-b78e-46d9-aa9b-67181a5fe176}">
+    <Declaration><![CDATA[// PLC -> HMI status for the cam coupler.
+TYPE ST_CamCoupler_HMI_Status :
+STRUCT
+    stsState        : E_CamCoupler_State;  // current couple/decouple state
+    stsCoupled      : BOOL;   // MC_CamIn.InSync - slave synchronized to the master via the cam
+    stsBusy         : BOOL;   // a couple or decouple sequence is in progress
+    stsError        : BOOL;   // latched coupler error (own error model - NOT an NC/axis fault)
+    stsErrorText    : STRING;  // reason for the latched error
+
+    stsVerified     : BOOL;   // echo of the incoming verified gate (from fb_CamTeach.stsVerified)
+    stsTableId      : UDINT;  // NC cam table id in use for this coupling
+
+    // Live cam relationship values (effective, latched at engage / updated by live trim)
+    stsMasterOffset : LREAL;  // [master unit]
+    stsSlaveOffset  : LREAL;  // [slave unit]
+    stsMasterScale  : LREAL;  // master scaling
+    stsSlaveScale   : LREAL;  // slave scaling
+    stsPeriodic     : BOOL;   // MC_CamTableSelect periodicity in use
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

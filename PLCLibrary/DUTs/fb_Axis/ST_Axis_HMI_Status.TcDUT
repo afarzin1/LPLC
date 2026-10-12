@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Axis_HMI_Status" Id="{e5f6a7b8-c9d0-1234-ef45-234567890004}">
+    <Declaration><![CDATA[TYPE ST_Axis_HMI_Status :
+STRUCT
+    // Identity, auto mode, fault and axis-level interlock live in HMIbaseDevice
+    // (ST_Device_HMI_Interface) - not duplicated here.
+
+    // Axis power state
+    stsEnabled          : BOOL;   // MC_Power.Status - drive powered and ready
+    stsHomed            : BOOL;   // axis is referenced/calibrated (Axis.Status.Homed)
+
+    // Motion state - curated operator summary (aggregated from AXIS_REF.Status)
+    stsStandstill       : BOOL;
+    stsMoving           : BOOL;   // DiscreteMotion OR ContinuousMotion
+    stsInTargetPos      : BOOL;   // within target window (abs/rel moves)
+    stsError            : BOOL;   // NC-level error (separate from PLC fault)
+    stsErrorID          : UDINT;  // NC error code
+
+    // Complete AXIS_REF.Status snapshot - every status flag this library version
+    // exposes (Disabled, ErrorStop, Stopping, Homing, Homed, DiscreteMotion,
+    // ContinuousMotion, SynchronizedMotion, ConstantVelocity, Accelerating,
+    // Decelerating, InTargetPosition, ...). Bind this for full/diagnostic status.
+    stsAxisStatus       : ST_AxisStatus;
+
+    // Process values
+    stsActualPosition   : LREAL;  // [unit]   actual position, accumulated/un-wrapped (Axis.NcToPlc.ActPos)
+    // Modulo position - only meaningful when stsIsModulo (the NC axis is configured modulo). The NC
+    // computes these regardless, so on a non-modulo axis they are not the value to display.
+    stsModuloActPos     : LREAL;  // [unit] actual position wrapped into one modulo period (Axis.NcToPlc.ModuloActPos)
+    stsModuloActTurns   : DINT;   // completed modulo turns (Axis.NcToPlc.ModuloActTurns)
+    stsActualVelocity   : LREAL;  // [unit/s] actual velocity  (Axis.NcToPlc.ActVelo)
+    stsActualTorque     : LREAL;  // [Nm or %] actual torque (Axis.NcToPlc.ActTorque)
+    stsSetPosition      : LREAL;  // [unit]   commanded position (Axis.NcToPlc.SetPos)
+    stsSetVelocity      : LREAL;  // [unit/s] commanded velocity (Axis.NcToPlc.SetVelo)
+    stsSetTorque        : LREAL;  // [% or Nm] commanded torque (FB-tracked; no NC torque setpoint)
+    stsFollowingError   : LREAL;  // [unit]   position lag = SetPos - ActPos
+
+    // Homing / direct position assignment
+    stsHomeBusy         : BOOL;   // MC_Home.Busy
+    stsHomeDone         : BOOL;   // MC_Home.Done
+    stsHomeError        : BOOL;   // MC_Home.Error
+    stsHomeErrorID      : UDINT;  // MC_Home.ErrorID
+    stsHomePosition     : LREAL;  // last/direct home position command [unit]
+
+    // Move status
+    stsCurrentMoveIndex : INT;    // 1-20 index of last executed move (0 = none)
+    stsCurrentMoveName  : STRING; // moveName of last executed move
+    stsMoveBusy         : BOOL;   // MC block is executing
+    stsActiveMoveMode   : E_Axis_Mode; // active move mode while stsMoveBusy is TRUE
+    stsMoveDone         : BOOL;   // last move completed (position/velocity reached)
+
+    // HMI move selection
+    stsSelectedMove     : INT;    // staged move index awaiting confirmation (0 = none)
+    stsConfirmPending   : BOOL;   // TRUE: ocmdRunMove required to execute
+
+    // HMI move configuration edit/apply feedback
+    stsMoveConfigLoaded     : BOOL;   // TRUE once HMI.Config.moves has been seeded from the live table
+    stsMoveConfigApplyError : BOOL;   // last apply/reload command was rejected
+    stsMoveConfigErrorText  : STRING; // reason the last apply/reload command was rejected
+
+    // Override
+    stsVelocityOverride : LREAL;  // effective velocity override [%] - global value if active, else local
+    stsGlobalOverrideActive : BOOL;  // TRUE = axis is following the machine-global override (inpGlobalOverrideEnable)
+
+    // Jog setpoints (currently active - reflects the owning source's velocity/accel)
+    stsJogVelocity      : LREAL;  // [unit/s]  active jog velocity
+    stsJogAcceleration  : LREAL;  // [unit/s²] active jog acceleration
+    stsJogSource        : E_Axis_JogSource;  // which input owns the jog: eNone / eHMI / ePendant
+    stsJogTorqueLimit   : LREAL;  // [Nm or %] global overtorque trip for position jog (0 = no limit)
+
+    // Torque jog (interactive manual torque, dead-man)
+    stsTorqueJogActive  : BOOL;   // torque-jog engaged (held, or ramping back to 0 after release)
+    stsTorqueJogMaxVel  : LREAL;  // [unit/s] active (retained) torque-jog overspeed trip; 0 = no trip
+
+    // Position jog ("go to position") - discrete absolute move at the jog velocity/accel
+    stsJogGotoBusy      : BOOL;   // TRUE while the go-to move is executing
+    stsJogGotoDone      : BOOL;   // go-to move reached its target
+    stsJogGotoPos       : LREAL;  // [unit] active/last go-to target position
+
+    // Safety
+    stsSTO              : BOOL;   // TRUE = STO not active (normal run), FALSE = STO active (drive torque cut imminent)
+    stsSafetyInhibited  : BOOL;   // TRUE = motion inhibited by safety (STO active). Soft inhibit, NOT a fault:
+                                  // blocks enable/motion, self-clears when STO restored (no reset needed)
+
+    // Units / kinematics (NC carries no unit metadata - configured on fb_Axis)
+    stsAxisType         : E_Axis_UnitType;  // eLinear / eRotary
+    stsUnit             : STRING;           // position unit label (e.g. 'mm','deg'); velocity = unit + '/s'
+    stsIsModulo         : BOOL;             // TRUE = axis is modulo: show stsModuloActPos, else stsActualPosition
+
+    // Coordination
+    stsExternalControl  : BOOL;   // axis yielded to external coordinator
+
+    // Move list - mirrored from fb_Axis internal persistent moves for HMI display
+    moves               : ARRAY[1..20] OF ST_Axis_MoveDefinition;
+    // Live interlock status per move - shows which moves are currently executable
+    moveInterlocks      : ARRAY[1..20] OF ST_Interlock_HMI_Interface;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

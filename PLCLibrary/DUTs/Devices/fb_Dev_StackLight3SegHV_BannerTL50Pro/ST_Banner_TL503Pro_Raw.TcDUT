@@ -1,0 +1,11 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Banner_TL503Pro_Raw" Id="{b58958f7-bb51-4639-9bcc-c6f8a77e8315}">
+    <Declaration><![CDATA[TYPE ST_Banner_TL503Pro_Raw :
+STRUCT
+	PDOs	:	Array[20..30] of USINT;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

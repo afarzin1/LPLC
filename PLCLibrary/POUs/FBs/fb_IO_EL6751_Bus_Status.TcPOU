@@ -1,0 +1,62 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_IO_EL6751_Bus_Status" Id="{30727b57-7f05-45bf-a527-5c7c5cc8e211}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_IO_EL6751_Bus_Status
+VAR_INPUT
+	IO_Bus_State	:	ST_EL6751_Bus_State;
+END_VAR
+VAR_OUTPUT
+	stsBusFaulted	: BOOL;
+END_VAR
+VAR
+	HMI			:ST_EL6751_Bus_State_Parsed;
+	_busState	:ST_EL6751_Bus_State_Parsed;	
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[_busState.stsBusLoad 					:= IO_Bus_State.GlobalState3;
+
+
+_busState.stsCANControllerBusOff		:= IO_Bus_State.GlobalState2.Bits[1].Bit1;
+_busState.stsCANControllerWarningLimit	:= IO_bus_State.GlobalState2.Bits[1].Bit2;
+_busState.stsRxQueueOverrun				:= IO_bus_State.GlobalState2.Bits[1].Bit3;
+_busState.stsCANSendError				:= IO_bus_State.GlobalState2.Bits[1].Bit6;
+_busState.stsCANQueueIntRxOverflow		:= IO_bus_State.GlobalState2.Bits[1].Bit8;
+_busState.stsCANQueueIntTxOverflow		:= IO_bus_State.GlobalState2.Bits[1].Bit9;
+_busState.stsSyncToggle					:= IO_bus_State.GlobalState2.Bits[1].Bit16;
+
+CASE IO_Bus_State.GlobalState0 OF
+	0:
+		_busState.stsCANDeviceState	:= 'RUN';
+	1:
+		_busState.stsCANDeviceState	:= 'RESET';
+	2:
+		_busState.stsCANDeviceState	:= 'OFFLINE';
+	3:
+		_busState.stsCANDeviceState	:= 'STOP';
+	ELSE
+		_busState.stsCANDeviceState	:= 'ERR';
+END_CASE
+
+IF (IO_Bus_State.GlobalState0 <> 0) OR (IO_Bus_State.GlobalState2.Num <> 0) THEN
+	stsBusFaulted := TRUE;
+ELSE
+	stsBusFaulted := FALSE;
+END_IF
+
+HMI := _busState;
+
+
+]]></ST>
+    </Implementation>
+    <Method Name="getHMIData" Id="{58731bbb-8105-4088-9c4c-e4769835830f}">
+      <Declaration><![CDATA[METHOD PUBLIC getHMIData : ST_EL6751_Bus_State_Parsed
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getHMIData := HMI;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

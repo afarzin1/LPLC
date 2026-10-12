@@ -1,0 +1,561 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="abs_fb_stateDevice" Id="{2d15d33e-a649-4560-9c3a-cb41ba3fe2f2}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK ABSTRACT abs_fb_stateDevice
+VAR_INPUT
+	inpReset	: BOOL;
+	inpAuto		: BOOL;
+	faultMonitor: POINTER TO fb_FaultMonitor;
+END_VAR
+VAR_OUTPUT
+	stsIdle				: BOOL;
+	stsDone				: BOOL;
+	stsRunning			: BOOL;
+	stsFaulted			: BOOL;
+	stsAborting			: BOOL;
+	stsAborted			: BOOL;
+	stsFaultDescription	: STRING;
+	stsStepDescription : STRING;
+END_VAR
+VAR
+	_inAuto				: BOOL;
+	_deviceName 		: STRING;
+	_initMachineMode	: BOOL;
+	_init				: BOOL;
+	Interlock			: fb_Interlock;
+	_dataInterlock		: st_interlock;
+	// START permissive — the conditions that must be met to ENTER Running. Wire slots with
+	// cmdSetStartPermissive(); unwired slots default TRUE, so an FB that never touches it is
+	// satisfied and behaves exactly as before this was added.
+	permStartPermissive	: fb_Permissive;
+	_stateDoneAborting	: BOOL;
+	_stateLogicReqRun	: BOOL;
+	_stateLogicReset	: BOOL;
+	_stateLogicFault	: FB_TcAlarm;
+	_stateLogicMsg		: FB_TcMessage;
+	_retryAllowed		: BOOL;
+	_retryStep			: INT;
+	_retryStateActive	: BOOL;
+	_stateVariable		: POINTER TO INT;
+	_lastStep			: INT;
+	_stepTimer			: TON;
+	_stepTimerEnable	: BOOL;
+	_stepTimeoutPT		: TIME;
+	HMIstateLogic		: ST_StateDevice_HMI_Interface;
+	_stateLogicFaultRaised  : BOOL;
+	_clear				: BOOL;
+	_sentWarning		: STRING;
+	_sentLog			: STRING;
+	_runtimeTimer		: TON;
+	_runtimeTimerTrig	: BOOL;
+	_cycletime			: TIME;
+	_cycletimeSet		: BOOL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[]]></ST>
+    </Implementation>
+    <Folder Name="stateLogic" Id="{9d5c0b00-fcdb-4be9-85be-fd93e3c9bcb8}" />
+    <Method Name="actionsAbort" Id="{ad885e05-da91-4e89-9390-b95d5f2faf42}" FolderPath="stateLogic\">
+      <Declaration><![CDATA[METHOD PROTECTED actionsAbort : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="actionsDone" Id="{e80714d9-8a4f-4b42-8463-ce95e80a23a3}" FolderPath="stateLogic\">
+      <Declaration><![CDATA[METHOD PROTECTED actionsDone : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="actionsFaulted" Id="{68a99e44-cdec-4f38-b70d-993067517a9a}" FolderPath="stateLogic\">
+      <Declaration><![CDATA[METHOD PROTECTED actionsFaulted : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="actionsReset" Id="{3f29fc17-e07b-49df-8e7c-ecdb7f294351}" FolderPath="stateLogic\">
+      <Declaration><![CDATA[METHOD PROTECTED actionsReset : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="actionsRun" Id="{127065d4-fd4c-48ac-9a4c-63e709e6d1ed}" FolderPath="stateLogic\">
+      <Declaration><![CDATA[METHOD PROTECTED actionsRun : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="cfgDeviceName" Id="{57f9a111-d797-4963-b7b1-0c12c6b9f530}">
+      <Declaration><![CDATA[PROPERTY cfgDeviceName : STRING]]></Declaration>
+      <Get Name="Get" Id="{b9626e84-8618-44c6-b212-973464bf250f}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[cfgDeviceName := _DeviceName;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{7b0d87f6-fcfe-423d-affb-d7c428f9d010}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_DeviceName := cfgDeviceName;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="cmdSetInterlock" Id="{8a71f06b-1929-4d88-b9a4-1ea4a5fc0f80}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdSetInterlock : BOOL
+VAR_INPUT
+	interlockIndex : INT;
+	description : STRING;
+	condition: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_dataInterlock.conditions[interlockIndex] := condition;
+_dataInterlock.descriptions[interlockIndex] := description;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdSetStartPermissive" Id="{6d21f4a8-93c7-4e05-b1a6-72fc80d9e514}">
+      <Declaration><![CDATA[// Wire one slot of the START permissive — a condition that must be met for this device to ENTER
+// Running. Mirrors cmdSetInterlock's argument order on purpose, since a machine usually writes the
+// two side by side; note fb_Permissive.setCondition() underneath takes (slot, met, description).
+//
+// Unwired slots default TRUE, so wire only what applies and leave the rest alone. Naming every slot
+// you DO wire matters: that text is the operator's answer to "why won't it start".
+//
+// PERMISSIVE, NOT INTERLOCK: this gates the start only. A condition that must stop a device that is
+// ALREADY RUNNING is an interlock — use cmdSetInterlock for that.
+METHOD PUBLIC cmdSetStartPermissive : BOOL
+VAR_INPUT
+	inpSlot			: INT;
+	inpDescription	: STRING;
+	inpCondition	: BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[cmdSetStartPermissive := permStartPermissive.setCondition(inpSlot, inpCondition, inpDescription);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{bd88524a-108b-4a36-966d-7909b78a4d03}">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init: BOOL
+VAR_INPUT
+    bInitRetains: BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode: BOOL;  // TRUE: the instance will be copied to the copy code afterward (online change)
+	cfgDeviceName 		: STRING;   
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 		:= 		cfgDeviceName; ]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="getStateLogicHMIdata" Id="{d03c086e-bb00-43db-a515-b532e4ccd472}">
+      <Declaration><![CDATA[METHOD getStateLogicHMIdata : ST_StateDevice_HMI_Status
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getStateLogicHMIdata := HMIstateLogic.Status;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="sendLog" Id="{343377a1-6caf-4ee9-9c62-ec578ff6c9af}">
+      <Declaration><![CDATA[METHOD sendLog : BOOL
+VAR_INPUT
+	message : STRING;
+END_VAR
+
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF message <> _sentLog THEN
+	_sentLog := message;
+	_stateLogicMsg.CreateEx(TC_Events.absStateDevice.Logger,0);
+	_stateLogicMsg.ipArguments.AddString(_deviceName).AddString(message);
+	_stateLogicMsg.Send(0);
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="sendWarning" Id="{f9981804-6985-468f-8ce0-e4f991bb2c16}">
+      <Declaration><![CDATA[METHOD sendWarning : BOOL
+VAR_INPUT
+	message : STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF message <> _sentWarning THEN
+	_sentWarning := message;
+	_stateLogicMsg.CreateEx(TC_Events.absStateDevice.Warning,0);
+	_stateLogicMsg.ipArguments.AddString(_deviceName).AddString(message);
+	_stateLogicMsg.Send(0);	
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setInit" Id="{76dac477-bd1a-4fd6-b9c3-afe70d49b235}">
+      <Declaration><![CDATA[METHOD INTERNAL setInit : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF faultMonitor <> 0 THEN
+	faultMonitor^.addDeviceFault(faultStatus := ADR(stsFaulted), faultDescription := ADR(stsFaultDescription), deviceName := ADR(_deviceName));
+END_IF
+_stateLogicFault.CreateEx(stEventEntry:=TC_Events.absStateDevice.Faulted, bWithConfirmation := FALSE, ipSourceInfo := 0);
+_stateLogicMsg.CreateEx(stEventEntry:=TC_events.absStateDevice.Warning,ipSourceInfo:=0);
+_stateLogicMsg.CreateEx(stEventEntry:=TC_events.absStateDevice.Logger,ipSourceInfo:=0);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStateDoneAborting" Id="{6a529d8c-81b5-44ac-978f-aeccef5e48fa}">
+      <Declaration><![CDATA[METHOD setStateDoneAborting : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_stateDoneAborting := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStateLogicAbort" Id="{c3b13381-652e-4475-9001-d236b08e08d8}">
+      <Declaration><![CDATA[METHOD setStateLogicAbort : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsRunning THEN
+	stsRunning := FALSE;
+	stsAborting := TRUE;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStateLogicDone" Id="{06d401ab-4f39-4096-a920-d7dd500c9110}">
+      <Declaration><![CDATA[METHOD setStateLogicDone : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsRunning THEN
+	stsDone := TRUE;
+END_IF
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStateLogicFault" Id="{0097ed90-61d9-4e84-a832-8df0a0f1816e}">
+      <Declaration><![CDATA[METHOD setStateLogicFault : BOOL
+VAR_INPUT
+	FaultDescription : STRING;
+	AllowRetry		 : BOOL;
+	RetryStep		 : INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stsFaulted := TRUE;
+stsFaultDescription := FaultDescription;
+
+_retryAllowed := AllowRetry;
+_retryStep	  := RetryStep;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStateLogicReset" Id="{e07684c2-1cc0-4945-a517-bcec998f44bf}">
+      <Declaration><![CDATA[METHOD setStateLogicReset : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_stateLogicReset := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStateLogicRetry" Id="{edf8e6bc-4829-4a7b-ac2b-c48d07cb6d4d}">
+      <Declaration><![CDATA[METHOD setStateLogicRetry : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsFaulted THEN
+	IF _retryAllowed THEN
+		_retryStateActive := TRUE;
+		_retryAllowed := FALSE;
+		IF _stateVariable <> 0 THEN
+			_stateVariable^ := _retryStep;
+		END_IF
+		stsFaulted := FALSE;
+		stsFaultDescription := '';
+		HMIstateLogic.Status.stsFaulted := FALSE;
+		HMIstateLogic.Commands.ocmdRetry := FALSE;
+		stsRunning := TRUE;
+	END_IF
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStateLogicRun" Id="{2394b63c-63cd-4d10-b515-4e4bb681d072}">
+      <Declaration><![CDATA[METHOD setStateLogicRun : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsIdle THEN
+	_stateLogicReqRun := TRUE;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="setStateLogicStepTimeout" Id="{60a233e4-40c9-4913-8bfd-07f7ea2183b7}">
+      <Declaration><![CDATA[METHOD setStateLogicStepTimeout : BOOL
+VAR_INPUT
+	Timeout	: TIME;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _stepTimer.ET > Timeout THEN
+	setStateLogicFault('Step timeout',TRUE,_stateVariable^);
+	stsFaultDescription := concat('Step timeout on step ', INT_TO_STRING(_stateVariable^));
+END_IF
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="stateLogic" Id="{7705b280-5c6a-451f-9780-a4a9e4dd91dd}">
+      <Declaration><![CDATA[METHOD PROTECTED stateLogic : BOOL
+VAR_INPUT
+	stateVariable : POINTER TO INT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF NOT _init THEN
+	_init := TRUE;
+	setInit();
+END_IF
+
+_stateVariable := stateVariable;
+
+//Measure duration of each step
+_stepTimer(IN:= _stepTimerEnable, PT:= T#100H);
+
+//Measure cycle time of the running state
+_runtimeTimer(IN:=_runtimeTimerTrig, PT:=T#45D);
+IF stsRunning THEN
+	_runtimeTimerTrig := TRUE;
+	_cycletimeset	  := FALSE;
+	_cycletime:= _runtimeTimer.ET;
+ELSE
+	IF NOT(_cycletimeset) THEN
+		_cycletimeset := TRUE;
+		_cycletime:= _runtimeTimer.ET;
+	END_IF
+	_runtimetimerTrig := FALSE;	
+END_IF
+
+//Set interlocks
+Interlock.name 			:= _DeviceName;
+Interlock(inpConfig 	:= _dataInterlock);
+
+// START permissive. Called HERE, before the run gate below, and unconditionally: stsPermissiveOK is
+// a VAR_OUTPUT and reads FALSE until the body has run once, so gating on an uncalled instance would
+// block every existing device on its first scan. Its conditions default TRUE, so an FB that never
+// calls cmdSetStartPermissive() is satisfied from scan one.
+permStartPermissive.cfgName := CONCAT(_DeviceName, ' start permissive');
+permStartPermissive();
+
+//Set Machine state
+IF inpAuto THEN
+	_inAuto := TRUE;
+	HMIstateLogic.Status.stsAuto := TRUE;
+ELSE
+	_inAuto := FALSE;
+	HMIstateLogic.Status.stsAuto := FALSE;
+END_IF
+
+//Run HMI operator commands if not in Auto
+IF NOT(_inAuto) THEN
+	IF HMIstateLogic.Commands.ocmdRun THEN
+		setStateLogicRun();
+	END_IF
+	
+	IF HMIstateLogic.Commands.ocmdAbort THEN
+		setStateLogicAbort();
+	END_IF
+	
+	IF HMIstateLogic.Commands.ocmdRetry THEN
+		setStateLogicRetry();
+	END_IF
+	
+END_IF
+
+IF stsRunning OR stsFaulted OR stsDone OR stsAborted OR stsAborting THEN
+	stsIdle 					 	:= FALSE;
+	HMIstateLogic.Status.stsIdle 	:= FALSE;
+ELSE
+	stsIdle 						:= TRUE;
+	HMIstateLogic.Status.stsIdle 	:= TRUE;
+	HMIstateLogic.Status.stsState	:= 'Idle';
+END_IF
+
+IF HMIStateLogic.Commands.ocmdAbort THEN
+	setStateLogicAbort();
+END_IF
+
+IF (inpReset OR HMIstatelogic.Commands.ocmdReset OR _stateLogicReset) AND (NOT(stsRunning) AND NOT(stsAborting)) THEN
+	stsFaulted 								:= FALSE;
+	stsAborted								:= FALSE;
+	stsDone   								:= FALSE;
+	stsRunning  							:= FALSE;
+	stsIdle 								:= TRUE;
+	HMIstateLogic.status.stsAborted			:= FALSE;
+	HMIstateLogic.Status.stsFaulted 		:= FALSE;
+	HMIstateLogic.Status.stsDone 			:= FALSE;
+	HMIstateLogic.Status.stsRunning			:= FALSE;
+	HMIstateLogic.Status.stsIdle 			:= TRUE;
+	_stateLogicReset 						:= 0;
+	_cycleTime								:= T#0s;
+	stsStepDescription 	:= '';
+	stsFaultDescription := '';
+
+	IF _stateVariable <> 0 THEN
+		_stateVariable^ 	:= 0;
+	END_IF
+	_retryStep				:= 0;
+	_retryAllowed 			:= FALSE;
+	
+	IF NOT(stsFaulted) THEN
+		_stateLogicFaultRaised := FALSE;
+		_stateLogicFault.Clear(0);
+	END_IF
+	
+	actionsReset();
+ELSE
+	_stateLogicReset := FALSE;
+END_IF
+
+IF stsAborting THEN
+	HMIstateLogic.Status.stsRunning 		:= FALSE;
+	_stateLogicReqRun						:= FALSE;
+	stsStepDescription 						:= 'Aborting';
+	HMIstateLogic.Status.stsState			:= 'Aborting';
+	HMIstateLogic.Status.stsAborting		:= TRUE;
+	IF _stateDoneAborting THEN
+		stsAborting			 				:= FALSE;
+		HMIstateLogic.Status.stsAborting	:= FALSE;
+		stsAborted 			 				:= TRUE;
+	END_IF
+	actionsAbort();
+END_IF
+
+IF stsAborted THEN
+	stsStepDescription 				:= 'Aborted';
+	HMIstateLogic.Status.stsAborted := TRUE;
+	HMIstateLogic.Status.stsState	:= 'Aborted';
+	_stateDoneAborting				:= FALSE;
+END_IF
+
+IF stsFaulted THEN
+	IF stsFaulted AND NOT(_stateLogicFaultRaised) THEN
+		_stateLogicFaultRaised := TRUE;
+		_stateLogicFault.ipArguments.Clear();
+		_stateLogicFault.ipArguments.AddString(_deviceName).AddString(stsFaultDescription);
+		_stateLogicFault.Raise(nTimeStamp :=0);
+	END_IF
+	stsRunning 			 			:= FALSE;
+	HMIstateLogic.Status.stsRunning := FALSE;
+	actionsFaulted();
+	HMIstateLogic.Status.stsFaulted := TRUE;
+	HMIstateLogic.Status.stsState	:= 'Faulted';
+	_stepTimerEnable				:= FALSE;
+
+END_IF
+
+IF stsDone THEN
+	_stateLogicReqRun 	:= FALSE;
+	stsRunning := FALSE;
+	actionsDone();
+	HMIstateLogic.Status.stsRunning := FALSE;
+	HMIstateLogic.Status.stsDone 	:= TRUE;
+	HMIstateLogic.Status.stsState	:= 'Done';
+END_IF
+
+IF _stateLogicReqRun THEN
+	IF stsIdle THEN
+		IF NOT Interlock.outInterlockOK THEN
+			sendWarning('Cannot start sequence, interlocks NOK');
+		// A permissive gates the START and nothing else. It is deliberately NOT added to the
+		// `IF stsRunning` check below, which aborts on a dropped INTERLOCK: an interlock breaking is
+		// abnormal and must stop the device, whereas a permissive going unmet mid-run is normal and
+		// means nothing — the device is already past the point it gated. Aborting on one would make
+		// a permissive behave exactly like the interlock it exists to not be.
+		ELSIF NOT permStartPermissive.stsPermissiveOK THEN
+			sendWarning(CONCAT('Cannot start sequence, start permissive not met - unmet conditions: ',
+				INT_TO_STRING(permStartPermissive.stsUnmetCount)));
+		ELSE
+			_stateLogicReqRun := FALSE;
+			stsRunning := TRUE;
+			_initMachineMode := _inAuto;
+		END_IF
+	ELSE
+		sendWarning('Cannot start sequence, not in idle');
+	END_IF
+END_IF
+
+IF stsRunning THEN
+	IF NOT(Interlock.outInterlockOK) THEN
+		sendWarning('Interlocks NOK, aborting...');
+		setStateLogicAbort();
+	ELSE
+		_lastStep := _stateVariable^;
+		_retryStateActive				:= FALSE;
+		stsIdle 						:= FALSE;
+		stsDone 						:= FALSE;
+		stsRunning 						:= TRUE;
+		HMIstateLogic.Status.stsRunning := TRUE;
+		HMIstateLogic.Status.stsState	:= 'Running';
+		actionsRun();
+		//if Machine state changes from when running start (Auto to Man. or Man. to Auto) then abort
+		IF _initMachineMode <> _inAuto THEN
+			setStateLogicAbort();
+		END_IF
+		IF _stateVariable^ <> _lastStep THEN
+			_stepTimerEnable := FALSE;
+		ELSE
+			_stepTimerEnable := TRUE;
+		END_IF
+	END_IF
+ELSE
+	_stateLogicReqRun := FALSE;
+	_stepTimerEnable  := FALSE;
+END_IF
+
+HMIstateLogic.Status.cfgDeviceName 		 := _DeviceName;
+HMIstateLogic.Status.stsStepDescription  := stsStepDescription;
+HMIstateLogic.Status.stsFaultDescription := stsFaultDescription;
+HMIstateLogic.Status.stsRetryAllowed	 := _retryAllowed;
+HMIstateLogic.interlock 		  		 := Interlock.getHMIdata();
+HMIstateLogic.startPermissive            := permStartPermissive.getHMIdata();
+IF _stateVariable <> 0 THEN
+	HMIstateLogic.Status.stsStepNumber := _stateVariable^;
+END_IF
+
+IF stsStepDescription <> '' THEN
+	sendLog(stsStepDescription);
+END_IF
+
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

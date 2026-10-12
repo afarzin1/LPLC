@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="E_MBArea" Id="{d9f7cabf-30a9-4770-b0ea-b9877419a285}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_MBArea :
+(
+    Coils               := 0,
+    DiscreteInputs      := 1,
+    InputRegisters      := 3,
+    HoldingRegisters    := 4
+) UINT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

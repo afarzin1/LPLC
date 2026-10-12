@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamCoupler_HMI_Interface" Id="{d1543ff0-d085-4af3-bb9e-aa7c8114f94a}">
+    <Declaration><![CDATA[// Public HMI interface for fb_CamCoupler - the struct an HMI binds.
+// No HMIbaseDevice: fb_CamCoupler is standalone and does NOT extend abs_fb_Device.
+TYPE ST_CamCoupler_HMI_Interface :
+STRUCT
+    Status   : ST_CamCoupler_HMI_Status;
+    Commands : ST_CamCoupler_HMI_Commands;
+    Config   : ST_CamCoupler_HMI_Config;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ControlValve_Modulating_HMI_Interface" Id="{2fab0b6c-914a-43d0-a8f3-27967a286b3c}">
+    <Declaration><![CDATA[TYPE ST_ControlValve_Modulating_HMI_Interface :
+STRUCT
+	HMIbaseDevice		: ST_Device_HMI_Interface;
+	stsValveFeedback	: LREAL;	// position feedback from device
+	ocmdValvePosition	: LREAL;    // operator command - valve position
+	stsValvePosition	: LREAL;    // actual command - valve position
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

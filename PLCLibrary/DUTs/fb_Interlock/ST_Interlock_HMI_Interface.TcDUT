@@ -1,0 +1,15 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Interlock_HMI_Interface" Id="{f71d3a1c-4717-4221-adda-1572afd39a31}">
+    <Declaration><![CDATA[TYPE ST_Interlock_HMI_Interface :
+STRUCT
+	stsInterlockOK				: BOOL;
+	stsConditions				: ARRAY[1..10] OF BOOL;
+	stsInterlockDescriptions 	: ARRAY[1..10] OF STRING;
+	stsInterlockName			: STRING;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

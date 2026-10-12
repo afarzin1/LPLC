@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Pump_ABBACS580_HMI_Interface" Id="{a1b00004-0000-4000-8000-000000000001}">
+    <Declaration><![CDATA[TYPE ST_Pump_ABBACS580_HMI_Interface :
+STRUCT
+	HMIbaseDevice			: ST_Device_HMI_Interface;
+	stsInterlocks			: ST_Interlock_HMI_Interface;
+
+	// Operator commands — pump HMI is the sole command surface when this FB wraps a VFD.
+	// (The inner VFD is forced to auto, so VFD.HMI.ocmd* fields are inert.)
+	ocmdReset				: BOOL;
+	ocmdRun					: BOOL;
+	ocmdSetpoint			: LREAL;	// 0..100 percent
+
+	stsOverpressureTripped	: BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

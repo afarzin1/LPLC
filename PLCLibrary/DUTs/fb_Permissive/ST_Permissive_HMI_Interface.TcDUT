@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Permissive_HMI_Interface" Id="{84f28cf2-22c5-4efc-88d5-aafb1a2049ad}">
+    <Declaration><![CDATA[// HMI face of fb_Permissive. Bind <instance>.HMI.* — the shared lhmi `PermissiveList` component
+// renders exactly this struct, so any permissive anywhere (a device's start conditions, a
+// MachineFlow transition gate, a machine-level ready check) gets the same operator view for free.
+//
+// There is deliberately NO first-out field here. First-out answers "which condition dropped and
+// caused the trip", which only means something for an interlock: it faults instantly, so the
+// condition that went first is the cause and the later ones are consequences. A permissive never
+// trips - it is evaluated at the moment something asks to proceed, and every unmet condition is
+// equally and simultaneously the reason. So this struct carries the SET (stsConditions) plus a
+// count, and the HMI shows all of them rather than nominating a misleading headline.
+//
+// There is deliberately NO BYPASS field either. A permissive is not a safety function, so the
+// temptation is to say a bypass is harmless here — but it is the one control that can make an
+// unsatisfied gate report itself satisfied, and a sequence that advances on a forced permissive
+// fails somewhere downstream where nothing explains why. Hold the conditions or do not; there is
+// no third answer to publish. (fb_Interlock's inpGlobalBypass is a different case: an interlock
+// stops a running machine, so commissioning needs a documented way to move it.)
+//
+// Bounds are literals, per CONVENTIONS §5 — matched to ST_Permissive's ten slots. Plain STRING is
+// STRING(80), the same width the descriptions carry there.
+TYPE ST_Permissive_HMI_Interface :
+STRUCT
+    stsPermissiveOK     : BOOL;     // TRUE when every condition is met
+    stsConditions       : ARRAY[1..10] OF BOOL;
+    stsDescriptions     : ARRAY[1..10] OF STRING;
+    stsUnmetCount       : INT;      // how many are unmet — 0 when satisfied
+    stsPermissiveName   : STRING;   // set via the cfgName property
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

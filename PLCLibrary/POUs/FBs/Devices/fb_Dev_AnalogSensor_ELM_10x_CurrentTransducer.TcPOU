@@ -1,0 +1,61 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_AnalogSensor_ELM_10x_CurrentTransducer" Id="{d7a06130-3a8a-4036-8f20-1985648dbf8c}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_AnalogSensor_ELM_10x_CurrentTransducer EXTENDS fb_Dev_AnalogSensor_CurrentTransducer
+VAR_INPUT
+	inpRawIOChannelArray			: ARRAY [1..10] OF DINT;
+END_VAR
+VAR_OUTPUT
+	stsSensorRawSignalArray	: ARRAY [1..10] OF LREAL;
+	stsEngValueArray		: ARRAY [1..10] OF LREAL;
+	stsEngValueRMS			: LREAL;
+END_VAR
+VAR
+	_sensorRawSignalArray			: ARRAY [1..10] OF LREAL;
+	_engValueArray					: ARRAY [1..10] OF LREAL;
+	_engValueRMS					: LREAL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// This FB is intended for a ELM IO card set to 10x overscan with a 1ms CPU cycletime
+
+DeviceLogic();
+
+scaleInput();
+
+FaultHandler();
+
+setHMI();
+
+stsSensorRawSignalArray		:= _sensorRawSignalArray;
+stsEngValueArray			:= _engValueArray;
+
+stsSensorRawSignal 			:= _sensorRawSignal;
+stsEngValue					:= _engValue;
+stsEngValueRMS				:= _engValueRMS;]]></ST>
+    </Implementation>
+    <Method Name="scaleInput" Id="{a18d2851-8c47-4734-aaf3-44e7c235dc31}">
+      <Declaration><![CDATA[METHOD scaleInput : BOOL
+VAR
+	i : INT;
+	tempRaw 		: LREAL := 0.0;
+	tempEng 		: LREAL := 0.0;
+	tempEngSqSum 	: LREAL := 0.0;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR i := 1 TO 10 DO
+	_sensorRawSignalArray[i]	:= F_AnalogToEngUnit(inpRawIOChannelArray[i], cfgChannelMinInt, cfgChannelMaxInt, cfgSensorMin, cfgSensorMax);
+	_engValueArray[i]			:= (_sensorRawSignalArray[i] * _cfgWindingRatio / _cfgShuntResValue) * _CalGain + _calOffset;
+	tempRaw := tempRaw + _sensorRawSignalArray[i];
+	tempEng := tempEng + _engValueArray[i];
+	tempEngSqSum := tempEngSqSum + _engValueArray[i] * _engValueArray[i];
+	
+END_FOR
+
+_sensorRawSignal	:= tempRaw / 10;
+_engValue			:= tempEng / 10;
+_engValueRMS		:= SQRT(tempEngSqSum / 10);]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_Axis_JogSource" Id="{c3d4e5f6-a7b8-9012-cd03-ef3456789012}">
+    <Declaration><![CDATA[// Which input currently owns the jog. HMI jog and the physical teach pendant feed ONE
+// MC_Jog through the same gating; this reports/arbitrates which one is in control so the
+// two can never command opposite directions. The pendant's dead-man (inpPendantEnable)
+// takes ownership while held, locking out the HMI jog buttons.
+TYPE E_Axis_JogSource :
+(
+    eNone    := 0,  // no jog source active
+    eHMI     := 1,  // HMI jog buttons
+    ePendant := 2   // physical teach pendant (dead-man held)
+) INT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

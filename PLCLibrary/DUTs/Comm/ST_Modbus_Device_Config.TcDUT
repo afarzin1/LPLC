@@ -1,0 +1,14 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Modbus_Device_Config" Id="{1595ab9e-242a-4872-b5e7-f1f287f7033a}">
+    <Declaration><![CDATA[TYPE ST_Modbus_Device_Config :
+STRUCT
+	cfgIP_address	: STRING(15);
+	cfgTCPPort		: UINT;
+	cfgUnitID		: BYTE;
+	cfgTimeout		: TIME;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

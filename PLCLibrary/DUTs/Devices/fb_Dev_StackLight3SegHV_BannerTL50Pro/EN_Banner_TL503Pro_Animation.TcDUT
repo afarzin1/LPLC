@@ -1,0 +1,25 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="EN_Banner_TL503Pro_Animation" Id="{aa068879-02b9-4278-9b93-0f084e8f2e03}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+TYPE EN_Banner_TL503Pro_Animation :
+(
+	Off,
+	Steady,
+	Flash,
+	TwoColorFlash,
+	FiftyFifty,
+	FiftyFiftyRotate,
+	Chase,
+	IntensitySweep,
+	Scroll,
+	Bounce,
+	ColorSprectrum,
+	Demo
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

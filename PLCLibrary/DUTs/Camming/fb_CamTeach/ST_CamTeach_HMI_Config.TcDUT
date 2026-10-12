@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamTeach_HMI_Config" Id="{96893fd3-62fd-45c3-8e4f-40624fc54bb4}">
+    <Declaration><![CDATA[// HMI-editable configuration for one cam-teach instance.
+// These mirror the FB's cfg* settings so the operator can tune them from the screen;
+// fb_CamTeach reads them when the paired command runs (e.g. fileName on save/load).
+TYPE ST_CamTeach_HMI_Config :
+STRUCT
+    fileName    : STRING;              // bare file name to save to / load from (dir is the FB's concern)
+
+    // ISO-8601 timestamp for the CSV header, supplied by the HMI. The wall clock is
+    // not sampled in-scan, so the caller stamps 'created' (e.g. '2026-07-14T09:12:00').
+    created     : STRING;              // 'created=' value written into the file metadata header
+
+    // Editable tuning mirrors (applied on the relevant command / next convert):
+    periodic    : BOOL;               // TRUE = periodic table (wrap velocity at the seam)
+    interp      : E_CamTeach_Interp;  // interpolation strategy for cmdConvert
+    smoothWindow: INT;                // moving-average window on master column (3-5; 0 = off)
+    slaveName   : STRING;             // name of the slave this table teaches (goes into file header)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

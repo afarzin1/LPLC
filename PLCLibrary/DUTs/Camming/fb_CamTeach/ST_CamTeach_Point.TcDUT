@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_CamTeach_Point" Id="{2c029ace-538b-4548-8060-64a65ce263ad}">
+    <Declaration><![CDATA[// One raw taught master->slave pair for THIS slave table.
+// The file (CSV) stores these raw values; NC motion-function structs are
+// regenerated from them on convert, so the interpolation strategy can change.
+TYPE ST_CamTeach_Point :
+STRUCT
+    rMaster : LREAL;   // [master unit] strictly increasing after post-process (offset-zeroed, monotonic)
+    rSlave  : LREAL;   // [slave unit]  taught slave position at rMaster
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

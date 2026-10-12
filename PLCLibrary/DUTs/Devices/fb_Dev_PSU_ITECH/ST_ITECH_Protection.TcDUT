@@ -1,0 +1,28 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ITECH_Protection" Id="{ddbe2cfe-30ea-4b90-995e-52e6271940fb}">
+    <Declaration><![CDATA[TYPE ST_ITECH_Protection :
+STRUCT
+
+    OVPState     : UDINT;  // OVP_state (uint32)
+    OVPLevel     : REAL;   // OVP_level (float)
+    OVPDelay     : REAL;   // OVP_delay (float)
+    OCPState     : UDINT;  // OCP_state (uint32)
+ 	OCPLevel     : REAL;   // OCP_level (float)
+    OCPDelay     : REAL;   // OCP_delay (float)
+    OPPState     : UDINT;  // OPP_state (uint32)
+    OPPLevel     : REAL;   // OPP_level (float)
+    OPPDelay     : REAL;   // OPP_delay (float)
+    UCPState     : UDINT;  // UCP_state (uint32)
+    UCPLevel     : REAL;   // UCP_level (float)
+    UCPDelay     : REAL;   // UCP_delay (float)
+    UCPWarmup    : REAL;   // UCP_warmup (float)
+    UVPState     : UDINT;  // UVP_state (uint32)
+    UVPLevel     : REAL;   // UVP_level (float)
+    UVPDelay     : REAL;   // UVP_delay (float)
+    UVPWarmup    : REAL;   // UVP_warmup (float)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

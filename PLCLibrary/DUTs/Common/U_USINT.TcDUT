@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="U_USINT" Id="{b797bb89-8abf-4e19-b60f-cf9d0c152b48}">
+    <Declaration><![CDATA[TYPE U_USINT :
+UNION
+	Bits : ARRAY [1..1] OF  ST_Bits;
+	Num : USINT;
+END_UNION
+END_TYPE
+
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

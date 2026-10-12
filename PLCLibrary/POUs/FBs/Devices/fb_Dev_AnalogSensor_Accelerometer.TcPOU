@@ -1,0 +1,123 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_AnalogSensor_Accelerometer" Id="{d5e3a38f-dea2-4f27-a4b7-c1597487d35f}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_AnalogSensor_Accelerometer EXTENDS fb_Dev_AnalogSensor
+
+VAR_INPUT
+	inpRawIOArray : ARRAY [0..49] OF INT;
+END_VAR
+
+VAR
+	_mV_g : REAL;
+	_engValueArray 			:  ARRAY [0..49] OF LREAL;
+	_sensorRawSignalArray	:  ARRAY [0..49] OF LREAL;
+END_VAR
+
+VAR_OUTPUT
+	stsSensorRawSignalArray	: ARRAY [0..49] OF LREAL;
+	stsEngValueArray		: ARRAY [0..49] OF LREAL;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+
+scaleInput();
+
+FaultHandler();
+
+setHMI();
+
+stsSensorRawSignalArray	:= _sensorRawSignalArray;
+stsEngValueArray			:= _engValueArray;]]></ST>
+    </Implementation>
+    <Method Name="FB_Init" Id="{9981e82c-aa45-4baf-b8d1-d93a71458431}">
+      <Declaration><![CDATA[(*FB_Init is always available implicitly and it is used primarily for initialization.
+The return value is not evaluated. For a specific influence, you can also declare the
+methods explicitly and provide additional code there with the standard initialization
+code. You can evaluate the return value.*)
+METHOD FB_Init : BOOL
+VAR_INPUT
+	(* TRUE: the retain variables are initialized (reset warm / reset cold)*)
+	bInitRetains	: BOOL;
+	(* TRUE: the instance will be copied to the copy code afterward (online change)   *)
+bInCopyCode			: BOOL;
+	cfgDeviceName		: STRING;
+	cfgEnable			: BOOL;
+	cfgInitEventClass	: BOOL;
+	cfgAlarmEnable		: BOOL;
+	cfgAlarmH			: LREAL;
+	cfgAlarmHH			: LREAL;
+	cfgAlarmL			: LREAL;
+	cfgAlarmLL			: LREAL;
+	cfgEngUnit			: STRING;
+	cfgCalOffset		: LREAL;
+	cfgCalGain			: LREAL := 1.0;	// omitted in the declaration = 1 (no correction)
+	cfgmV_g				: REAL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 		:= 		cfgDeviceName; 		
+THIS^.cfgEnable 			:= 	    cfgEnable; 	
+THIS^.cfgInitEventClass		:= 		cfgInitEventClass;
+THIS^.cfgAlarmEnable		:=		cfgAlarmEnable;
+THIS^.cfgAlarmH				:=		cfgAlarmH;
+THIS^.cfgAlarmHH			:=		cfgAlarmHH;
+THIS^.cfgAlarmL				:=		cfgAlarmL;
+THIS^.cfgAlarmLL			:=		cfgAlarmLL;
+THIS^.cfgCalOffset			:=		cfgCalOffset;
+THIS^.cfgCalGain			:=		cfgCalGain;
+THIS^.cfgEngUnit			:=		cfgEngUnit;
+THIS^._mV_g					:= 		cfgmV_g;
+
+THIS^.HMI.cfgAlarmEnable	:= cfgAlarmEnable;
+THIS^.HMI.cfgAlarmH			:= cfgAlarmH;
+THIS^.HMI.cfgAlarmHH		:= cfgAlarmHH;
+THIS^.HMI.cfgAlarmL			:= cfgAlarmL;
+THIS^.HMI.cfgAlarmLL		:= cfgAlarmLL;
+THIS^.HMI.cfgEngUnit		:= cfgEngUnit;
+THIS^.HMI.cfgCalOffset		:= cfgCalOffset;
+THIS^.HMI.cfgCalGain		:= cfgCalGain;]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="mV_g" Id="{dee17e13-73ed-4d63-be25-e17440209662}">
+      <Declaration><![CDATA[PROPERTY mV_g : REAL]]></Declaration>
+      <Get Name="Get" Id="{9a39257b-2654-4c16-b212-1bd983b59b7d}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[mV_g := _mV_g;
+]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{2d2a45ea-2243-4949-b64c-9ed66dd73b18}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_mV_g := mV_g;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="scaleInput" Id="{80395f53-1645-49ba-b28d-81be871a2f94}">
+      <Declaration><![CDATA[METHOD scaleInput : BOOL
+ VAR
+	 i : INT;
+ END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF cfgScalingNeeded THEN
+	FOR i := 0 TO 49 DO
+		_sensorRawSignalArray[i]	:= F_AnalogToEngUnit(inpRawIOArray[i], cfgChannelMinInt, cfgChannelMaxInt, cfgSensorMin, cfgSensorMax);
+		_engValueArray[i]			:= ((_sensorRawSignalArray[i]/_mV_g) * _CalGain) + _CalOffset;
+	END_FOR
+	
+	
+ELSE
+	FOR i := 0 TO 49 DO
+		_sensorRawSignalArray[i] := inpRawIOArray[i];
+		_engValueArray[i]		 := (_sensorRawSignalArray[i] * _CalGain) + _CalOffset;
+	END_FOR
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

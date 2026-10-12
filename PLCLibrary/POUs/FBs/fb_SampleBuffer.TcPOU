@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_SampleBuffer" Id="{8a4e1c5d-9b2f-4a73-bf08-1e6c3d7a02f1}" SpecialFunc="None">
+    <Declaration><![CDATA[(* fb_SampleBuffer
+
+   Sensor-agnostic oversampling ring buffer. Captures the N-sample oversample
+   block delivered by a Beckhoff oversampling terminal each PLC scan (1 ms
+   scan) into a long ring buffer that an external ADS reader (the chart
+   engine) can poll at its own slower cadence without losing samples.
+
+   Works for any terminal that produces a block of 32-bit samples per scan:
+     - ELM3602-0002 accelerometer (raw INT32 ADC counts, 50 kHz / 50x)
+     - EL5101-0011 encoder (oversampled position counter, for order tracking)
+   The FB doesn't interpret the samples — it just rings them. Scaling /
+   unwrapping / FFT happen downstream in the engine, so a DINT ring is used
+   regardless of what the counts mean (encoder UDINT counters are bit-
+   compatible; map them as DINT in the process image and unwrap in Python).
+
+   The engine's actual fast-loop period on a reference test-stand config measures
+   ~80 ms (89-signal batch + 2x 16 KB ring reads + asyncio.sleep(33 ms)), so
+   the ring consumes ~4000 samples per tick. cRING_SIZE = 8192 gives ~164 ms
+   of buffer — absorbing both the slow first tick (extra slow + test-panel
+   reads, ~115 ms) and transient ADS jitter without overwriting unread samples.
+
+   Reader contract:
+     - stsTotalSamples is monotonic across PLC restarts of this FB (never wraps
+       for ~12,000 years at 50 kHz). The reader stores its last-seen value;
+       delta := stsTotalSamples - lastSeen tells the reader how many new samples
+       arrived since the previous read.
+     - If delta > stsRingSize the reader has fallen behind further than the
+       ring can hold — older samples have been overwritten. Detection and
+       handling (gap-marker, drop window, log) live on the reader side.
+     - To extract the last N := MIN(delta, stsRingSize) samples in chrono
+       order, read backward from ((stsWriteIdx - 1) MOD stsRingSize) for N
+       slots, then reverse — or read the whole stsRingBuffer once and slice.
+
+   For synchronous multi-channel work (e.g. order tracking pairs an accel
+   instance with an encoder instance): instantiate one FB per signal in the
+   same task. All instances advance stsTotalSamples in lockstep (+cBLOCK_SIZE
+   per scan), so the reader aligns channels by total-sample index.
+*)
+FUNCTION_BLOCK fb_SampleBuffer
+
+VAR CONSTANT
+	cRING_SIZE		: UDINT := 8192;	// ~164 ms of buffer at 50 kHz; absorbs slow first tick + ADS jitter
+	cBLOCK_SIZE		: UDINT := 50;		// oversample factor at 1 ms scan (ELM3602 / EL5101 50x)
+END_VAR
+
+VAR_INPUT
+	inpRawBlock		: ARRAY [0..49] OF DINT;	// one oversample frame (accel block or encoder block)
+	inpEnable		: BOOL := TRUE;
+END_VAR
+
+VAR_OUTPUT
+	stsRingBuffer	: ARRAY [0..8191] OF DINT;	// raw samples; reader uses stsTotalSamples to compute the newest-sample slot
+	stsTotalSamples	: ULINT;					// monotonic count of samples ever written; never wraps in practice
+	stsWriteIdx		: UDINT;					// next slot to write into; ((stsWriteIdx - 1) MOD cRING_SIZE) is newest
+	stsRingSize		: UDINT := 8192;			// exposed for the reader so it doesn't have to hard-code
+	stsBlockSize	: UDINT := 50;
+END_VAR
+
+VAR
+	_writeIdx		: UDINT;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[IF NOT inpEnable THEN
+	RETURN;
+END_IF
+
+BufferSamples();
+
+stsWriteIdx := _writeIdx;]]></ST>
+    </Implementation>
+    <Method Name="BufferSamples" Id="{3c1b7e09-5d4a-4c12-8e1f-2a9b6f5d3e74}">
+      <Declaration><![CDATA[(* Append the oversample frame into the ring and advance the monotonic
+   sample counter. Wrapping is per-sample (not per-block) so reader logic
+   doesn't need to special-case partial-block wraps. *)
+METHOD BufferSamples : BOOL
+VAR
+	i : UDINT;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR i := 0 TO cBLOCK_SIZE - 1 DO
+	stsRingBuffer[_writeIdx] := inpRawBlock[i];
+	_writeIdx := (_writeIdx + 1) MOD cRING_SIZE;
+END_FOR
+
+stsTotalSamples := stsTotalSamples + cBLOCK_SIZE;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,29 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="EN_Banner_TL503Pro_Colors" Id="{b7643c76-08eb-47d5-9b0f-d955ad6b1f39}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+TYPE EN_Banner_TL503Pro_Colors :
+(
+	Green,
+	Red,
+	Orange,
+	Amber,
+	Yellow,
+	LimeGreen,
+	SpringGreen,
+	Cyan,
+	SkyBlue,
+	Blue,
+	Violet,
+	Magenta,
+	Rose,
+	White,
+	Custom1,
+	Custom2	
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

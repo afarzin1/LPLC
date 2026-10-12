@@ -1,0 +1,22 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Pump_SPAL_CAN_Inputs" Id="{5daf7294-6bf5-4e7b-9ba5-074fe0d30695}">
+    <Declaration><![CDATA[TYPE ST_Pump_SPAL_CAN_Inputs :
+STRUCT
+	PumpMotor		: USINT;
+	PumpError		: USINT;
+	PumpCMDStatus	: USINT;
+	PumpSpeed		: LREAL;
+	PumpTemperature : LREAL;
+	PumpPower		: LREAL;
+	PumpServiceIndicator	: USINT;
+	PumpOperatorStatus		: USINT;
+	
+	
+	
+	
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

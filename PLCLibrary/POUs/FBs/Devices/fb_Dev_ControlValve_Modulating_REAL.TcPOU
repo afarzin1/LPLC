@@ -1,0 +1,70 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_ControlValve_Modulating_REAL" Id="{22060ad1-50dd-4e13-a850-919e1d598129}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_ControlValve_Modulating_REAL
+VAR_INPUT
+	IO_valveFeedback	: LREAL;
+	IO_valveOutput		: POINTER TO REAL;
+	inpAuto				: BOOL;
+	inpReset			: BOOL;
+	inpInterlockBypass	: BOOL;
+	faultMonitor		: POINTER TO fb_FaultMonitor;
+END_VAR
+
+VAR
+	valveFeedback_scaled	: LREAL;
+	_valveName				: STRING;
+	Valve					: fb_Dev_ControlValve_Modulating(cfgDeviceName := _valveName, cfgEnable := TRUE, cfgInitEventClass := TRUE);
+	_valvePositionCmd		: LREAL;
+	
+END_VAR
+VAR_OUTPUT
+	outValvePosition	: LREAL;
+	stsValveFeedback	: LREAL;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//INPUTS AND OUTPUTS FOR THIS FB VARIANT ARE SCALED ANALOG VALUES IN VOLTS
+valveFeedback_scaled := F_AnalogToEngUnit(IO_valveFeedback, 2, 10, 0, 100);
+
+Valve(inpAuto := inpAuto, inpReset := inpReset, inpInterlockBypass := inpInterlockBypass, faultMonitor:=faultMonitor
+		, inpValvePosition := valveFeedback_scaled);
+		
+outValvePosition := Valve.outValvePosition;
+stsValveFeedback := Valve.stsValveFeedback;
+
+Valve.valvePosition := _valvePositionCmd;
+
+		
+IO_valveOutput^ := F_AnalogToEngUnit(TO_LREAL(Valve.outValvePosition), 0, 100, 2, 10);
+		
+		]]></ST>
+    </Implementation>
+    <Property Name="cmdSetValvePosition" Id="{8723dea7-1375-4764-bfda-7e9ca5bf7e97}">
+      <Declaration><![CDATA[PROPERTY cmdSetValvePosition : LREAL]]></Declaration>
+      <Set Name="Set" Id="{e2e837c0-1c31-4ff8-8f7c-da57171b67bf}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_valvePositionCmd := cmdSetValvePosition;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <Method Name="FB_Init" Id="{e5e9758e-5133-488c-9941-52e0ec2c8dde}">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init: BOOL
+VAR_INPUT
+    bInitRetains: BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode: BOOL;  // TRUE: the instance will be copied to the copy code afterward (online change) 
+	cfgDeviceName	: STRING;  
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^._valveName 			:= cfgDeviceName;
+THIS^.Valve.cfgDeviceName 	:= cfgDeviceName;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

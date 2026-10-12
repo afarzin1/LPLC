@@ -1,0 +1,17 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ITECH_DCMeter" Id="{bfa9f2c0-a690-4f92-bd6a-f658a09886c9}">
+    <Declaration><![CDATA[TYPE ST_ITECH_DCMeter :
+STRUCT
+	DCVrms      : REAL;   // DC-METER: v_rms (float)
+    DCIrms      : REAL;   // DC-METER: i_rms (float)
+    DCPrms      : REAL;   // DC-METER: p_rms (float)
+    DCOperReg   : UDINT;  // DC-METER: oper_reg (uint32)
+    DCStateReg  : UDINT;  // DC-METER: state_reg (uint32)
+    DCQuesReg   : UDINT;  // DC-METER: ques_reg (uint32)
+    DCSenseVolt : REAL;   // DC-METER: sense_volt (float)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

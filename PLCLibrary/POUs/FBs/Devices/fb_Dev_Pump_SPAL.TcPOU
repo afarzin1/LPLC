@@ -1,0 +1,328 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_Pump_SPAL" Id="{288faab6-ad4b-4e01-ba14-7d36f5639360}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Dev_Pump_SPAL EXTENDS abs_fb_Device
+VAR_INPUT
+	IO_CANIn		: POINTER TO ST_Pump_SPAL_CAN_Inputs;
+	IO_CANOut		: POINTER TO ST_Pump_SPAL_CAN_Outputs;
+	IO_CAN_State	: POINTER TO ST_EL6751_Bus_State;
+	IO_LV_DO		: POINTER TO BOOL;
+	inpESTOPActive	: BOOL;
+	inpMachineSTOP	: BOOL;
+END_VAR
+
+VAR PERSISTENT
+	HMI						: ST_Pump_SPAL_HMI_Interface;
+END_VAR
+	
+VAR
+	LVActuator				:fb_Dev_Actuator(cfgDeviceName := CONCAT(_deviceName,' PWR'), cfgHasFeedback:=FALSE,cfgInitEventclass := TRUE,
+										  cfgEnable := TRUE,
+										  cfgOnDelay :=T#3S,
+										  cfgOffDelay:=T#1S,
+										  cfgRetractOnFault := TRUE,
+										  cfgInvFeedback:=FALSE);
+	_LVActuator_interlocks	: ARRAY [1..10] OF BOOL;
+	_interlocks				: ARRAY [1..10] of BOOL;
+	
+	Bus_Status				: fb_IO_EL6751_Bus_Status;
+	_pumpState				: STRING;
+	_pumpCommandFB			: STRING;
+	_pumpMotorFB			: STRING;
+	_pumpServiceIndicator	: STRING;
+	_pumpError				: STRING;
+	_pumpPower				: LREAL;
+	_pumpTemperature		: LREAL;
+	_pumpSpeed				: LREAL;
+	_ctrlRunPump			: USINT;
+	_ctrlSetpoint			: LREAL;
+END_VAR
+
+VAR_OUTPUT
+	stsLVOn		: BOOL;
+	stsEnabled	: BOOL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+Bus_Status(IO_Bus_State	:= IO_CAN_State^);
+LVActuator(inpAuto:= inpAuto,inpReset:=inpReset,IO_output_Actuate:=IO_LV_DO^);
+
+_LVActuator_interlocks[1] := inpESTOPActive;
+LVActuator.cmdSetInterlock(1,'ESTOPs Not Active',_LVActuator_interlocks[1]);
+
+_interlocks[1] := inpESTOPActive;
+cmdSetInterlock(1,'ESTOPs Not Active',_LVActuator_interlocks[1]);
+
+_interlocks[2] := LVactuator.stsActuated;
+cmdSetInterlock(2, 'LV On', _interlocks[2]);
+
+_interlocks[3] := NOT(inpMachineStop);
+cmdSetInterlock(3, 'Machine STOP Not Active', _interlocks[3]);
+
+
+parsePumpFeedback();
+FaultHandler();
+
+IF _Enabled THEN
+	IF (NOT _inAuto) THEN
+		_ctrlRunPump	:= HMI.ocmdRunPump;
+		_ctrlSetpoint	:= HMI.ocmdSetpoint;
+	END_IF
+END_IF
+
+IF NOT(LVActuator.stsActuated) THEN
+	resetControlSignals();
+END_IF
+
+// A faulted pump is not commanded to run. Without this, an auto-mode run request survived the
+// fault and the pump restarted by itself as soon as its interlock came back.
+IF stsFaulted THEN
+	_ctrlRunPump    := 0;
+	HMI.ocmdRunPump := 0;
+END_IF
+
+IF interlock.outInterlockOK THEN
+	IO_CANOut^.MotorSetpoint 	:= _ctrlSetpoint;
+	IO_CANOut^.MotorStateRequest := _ctrlRunPump;
+ELSE
+	HMI.ocmdRunPump := 0;
+	IO_CANOut^.MotorStateRequest := 0;
+END_IF
+
+sendLog(Concat('Run command set to ',TO_STRING(_ctrlRunPump)),1);
+sendLog(Concat('Setpoint set to ', TO_STRING(_ctrlSetpoint)),2);
+
+updateHMI();
+
+stsLVOn	:= LVActuator.stsActuated;
+stsEnabled := (_ctrlRunPump = 1);
+
+
+]]></ST>
+    </Implementation>
+    <Method Name="cmdEnable" Id="{b7950aff-de6b-4739-8aae-0556485ac575}">
+      <Declaration><![CDATA[METHOD cmdEnable : BOOL
+VAR_INPUT
+	command	: USINT; //1= Enable, 0= Disable
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_ctrlRunPump := command;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdLV" Id="{54e84ac7-3a48-43e9-9f42-9ca0d184c1fa}">
+      <Declaration><![CDATA[METHOD PUBLIC cmdLV : BOOL
+VAR_INPUT
+	command	: BOOL; //1=ON, 0=OFF
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF command THEN
+	LVActuator.cmdActuate();
+ELSE
+	LVActuator.cmdRetract();
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{3c2463a8-d035-4c5d-8c36-515e5910c624}">
+      <Declaration><![CDATA[METHOD cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[setFault(0,'');]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdSetpoint" Id="{05a5f37c-8de0-4703-8f8e-277e86f10e27}">
+      <Declaration><![CDATA[METHOD cmdSetpoint : BOOL
+VAR_INPUT
+	setpoint	: LREAL; //0-100%
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_ctrlSetpoint	:= setpoint;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FaultHandler" Id="{824c9caf-dcec-43b7-84ae-7aa90cae926c}">
+      <Declaration><![CDATA[METHOD PRIVATE FaultHandler : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[
+
+IF LVActuator.stsFaulted AND _ctrlRunPump = 1 THEN
+	setFault(1,LVActuator.stsFaultDescription);
+END_IF
+
+IF LVactuator.stsActuated AND _ctrlRunPump = 1 AND IO_CANIn^.PumpOperatorStatus = EN_Pump_SPAL_Operating_status.Not_Operable THEN 
+	setFault(1,_pumpError);
+END_IF
+
+// Faults LATCH until cmdReset / inpReset. (A 'Normal' operating status used to clear every fault
+// here on the next scan, interlock-loss and LV faults included, so nothing stayed faulted.)
+
+IF IO_CANIn^.PumpOperatorStatus = EN_Pump_SPAL_Operating_status.Derated THEN
+	sendWarning('Derated',10);
+END_IF
+
+IF IO_CANIn^.PumpServiceIndicator = EN_Pump_SPAL_ServiceIndicator.Service_required THEN
+	sendWarning('Service required',11);
+END_IF
+
+//If enabled and  then fault
+IF NOT stsFaulted AND _ctrlRunPump = 1 THEN
+	IF NOT interlock.outInterlockOK THEN
+		setFault(1,CONCAT('I_NOK - ',Interlock.stsFirstOut));
+	END_IF
+END_IF
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FB_Init" Id="{2dfd2c94-816f-473d-ac13-69f2c29e597f}">
+      <Declaration><![CDATA[//FB_Init is always available implicitly and it is used primarily for initialization.
+//The return value is not evaluated. For a specific influence, you can also declare the
+//methods explicitly and provide additional code there with the standard initialization
+//code. You can evaluate the return value.
+METHOD FB_Init: BOOL
+VAR_INPUT
+    bInitRetains: BOOL; // TRUE: the retain variables are initialized (reset warm / reset cold)
+    bInCopyCode: BOOL;  // TRUE: the instance will be copied to the copy code afterward (online change) 
+	cfgDeviceName 	: STRING;
+	cfgEnable		: BOOL;
+	cfgInitEventClass	: BOOL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^.cfgDeviceName 	:= cfgDeviceName;
+THIS^.cfgEnable 		:= cfgEnable;
+THIS^.cfgInitEventClass	:= cfgInitEventClass;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="parsePumpFeedback" Id="{3d2d7246-b0f3-4d0e-82c6-82587d1e4c2f}">
+      <Declaration><![CDATA[METHOD PRIVATE parsePumpFeedback : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE TO_INT(IO_CANIn^.PumpError) OF
+	EN_Pump_SPAL_PumpError.Dry_Run:
+		_pumpError :=   'Dry Run';
+	EN_Pump_SPAL_PumpError.Normal_Operation:
+		_pumpError := 'N/A';
+	EN_Pump_SPAL_PumpError.OverT_Protection_Shutdown:
+		_pumpError := 'Over Temperature Protection';
+	EN_Pump_SPAL_PumpError.OverV_Protection_Shutdown:
+		_pumpError := 'Over Voltage Protection';
+	EN_Pump_SPAL_PumpError.Speed_Limited_Due_To_Capability:
+		_pumpError := 'Speed limited due to capability';
+	EN_Pump_SPAL_PumpError.Speed_Limited_Due_To_Current:
+		_pumpError := 'Speed limited due to current';
+	EN_Pump_SPAL_PumpError.Speed_Limited_Due_To_OverT:
+		_pumpError := 'Speed limited due to overtemperature';
+	EN_Pump_SPAL_PumpError.Speed_Limited_Due_To_Torque:
+		_pumpError := 'Speed limited due to torque';
+	EN_Pump_SPAL_PumpError.Unable_to_start:
+		_pumpError := 'Unable to start';
+	EN_Pump_SPAL_PumpError.UnderV_Protection_Shutdown:
+		_pumpError := 'Undervoltage protection';
+	ELSE
+		_pumpError := 'Undefined error';
+		
+END_CASE
+
+CASE TO_INT(IO_CANIn^.PumpOperatorStatus) OF
+	EN_Pump_SPAL_Operating_status.Derated:
+		_pumpState := 'Derated';
+	EN_Pump_SPAL_Operating_status.Normal:
+		_pumpState := 'Normal';
+	EN_Pump_SPAL_Operating_status.Not_Available:
+		_pumpState := 'Not Available';
+	EN_Pump_SPAL_Operating_status.Not_Operable:
+		_pumpState:= 'Not Operable';	
+END_CASE
+
+CASE TO_INT(IO_CANIn^.PumpServiceIndicator) OF
+	EN_Pump_SPAL_ServiceIndicator.Not_Available:
+		_pumpServiceIndicator := 'N/A';
+	EN_Pump_SPAL_ServiceIndicator.Reserved:
+		_pumpServiceIndicator:= 'Reserved';
+	EN_Pump_SPAL_ServiceIndicator.Service_not_required:
+		_pumpServiceIndicator := 'OK';
+	EN_Pump_SPAL_ServiceIndicator.Service_required:
+		_pumpServiceIndicator := 'Service Required';	
+END_CASE
+
+CASE TO_INT(IO_CANIn^.PumpCMDStatus) OF
+	0:
+		_pumpCommandFB := 'Internal';
+	1:
+		_pumpCommandFB := 'External';
+	2:
+		_pumpCommandFB := 'Default';
+	3:
+		_pumpCommandFB := 'N/A';
+END_CASE
+
+CASE TO_INT(IO_CANIn^.PumpMotor) OF
+	0:
+		_pumpMotorFB := 'OFF';
+	1:
+		_pumpMotorFB := 'ON';
+	2:
+		_pumpMotorFB := 'Reverse';
+	3:
+		_pumpMotorFB := 'N/A';
+END_CASE
+
+_pumpTemperature := IO_CANIn^.PumpTemperature;
+_pumpSpeed		 := IO_CANIn^.PumpSpeed;
+_pumpPower		 := IO_CANIn^.PumpPower;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="resetControlSignals" Id="{a20332df-cd92-48b6-9376-87e820f83f33}">
+      <Declaration><![CDATA[METHOD PRIVATE resetControlSignals : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_ctrlRunPump	:= 0;
+_ctrlSetpoint	:= 0.0;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="updateHMI" Id="{1b1d38ab-5a7f-49e0-963f-66e6e6819e74}">
+      <Declaration><![CDATA[METHOD PRIVATE updateHMI : BOOL
+VAR
+
+END_VAR
+
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[HMI.HMIbaseDevice := HMIbaseDevice;
+HMI.stsBusStatus  := Bus_Status.getHMIData();
+
+HMI.stsRunPump	  := _ctrlRunPump;
+HMI.stsSetpoint	  := _ctrlSetpoint;
+
+HMI.stsCommandFB 		:= _pumpCommandFB;
+HMI.stsError	 		:= _pumpError;
+HMI.stsMotorFB			:= _pumpMotorFB;
+HMI.stsPower     		:= _pumpPower;
+HMI.stsServiceIndicator := _pumpServiceIndicator;
+HMI.stsSpeed			:= _pumpSpeed;
+HMI.stsState			:= _pumpState;
+HMI.stsTemperature		:= _pumpTemperature;
+
+IF bus_status.stsBusFaulted THEN
+	HMI.stsBusOK := FALSE;
+ELSE
+	HMI.stsBusOK := TRUE;
+END_IF
+
+
+
+
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

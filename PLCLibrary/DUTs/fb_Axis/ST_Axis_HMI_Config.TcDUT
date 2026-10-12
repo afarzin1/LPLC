@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Axis_HMI_Config" Id="{a8b9c0d1-e2f3-4567-8901-456789000007}">
+    <Declaration><![CDATA[// HMI-editable axis configuration.
+// The move table here is a draft buffer. fb_Axis copies it into the internal
+// persistent live move table only when ocmdApplyMoveConfig is accepted.
+TYPE ST_Axis_HMI_Config :
+STRUCT
+    homePosition : LREAL; // position assigned by MC_Home using MC_Direct [unit]
+    moves : ARRAY[1..20] OF ST_Axis_MoveDefinition;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

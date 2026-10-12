@@ -1,0 +1,33 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Machine_HMI_Interface" Id="{68f90176-4e05-4bcc-a61e-7a41a4b75786}">
+    <Declaration><![CDATA[TYPE ST_Machine_HMI_Interface :
+STRUCT
+	inpReset				: BOOL;
+	inpStop					: BOOL;
+	inpStart				: BOOL;
+	inpAuto					: BOOL;
+	inpManual				: BOOL;
+	inpInterlockBypass		: BOOL;
+	inpAbort				: BOOL;
+	inpPause				: BOOL;
+	inpClearMachineLog		: BOOL;
+	stsStopped				: BOOL;
+	stsStarted				: BOOL;
+	stsStartEnable			: BOOL;
+	stsStartReady			: BOOL;
+	stsInAuto				: BOOL;
+	stsAutoEnable			: BOOL;
+	stsInManual				: BOOL;
+	stsInterlockBypassed	: BOOL;
+	stsPaused				: BOOL;
+	stsPausing				: BOOL;
+	stsPauseEnable			: BOOL;
+	stsInterlocksBypassed	: BOOL;
+	stsMachineName			: T_MaxString;
+	stsHeartBeat			: BOOL;			// toggles 500ms on / 500ms off - HMI frozen-data watchdog (binds machine.heartbeat)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

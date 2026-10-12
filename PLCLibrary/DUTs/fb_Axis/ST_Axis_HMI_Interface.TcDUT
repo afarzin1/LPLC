@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Axis_HMI_Interface" Id="{f6a7b8c9-d0e1-2345-f056-345678900005}">
+    <Declaration><![CDATA[TYPE ST_Axis_HMI_Interface :
+STRUCT
+    // Inherited base-device HMI values (deviceName, enabled, stsInAuto, stsFaulted,
+    // stsFaultDescription, axis-level interlock). Populated from abs_fb_Device.
+    HMIbaseDevice : ST_Device_HMI_Interface;
+    Status        : ST_Axis_HMI_Status;
+    Commands      : ST_Axis_HMI_Commands;
+    Config        : ST_Axis_HMI_Config;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

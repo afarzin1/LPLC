@@ -1,0 +1,18 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_StateDevice_HMI_Interface" Id="{9ca2ce83-5f3a-45bd-a137-113bb22a5a80}">
+    <Declaration><![CDATA[TYPE ST_StateDevice_HMI_Interface :
+STRUCT
+	Status		: ST_StateDevice_HMI_Status;
+	Commands 	: ST_StateDevice_HMI_Commands;
+	Interlock  	: ST_Interlock_HMI_Interface;
+	// Conditions that must be met for this device to ENTER Running (cmdSetStartPermissive). Purely
+	// ADDITIVE — a device that never wires a slot publishes an all-satisfied permissive, so nothing
+	// that read this struct before needs to change.
+	startPermissive	: ST_Permissive_HMI_Interface;
+
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

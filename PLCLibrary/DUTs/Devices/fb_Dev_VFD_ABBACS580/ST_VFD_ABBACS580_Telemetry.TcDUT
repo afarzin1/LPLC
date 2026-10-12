@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_VFD_ABBACS580_Telemetry" Id="{a1b00002-0000-4000-8000-000000000001}">
+    <Declaration><![CDATA[TYPE ST_VFD_ABBACS580_Telemetry :
+STRUCT
+	actualSpeed		: LREAL;	// percent, signed
+	motorCurrent	: LREAL;	// A (raw par 01.07; default whole amps)
+	dcBusVoltage	: LREAL;	// VDC (raw 0.1 VDC / 10)
+	outputFreq		: LREAL;	// Hz, signed (assumes par 46.02 = 60.0)
+	motorTorque		: LREAL;	// %, signed (raw 0.01% / 100)
+	inverterTemp	: LREAL;	// % (raw 1%)
+	faultCode		: UINT;		// par 04.11 raw
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

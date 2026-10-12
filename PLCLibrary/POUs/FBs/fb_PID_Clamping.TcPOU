@@ -1,0 +1,141 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_PID_Clamping" Id="{35809f69-c29e-4c5b-bbab-1110c672baf5}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_PID_Clamping
+VAR_INPUT
+    inpSP               : LREAL;
+    inpPV               : LREAL;
+    inpManualValue      : LREAL;
+    inpEnable           : BOOL;
+    inpPIDReset         : BOOL;
+    cfgKp               : LREAL;
+    cfgTn               : LREAL;
+    cfgTv               : LREAL;
+    cfgOutMin           : LREAL := 0.0;
+    cfgOutMax           : LREAL := 350.0;
+    cfgCycleTime        : LREAL := 0.01;
+    cfgOutputFilterAlpha: LREAL := 0.4;
+    cfgDerivFilterN     : LREAL := 8.0;
+    cfgPvRateWindow     : LREAL := 20.0;
+    cfgCoolingMode      : BOOL := FALSE;
+END_VAR
+VAR_OUTPUT
+    stsOut              : LREAL;
+    stsAuto             : BOOL;
+END_VAR
+VAR
+    _integral           : LREAL;
+    _p                  : LREAL;
+    _i                  : LREAL;
+    _d                  : LREAL;
+    _pvRate             : LREAL;
+    _pvWindowAgo        : LREAL;
+    _windowTimer        : LREAL;
+    _error              : LREAL;
+    _outRaw             : LREAL;
+    _outClamped         : LREAL;
+    _wasAuto            : BOOL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// Reset clears accumulated controller state only. It must NOT force the output
+// to 0, otherwise it would override the manual pass-through below when reset is
+// held while the block is disabled.
+IF inpPIDReset THEN
+    _integral    := 0.0;
+    _pvWindowAgo := inpPV;
+    _windowTimer := 0.0;
+    _d           := 0.0;
+    _wasAuto     := FALSE;
+END_IF
+
+// Error sign depends on mode. Heating: drive output up when PV is below SP.
+// Cooling: drive output up when PV is above SP (reverse acting).
+IF cfgCoolingMode THEN
+    _error := inpPV - inpSP;
+ELSE
+    _error := inpSP - inpPV;
+END_IF
+
+// Disabled: pass the manual value straight through (transparent insert) and
+// preload the integral so the first auto scan resumes from the manual value.
+IF NOT inpEnable THEN
+    _outClamped := LIMIT(cfgOutMin, inpManualValue, cfgOutMax);
+    stsOut      := _outClamped;
+    stsAuto     := FALSE;
+    _wasAuto     := FALSE;
+    _pvWindowAgo := inpPV;
+    _windowTimer := 0.0;
+    _d           := 0.0;
+    _p           := cfgKp * _error;
+    _integral    := _outClamped - _p;
+    RETURN;
+END_IF
+
+stsAuto := TRUE;
+
+// On transfer into auto, seed the rate window and clear the filtered derivative
+// so the first scan sees no PV step and no carried-over derivative state.
+IF NOT _wasAuto THEN
+    _pvWindowAgo := inpPV;
+    _windowTimer := 0.0;
+    _d           := 0.0;
+    _wasAuto     := TRUE;
+END_IF
+
+_p := cfgKp * _error;
+
+IF cfgTn > 0.0 THEN
+    IF (_outClamped >= cfgOutMax AND _error > 0.0) OR
+       (_outClamped <= cfgOutMin AND _error < 0.0) THEN
+        ;
+    ELSE
+        _integral := _integral + (cfgKp / cfgTn) * _error * cfgCycleTime;
+    END_IF
+    _i := _integral;
+ELSE
+    _i := 0.0;
+END_IF
+
+// Derivative on measurement (PV), first-order filtered.
+//
+// Acting on the change in PV (not error) avoids a derivative kick when the
+// setpoint moves and keeps the sign convention explicit. The filter is the
+// backward-Euler discretization of  Kp*Tv*s / (1 + (Tv/N)*s), with divisor N:
+// large N -> near-raw difference, small N -> heavier smoothing. It rejects the
+// per-tick spikes produced by the 0.1 degC PV quantization so the term tracks
+// the genuine temperature trend instead of chattering on each digit step.
+//
+// Sign: a rising PV must raise output in cooling mode (anticipatory fan
+// spin-up) and lower it in heating mode.
+IF cfgTv > 0.0 AND cfgDerivFilterN > 0.0 THEN
+    // PV is quantized to 0.1 degC and changes slowly (~0.1 degC / 30 s), so a
+    // scan-to-scan difference is 0.0 on almost every scan. Measure the change
+    // over a fixed window instead and divide by the elapsed window time to get
+    // a true degC/s rate. _pvRate updates once per window and holds between
+    // updates; the process is far slower than the window and the derivative
+    // filter below smooths the steps.
+    _windowTimer := _windowTimer + cfgCycleTime;
+    IF _windowTimer >= cfgPvRateWindow THEN
+        IF cfgCoolingMode THEN
+            _pvRate := (inpPV - _pvWindowAgo) / _windowTimer;
+        ELSE
+            _pvRate := (_pvWindowAgo - inpPV) / _windowTimer;
+        END_IF
+        _pvWindowAgo := inpPV;
+        _windowTimer := 0.0;
+    END_IF
+    _d := (cfgTv / (cfgTv + cfgDerivFilterN * cfgCycleTime)) * _d
+        + (cfgKp * cfgTv * cfgDerivFilterN / (cfgTv + cfgDerivFilterN * cfgCycleTime)) * _pvRate;
+ELSE
+    _d := 0.0;
+END_IF
+
+_outRaw     := _p + _i + _d;
+_outClamped := LIMIT(cfgOutMin, _outRaw, cfgOutMax);
+
+// Smooth the output
+stsOut := stsOut + cfgOutputFilterAlpha * (_outClamped - stsOut);]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

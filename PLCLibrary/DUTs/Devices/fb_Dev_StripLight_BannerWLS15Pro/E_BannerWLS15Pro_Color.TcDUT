@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_BannerWLS15Pro_Color" Id="{c5fe6fcf-6356-4053-8190-7336f97cfbe0}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+// Run Mode Color 1 / Color 2, subindices 2 and 6 (219132 Rev. A, section 1.3.2).
+// eCustom1 / eCustom2 render whatever was written to the device's custom
+// colour parameters; the rest are fixed in firmware.
+TYPE E_BannerWLS15Pro_Color :
+(
+    eGreen                  := 0,
+    eRed                    := 1,
+    eOrange                 := 2,
+    eAmber                  := 3,
+    eYellow                 := 4,
+    eLimeGreen              := 5,
+    eSpringGreen            := 6,
+    eCyan                   := 7,
+    eSkyBlue                := 8,
+    eBlue                   := 9,
+    eViolet                 := 10,
+    eMagenta                := 11,
+    eRose                   := 12,
+    eDaylightWhite5000K     := 13,
+    eCustom1                := 14,
+    eCustom2                := 15,
+    eIncandescentWhite2700K := 16,
+    eWarmWhite3000K         := 17,
+    eFluorescentWhite4100K  := 18,
+    eNeutralWhite5700K      := 19,
+    eCoolWhite6500K         := 20
+) BYTE;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

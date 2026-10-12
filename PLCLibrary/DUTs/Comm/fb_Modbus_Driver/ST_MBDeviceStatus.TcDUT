@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="ST_MBDeviceStatus" Id="{d76431cd-00b1-425c-8d7f-ea4629b7679c}">
+    <Declaration><![CDATA[TYPE ST_MBDeviceStatus :
+STRUCT
+    connected               : BOOL;
+    faulted                 : BOOL;
+    readCycleActive         : BOOL;
+    writeCycleActive        : BOOL;
+
+    consecutiveFailures     : UINT;
+    reconnectAttempts       : UINT;
+    totalReadCycles         : UDINT;
+    totalWriteCycles        : UDINT;
+    totalErrors             : UDINT;
+
+    lastErrorCode           : UDINT;
+    timeSinceLastGoodRead   : TIME;
+    timeSinceLastGoodWrite  : TIME;
+
+    currentState            : E_DriverState;
+    readBlockCount          : UINT;
+    writeBlockCount         : UINT;
+    bitRegisterCount        : UINT;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

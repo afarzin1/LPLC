@@ -1,0 +1,23 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_StateDevice_HMI_Status" Id="{bf497164-7e14-4451-bf9a-5b0043fa1ae0}">
+    <Declaration><![CDATA[TYPE ST_StateDevice_HMI_Status :
+STRUCT
+	cfgDeviceName		: STRING;
+	stsAuto				: BOOL;
+	stsIdle				: BOOL;
+	stsDone				: BOOL;
+	stsRunning 			: BOOL;
+	stsFaulted			: BOOL;
+	stsAborting			: BOOL;
+	stsAborted			: BOOL;
+	stsFaultDescription	: STRING;
+	stsState			: STRING;
+	stsStepDescription	: STRING;
+	stsStepNumber		: INT;
+	stsRetryAllowed		: BOOL;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

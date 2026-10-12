@@ -1,0 +1,643 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_CamCoupler" Id="{ea8177e1-9738-4633-8012-50aca4eaf09b}" SpecialFunc="None">
+    <Declaration><![CDATA[// Reusable, machine-agnostic coupler: synchronizes ONE slave axis to a master axis via a verified
+// NC cam table. Wraps MC_CamTableSelect / MC_CamIn / MC_CamOut, gates engagement on the incoming
+// 'verified' flag (from fb_CamTeach.stsVerified), coordinates the fb_Axis yield hook so the slave
+// stops issuing its own motion while cammed, and decouples cleanly on fault/interlock loss.
+//
+// Standalone: does NOT extend abs_fb_Device. Its own error model (stsError/stsErrorText) is used
+// instead of setFault, because a fault would gate the slave's MC_Power and break the coupling.
+// Instantiate one per slave. The master is driven independently (elsewhere).
+//
+// NOTE ON INPUT NAMING: the design skeleton lists the couple/decouple triggers as VAR_INPUT
+// 'cmdCouple'/'cmdDecouple'. Because this FB ALSO exposes public METHODS cmdCouple()/cmdDecouple()
+// (both the input edges and the method calls start the sequences), the inputs are named inpCouple/
+// inpDecouple to avoid an identifier collision - a method and a variable cannot share a name in
+// TwinCAT. This matches the fb_Axis convention (inp* = wired inputs, cmd* = methods; cf. inpReset /
+// cmdReset). Semantics are identical to the design skeleton. See report/deviations.
+FUNCTION_BLOCK fb_CamCoupler
+VAR_IN_OUT
+    Master : AXIS_REF;                 // shared master (driven elsewhere)
+    Slave  : AXIS_REF;                 // this slave
+END_VAR
+
+VAR_INPUT
+    verified     : BOOL;               // from fb_CamTeach.stsVerified for this slave - REQUIRED to couple
+    tableId      : UDINT;              // NC cam table id (same one fb_CamTeach downloaded); 0 = use cfgTableId
+    periodic     : BOOL;               // MC_CamTableSelect periodicity for this slave
+    masterOffset : LREAL;              // engage offsets to match current pose at master start
+    slaveOffset  : LREAL;
+    masterScale  : LREAL := 1.0;
+    slaveScale   : LREAL := 1.0;
+    interlockOK  : BOOL;               // machine/axis permissive
+    slaveFB      : POINTER TO fb_Axis; // yield coordination (optional but recommended); 0 = no yield
+    inpCouple    : BOOL;               // (design skeleton: cmdCouple) rising edge starts the couple sequence
+    inpDecouple  : BOOL;               // (design skeleton: cmdDecouple) rising edge starts the decouple sequence
+    inpReset     : BOOL;               // rising edge clears a latched error (back to E_CamCoupler_State.eIdle if safe)
+END_VAR
+
+VAR_OUTPUT
+    stsCoupled   : BOOL;               // MC_CamIn.InSync
+    stsBusy      : BOOL;               // a couple/decouple sequence is running
+    stsState     : E_CamCoupler_State;
+    stsError     : BOOL;               // latched coupler error (own model - not setFault)
+    stsErrorText : STRING;
+END_VAR
+
+VAR
+    // Public HMI interface - the struct an HMI (e.g. lhmi) binds
+    HMI        : ST_CamCoupler_HMI_Interface;
+
+    // MC camming / stop function blocks (Tc2_MC2 / Tc2_MC2_Camming)
+    _camSelect : MC_CamTableSelect;    // VERIFY against installed Tc2_MC2 / TF5050 version
+    _camIn     : MC_CamIn;             // VERIFY against installed Tc2_MC2 / TF5050 version
+    _camOut    : MC_CamOut;            // VERIFY against installed Tc2_MC2 / TF5050 version
+    _mcHalt    : MC_Halt;              // stop the freed slave after CamOut
+    _superImp  : MC_MoveSuperImposed;  // VERIFY against installed Tc2_MC2 / TF5050 version (live trim)
+
+    // Cam-table reference passed to MC_CamTableSelect. VERIFY: in Tc2_MC2, MC_CamTableSelect takes a
+    // CamTable:MC_CAM_REF (VAR_IN_OUT) linked to the NC cam-table object fb_CamTeach populated and
+    // OUTPUTS CamTableID:MC_CAM_ID. The design doc models tableId (UDINT) as the id passed directly;
+    // confirm how your fb_CamTeach registers the table and wire _camTableRef / _tableId accordingly.
+    _camTableRef : MC_CAM_REF;         // VERIFY against installed Tc2_MC2 / TF5050 version
+
+    _state : E_CamCoupler_State;       // working state (mirrored to stsState)
+
+    // Command requests + input edge detectors
+    _coupleReq    : BOOL;
+    _decoupleReq  : BOOL;
+    _resetReq     : BOOL;
+    _trigCouple   : R_TRIG;
+    _trigDecouple : R_TRIG;
+    _trigReset    : R_TRIG;
+
+    // Sequence control flags
+    _engaged       : BOOL;             // in one of the engaged states (yielding..coupled)
+    _beginDecouple : BOOL;             // request to start the decouple path this scan
+    _faultDecouple : BOOL;             // TRUE = the active decouple was fault-triggered (end in E_CamCoupler_State.eError)
+    _slaveReady    : BOOL;             // slave powered/operational (best-effort via AXIS_REF + slaveFB)
+    _camInExec     : BOOL;             // MC_CamIn.Execute driver (TRUE from eCoupling through eCoupled)
+    _camInRetrig   : INT;              // 0=idle, 1=drop Execute one scan, 2=re-execute (live offset trim)
+    _haltExec      : BOOL;             // MC_Halt.Execute driver (post-CamOut stop)
+
+    // Superimposed correction (live trim)
+    _superImpReq   : BOOL;             // one-shot start request
+    _superImpExec  : BOOL;             // MC_MoveSuperImposed.Execute driver
+    _superImpDist  : LREAL;
+    _superImpVelo  : LREAL;
+    _superImpAccel : LREAL := 100.0;   // [slave unit/s2] accel/decel for the corrective move
+
+    // Effective engage parameters (resolved from inputs/cfg at couple; latched so live trim persists)
+    _tableId      : UDINT;
+    _periodic     : BOOL;
+    _masterOffset : LREAL;
+    _slaveOffset  : LREAL;
+    _masterScale  : LREAL := 1.0;
+    _slaveScale   : LREAL := 1.0;
+
+    // Commissioning defaults (FB_Init / cfg* properties)
+    _cfgTableId   : UDINT;
+    _cfgPeriodic  : BOOL;
+
+    // Stop dynamics for the post-CamOut halt
+    _haltDecel    : LREAL := 100.0;    // [slave unit/s2]
+
+    _hmiCfgLoaded : BOOL;              // HMI.Config seeded from defaults once
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ── 1. Refresh AXIS_REF status snapshots ─────────────────────────────────────
+// Decode NcToPlc into Master/Slave .Status before anything reads .Status this scan. fb_Axis refreshes
+// the same shared refs each scan; a second ReadStatus() here is harmless and keeps this FB self-contained.
+Master.ReadStatus();
+Slave.ReadStatus();
+
+// Slave "enabled / operational" check. Best-effort via the shared AXIS_REF, refined by the slave's
+// fb_Axis power state when the pointer is wired. (Pointer deref guarded - IEC OR/AND do not short-circuit.)
+_slaveReady := (NOT Slave.Status.Disabled) AND (NOT Slave.Status.ErrorStop) AND (NOT Slave.Status.Error);
+IF slaveFB <> 0 THEN
+    _slaveReady := _slaveReady AND slaveFB^.stsEnabled;
+END_IF
+
+// ── 2. Command inputs: rising edges + self-clearing HMI one-shots ─────────────
+// Both the wired input edges and the public methods funnel into the same request flags.
+_trigCouple(CLK := inpCouple);
+IF _trigCouple.Q THEN cmdCouple(); END_IF
+_trigDecouple(CLK := inpDecouple);
+IF _trigDecouple.Q THEN cmdDecouple(); END_IF
+_trigReset(CLK := inpReset);
+IF _trigReset.Q THEN cmdReset(); END_IF
+
+IF HMI.Commands.ocmdCouple THEN
+    HMI.Commands.ocmdCouple := FALSE;
+    cmdCouple();
+END_IF
+IF HMI.Commands.ocmdDecouple THEN
+    HMI.Commands.ocmdDecouple := FALSE;
+    cmdDecouple();
+END_IF
+IF HMI.Commands.ocmdReset THEN
+    HMI.Commands.ocmdReset := FALSE;
+    cmdReset();
+END_IF
+IF HMI.Commands.ocmdSetMasterOffset THEN
+    HMI.Commands.ocmdSetMasterOffset := FALSE;
+    cmdSetMasterOffset(HMI.Commands.ocmdMasterOffset);
+END_IF
+IF HMI.Commands.ocmdSetSlaveOffset THEN
+    HMI.Commands.ocmdSetSlaveOffset := FALSE;
+    cmdSetSlaveOffset(HMI.Commands.ocmdSlaveOffset);
+END_IF
+IF HMI.Commands.ocmdSuperImpose THEN
+    HMI.Commands.ocmdSuperImpose := FALSE;
+    cmdSuperImpose(HMI.Commands.ocmdSuperImposeDist, HMI.Commands.ocmdSuperImposeVelo);
+END_IF
+
+// ── 3. Reset ─────────────────────────────────────────────────────────────────
+// Honored only from a resting state - a reset must never tear down an active coupling.
+IF _resetReq THEN
+    _resetReq := FALSE;
+    IF _state = E_CamCoupler_State.eError OR _state = E_CamCoupler_State.eIdle THEN
+        stsError       := FALSE;
+        stsErrorText   := '';
+        _faultDecouple := FALSE;
+        _state         := E_CamCoupler_State.eIdle;
+    END_IF
+END_IF
+
+// ── 4. Safety & decouple triggers ────────────────────────────────────────────
+// Evaluated BEFORE the state machine so a loss condition begins the decouple the same scan it appears.
+_engaged := (_state = eYielding) OR (_state = eSelecting) OR (_state = eCoupling) OR (_state = eCoupled);
+_beginDecouple := FALSE;
+
+// Operator-requested decouple (only meaningful while engaged).
+IF _decoupleReq THEN
+    _decoupleReq := FALSE;
+    IF _engaged THEN
+        _faultDecouple := FALSE;
+        _beginDecouple := TRUE;
+    END_IF
+END_IF
+
+// Fault / interlock loss / verified drop while engaged -> forced decouple + latched error.
+// No auto re-couple: a deliberate cmdCouple (after a reset) is required to re-engage.
+// MC_CamIn is hard-gated on verified below, so a dropped 'verified' both aborts and prevents re-engage.
+IF _engaged AND NOT stsError THEN
+    IF NOT interlockOK THEN
+        raiseError('Interlock lost while coupled');
+        _faultDecouple := TRUE;
+        _beginDecouple := TRUE;
+    ELSIF Slave.Status.Error THEN
+        raiseError(CONCAT('Slave axis error: ', UDINT_TO_STRING(Slave.NcToPlc.ErrorCode)));
+        _faultDecouple := TRUE;
+        _beginDecouple := TRUE;
+    ELSIF NOT verified THEN
+        raiseError('Verified dropped while coupled');
+        _faultDecouple := TRUE;
+        _beginDecouple := TRUE;
+    END_IF
+END_IF
+
+IF _beginDecouple THEN
+    _camInExec := FALSE;
+    IF _camIn.InSync OR (_state = eCoupled) OR (_state = eCoupling) THEN
+        _state := eDecoupling;         // disengage the cam first (CamOut)
+    ELSE
+        _haltExec := TRUE;
+        _state    := eStopping;        // not cammed yet - just stop the slave & release the yield
+    END_IF
+END_IF
+
+// ── 5. Couple / decouple state machine ───────────────────────────────────────
+CASE _state OF
+
+    E_CamCoupler_State.eIdle:
+        _camInExec := FALSE;
+        _haltExec  := FALSE;
+        IF _coupleReq THEN
+            _coupleReq := FALSE;
+            // Preconditions (design: verified, slave enabled, interlockOK, not already coupled).
+            IF NOT verified THEN
+                raiseError('Cannot couple: table not verified');
+                _state := E_CamCoupler_State.eError;
+            ELSIF NOT interlockOK THEN
+                raiseError('Cannot couple: interlock not OK');
+                _state := E_CamCoupler_State.eError;
+            ELSIF _camIn.InSync THEN
+                raiseError('Cannot couple: already coupled');
+                _state := E_CamCoupler_State.eError;
+            ELSIF NOT _slaveReady THEN
+                raiseError('Cannot couple: slave not enabled');
+                _state := E_CamCoupler_State.eError;
+            ELSE
+                // Resolve effective table id / periodicity (live input overrides the commissioning
+                // default; periodic input is authoritative - the machine layer supplies it per slave).
+                IF tableId <> 0 THEN _tableId := tableId; ELSE _tableId := _cfgTableId; END_IF
+                _periodic := periodic;
+                // Yield: fb_Axis runs an interruptible halt, then suppresses all its own motion.
+                IF slaveFB <> 0 THEN
+                    slaveFB^.cmdSetExternalControl(TRUE);
+                END_IF
+                _state := eYielding;
+            END_IF
+        END_IF
+
+    eYielding:
+        // Wait for the slave to reach standstill (the fb_Axis entry cmdHalt completes) before selecting/
+        // engaging, so the halt and the coupling never overlap (design coupler note).
+        IF Slave.Status.Standstill THEN
+            _state := eSelecting;
+        END_IF
+
+    eSelecting:
+        // MC_CamTableSelect driven Execute:=TRUE by state gate (section 6).
+        IF _camSelect.Done THEN
+            // Latch engage parameters from the inputs at engage time (so later live trim persists).
+            _masterOffset := masterOffset;
+            _slaveOffset  := slaveOffset;
+            IF masterScale <> 0.0 THEN _masterScale := masterScale; ELSE _masterScale := 1.0; END_IF
+            IF slaveScale  <> 0.0 THEN _slaveScale  := slaveScale;  ELSE _slaveScale  := 1.0; END_IF
+            _camInExec := TRUE;        // begin engaging
+            _state     := eCoupling;
+        ELSIF _camSelect.Error THEN
+            raiseError(CONCAT('CamTableSelect error: ', UDINT_TO_STRING(_camSelect.ErrorID)));
+            _faultDecouple := TRUE;
+            _haltExec      := TRUE;    // not cammed - stop & release yield -> E_CamCoupler_State.eError
+            _state         := eStopping;
+        END_IF
+
+    eCoupling:
+        // MC_CamIn driven Execute:=_camInExec (section 7). Engage complete when InSync.
+        IF _camIn.InSync THEN
+            _state := eCoupled;
+        ELSIF _camIn.Error THEN
+            raiseError(CONCAT('CamIn error: ', UDINT_TO_STRING(_camIn.ErrorID)));
+            _camInExec     := FALSE;
+            _faultDecouple := TRUE;
+            _state         := eDecoupling;   // CamOut to be safe, then stop -> E_CamCoupler_State.eError
+        ELSIF _camIn.CommandAborted THEN
+            raiseError('CamIn aborted');
+            _camInExec     := FALSE;
+            _faultDecouple := TRUE;
+            _state         := eDecoupling;
+        END_IF
+
+    eCoupled:
+        // Steady state - coupling held. Live trim (offset re-issue / superimpose) runs in sections 7 & 10.
+        // External loss conditions are handled in section 4; an NC-level CamIn error is caught here.
+        IF _camIn.Error THEN
+            raiseError(CONCAT('CamIn error: ', UDINT_TO_STRING(_camIn.ErrorID)));
+            _camInExec     := FALSE;
+            _faultDecouple := TRUE;
+            _state         := eDecoupling;
+        END_IF
+
+    eDecoupling:
+        // MC_CamOut driven Execute:=TRUE by state gate (section 8).
+        IF _camOut.Done THEN
+            _haltExec := TRUE;         // slave keeps its last velocity after CamOut -> halt it
+            _state    := eStopping;
+        ELSIF _camOut.Error THEN
+            raiseError(CONCAT('CamOut error: ', UDINT_TO_STRING(_camOut.ErrorID)));
+            _faultDecouple := TRUE;
+            _haltExec      := TRUE;    // still try to bring the slave to rest & release the yield
+            _state         := eStopping;
+        END_IF
+
+    eStopping:
+        // MC_Halt driven Execute:=_haltExec (section 9). Done when at rest.
+        IF _mcHalt.Done OR Slave.Status.Standstill THEN
+            _haltExec := FALSE;
+            // Release the yield: fb_Axis resumes control and stays at rest until a new explicit command.
+            IF slaveFB <> 0 THEN
+                slaveFB^.cmdSetExternalControl(FALSE);
+            END_IF
+            IF _faultDecouple THEN
+                _faultDecouple := FALSE;
+                _state         := E_CamCoupler_State.eError;   // stsError already latched by raiseError
+            ELSE
+                _state := E_CamCoupler_State.eIdle;
+            END_IF
+        END_IF
+
+    E_CamCoupler_State.eError:
+        // Latched fault - wait for cmdReset/inpReset. No motion commanded here.
+        _camInExec := FALSE;
+        _haltExec  := FALSE;
+
+END_CASE
+
+// ── 6. MC_CamTableSelect (register the verified table) ───────────────────────
+// VERIFY against installed Tc2_MC2 / TF5050 version: block signature, that MasterAbsolute/SlaveAbsolute
+// are BOOL (some versions use an enum), and how CamTable/CamTableID map to the numeric _tableId that
+// fb_CamTeach produced (see _camTableRef note in the declaration).
+_camSelect(
+    Master         := Master,
+    Slave          := Slave,
+    CamTable       := _camTableRef,
+    Execute        := (_state = eSelecting),
+    Periodic       := _periodic,
+    MasterAbsolute := TRUE,                    // VERIFY: enum vs BOOL, and absolute vs relative choice
+    SlaveAbsolute  := TRUE                     // VERIFY: enum vs BOOL, and absolute vs relative choice
+);
+
+// ── 7. MC_CamIn (engage - RampIn, offset/scaling) ────────────────────────────
+// Live offset trim re-issues MC_CamIn: drop Execute for one scan, then re-execute with the new offsets.
+IF _camInRetrig = 1 THEN
+    _camInExec   := FALSE;
+    _camInRetrig := 2;
+ELSIF _camInRetrig = 2 THEN
+    _camInExec   := TRUE;
+    _camInRetrig := 0;
+END_IF
+// HARD gate on 'verified': never engage an unverified table (design principle 2).
+// VERIFY against installed Tc2_MC2 / TF5050 version: StartMode enum name/values (RampIn variant),
+// CamTableID type (MC_CAM_ID) and source, and MasterOffset/SlaveOffset/MasterScaling/SlaveScaling
+// semantics + which StartMode supports live offset re-issue.
+_camIn(
+    Master        := Master,
+    Slave         := Slave,
+    Execute       := _camInExec AND verified,
+    MasterOffset  := _masterOffset,
+    SlaveOffset   := _slaveOffset,
+    MasterScaling := _masterScale,
+    SlaveScaling  := _slaveScale,
+    StartMode     := MC_STARTMODE_ABSOLUTE,    // absolute: cam CS congruent with axis CS (no RampIn member in this TF5050)
+    CamTableID    := _camSelect.CamTableID      // VERIFY: MC_CAM_ID assigned by MC_CamTableSelect
+);
+
+// ── 8. MC_CamOut (disengage) ─────────────────────────────────────────────────
+// VERIFY against installed Tc2_MC2 / TF5050 version: block signature (Slave-only in/out).
+_camOut(
+    Slave   := Slave,
+    Execute := (_state = eDecoupling)
+);
+
+// ── 9. MC_Halt (kill the retained slave velocity after CamOut) ───────────────
+_mcHalt(
+    Axis         := Slave,
+    Execute      := _haltExec,
+    Deceleration := _haltDecel,
+    Jerk         := 0.0
+);
+IF _mcHalt.Done THEN
+    _haltExec := FALSE;
+END_IF
+
+// ── 10. MC_MoveSuperImposed (live corrective move on top of the cam) ──────────
+// Kept engaged: a bounded correction superimposed on the running cam (no decouple).
+IF _superImpReq THEN
+    _superImpReq  := FALSE;
+    _superImpExec := TRUE;
+END_IF
+// VERIFY against installed Tc2_MC2 / TF5050 version: block signature and VelocityDiff semantics
+// (superimposed on a synchronized/cammed axis).
+_superImp(
+    Axis         := Slave,
+    Execute      := _superImpExec,
+    Distance     := _superImpDist,
+    VelocityDiff := _superImpVelo,
+    Acceleration := _superImpAccel,
+    Deceleration := _superImpAccel,
+    Jerk         := 0.0
+);
+IF _superImp.Done OR _superImp.CommandAborted OR _superImp.Error THEN
+    _superImpExec := FALSE;
+END_IF
+
+// ── 11. Outputs ──────────────────────────────────────────────────────────────
+stsState   := _state;
+stsCoupled := _camIn.InSync;
+stsBusy    := (_state = eYielding) OR (_state = eSelecting) OR (_state = eCoupling)
+              OR (_state = eDecoupling) OR (_state = eStopping);
+
+// ── 12. HMI status update ────────────────────────────────────────────────────
+// Seed the commissioning mirror once from the configured defaults.
+IF NOT _hmiCfgLoaded THEN
+    HMI.Config.tableId      := _cfgTableId;
+    HMI.Config.periodic     := _cfgPeriodic;
+    HMI.Config.masterOffset := _masterOffset;
+    HMI.Config.slaveOffset  := _slaveOffset;
+    HMI.Config.masterScale  := _masterScale;
+    HMI.Config.slaveScale   := _slaveScale;
+    _hmiCfgLoaded := TRUE;
+END_IF
+HMI.Status.stsState        := _state;
+HMI.Status.stsCoupled      := stsCoupled;
+HMI.Status.stsBusy         := stsBusy;
+HMI.Status.stsError        := stsError;
+HMI.Status.stsErrorText    := stsErrorText;
+HMI.Status.stsVerified     := verified;
+HMI.Status.stsTableId      := _tableId;
+HMI.Status.stsMasterOffset := _masterOffset;
+HMI.Status.stsSlaveOffset  := _slaveOffset;
+HMI.Status.stsMasterScale  := _masterScale;
+HMI.Status.stsSlaveScale   := _slaveScale;
+HMI.Status.stsPeriodic     := _periodic;
+]]></ST>
+    </Implementation>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         PUBLIC COMMAND METHODS
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Method Name="cmdCouple" Id="{03eeb804-8954-43d6-bed7-9cdc8a66a150}">
+      <Declaration><![CDATA[// Request an engage of this slave onto the master via the verified cam table.
+// Multi-scan sequence: yield -> select -> cam-in. Accepted only from E_CamCoupler_State.eIdle; rejected QUIETLY while
+// busy/engaged/errored (no fault - a fault would gate the slave MC_Power and break any coupling).
+// Reachable both from this method and the rising edge of inpCouple.
+METHOD PUBLIC cmdCouple : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _state <> E_CamCoupler_State.eIdle THEN
+    cmdCouple := FALSE;
+    RETURN;
+END_IF
+
+_coupleReq := TRUE;
+cmdCouple  := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdDecouple" Id="{38aedbba-dce1-4535-8de9-ff4484198dbc}">
+      <Declaration><![CDATA[// Request a controlled decouple: CamOut -> MC_Halt (kill retained velocity) -> release the yield.
+// Ignored QUIETLY if not engaged. Reachable both from this method and the rising edge of inpDecouple.
+METHOD PUBLIC cmdDecouple : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_decoupleReq := TRUE;
+cmdDecouple  := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdReset" Id="{52f99ceb-0480-4e86-8ece-6519c578ff9c}">
+      <Declaration><![CDATA[// Clear a latched coupler error and return to E_CamCoupler_State.eIdle. Honored only from E_CamCoupler_State.eError/E_CamCoupler_State.eIdle so it can never
+// tear down an active coupling. Reachable from this method, ocmdReset, and the rising edge of inpReset.
+METHOD PUBLIC cmdReset : BOOL
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[_resetReq := TRUE;
+cmdReset  := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdSetMasterOffset" Id="{06384727-d2f9-45c4-b5fa-71beb4f8d73e}">
+      <Declaration><![CDATA[// Live master-offset trim (no decouple): re-issue MC_CamIn with the new master offset while the
+// coupling stays engaged. Accepted only while fully coupled; rejected QUIETLY otherwise.
+METHOD PUBLIC cmdSetMasterOffset : BOOL
+VAR_INPUT
+    offset : LREAL;   // [master unit] new cam master offset
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _state <> eCoupled THEN
+    cmdSetMasterOffset := FALSE;
+    RETURN;
+END_IF
+
+_masterOffset      := offset;
+_camInRetrig       := 1;   // one clear scan, then MC_CamIn re-executes with the new offset
+cmdSetMasterOffset := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdSetSlaveOffset" Id="{0c08c3e4-bfd2-430f-b879-6ee81f40a468}">
+      <Declaration><![CDATA[// Live slave-offset trim (no decouple): re-issue MC_CamIn with the new slave offset while the
+// coupling stays engaged. Accepted only while fully coupled; rejected QUIETLY otherwise.
+METHOD PUBLIC cmdSetSlaveOffset : BOOL
+VAR_INPUT
+    offset : LREAL;   // [slave unit] new cam slave offset
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _state <> eCoupled THEN
+    cmdSetSlaveOffset := FALSE;
+    RETURN;
+END_IF
+
+_slaveOffset      := offset;
+_camInRetrig      := 1;   // one clear scan, then MC_CamIn re-executes with the new offset
+cmdSetSlaveOffset := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="cmdSuperImpose" Id="{5e3b677d-7b85-4baf-8fac-c0d6a1144232}">
+      <Declaration><![CDATA[// Bounded corrective move superimposed on top of the running cam via MC_MoveSuperImposed (no decouple).
+// Accepted only while fully coupled and no correction is already active; rejected QUIETLY otherwise.
+METHOD PUBLIC cmdSuperImpose : BOOL
+VAR_INPUT
+    distance : LREAL;   // [slave unit] corrective distance added on top of the cam
+    velocity : LREAL;   // [slave unit/s] additional velocity for the correction
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF _state <> eCoupled THEN
+    cmdSuperImpose := FALSE;
+    RETURN;
+END_IF
+
+IF _superImpExec THEN
+    // one correction at a time
+    cmdSuperImpose := FALSE;
+    RETURN;
+END_IF
+
+_superImpDist  := distance;
+_superImpVelo  := velocity;
+_superImpReq   := TRUE;    // rising-edge Execute in section 10 next scan
+cmdSuperImpose := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="raiseError" Id="{adaca506-e1c7-49ce-b051-1e375cacbf16}">
+      <Declaration><![CDATA[// Latch the FB's own error. This FB does NOT extend abs_fb_Device and deliberately does NOT call
+// setFault: a fault would gate the slave MC_Power and drop the coupling. Preserves the first cause
+// if several conditions trip in the same scan.
+METHOD PRIVATE raiseError : BOOL
+VAR_INPUT
+    text : STRING;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF NOT stsError THEN
+    stsError     := TRUE;
+    stsErrorText := text;
+END_IF
+raiseError := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <Method Name="getHMIdata" Id="{e3a1b81e-44b3-4f39-9565-4d41306a137d}">
+      <Declaration><![CDATA[// Return the full HMI interface struct (the one an HMI binds).
+METHOD PUBLIC getHMIdata : ST_CamCoupler_HMI_Interface
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getHMIdata := HMI;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         FB_INIT
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Method Name="FB_Init" Id="{2dd64fb9-d9ac-4867-8c8d-26eebe68cfcd}">
+      <Declaration><![CDATA[METHOD FB_Init : BOOL
+VAR_INPUT
+    bInitRetains : BOOL;
+    bInCopyCode  : BOOL;
+    cfgTableId   : UDINT;   // commissioning default NC cam table id
+    cfgPeriodic  : BOOL;    // commissioning default periodicity
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[THIS^._cfgTableId  := cfgTableId;
+THIS^._cfgPeriodic := cfgPeriodic;
+// Seed the effective values so status/HMI reflect the defaults before the first couple.
+THIS^._tableId  := cfgTableId;
+THIS^._periodic := cfgPeriodic;
+]]></ST>
+      </Implementation>
+    </Method>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         CONFIGURATION PROPERTIES
+         ═══════════════════════════════════════════════════════════════════ -->
+
+    <Property Name="cfgTableId" Id="{e4c0503d-5f2e-4a8b-af8d-fdfc8913f11a}">
+      <Declaration><![CDATA[// Commissioning default NC cam table id, used when the tableId VAR_INPUT is left 0.
+PROPERTY PUBLIC cfgTableId : UDINT]]></Declaration>
+      <Get Name="Get" Id="{5b2d8ce8-dd77-4f3d-a7a5-392173dd122b}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgTableId := _cfgTableId;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{fbe99cbc-64aa-44e5-bce6-56e5c4f6df96}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_cfgTableId := cfgTableId;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+    <Property Name="cfgPeriodic" Id="{a69bd170-930e-4d8b-84ad-ef4a13e40ffb}">
+      <Declaration><![CDATA[// Commissioning default periodicity. The periodic VAR_INPUT is authoritative at couple time; this
+// seeds the power-on default for setups that drive the coupler without wiring that input.
+PROPERTY PUBLIC cfgPeriodic : BOOL]]></Declaration>
+      <Get Name="Get" Id="{12d78e60-cefc-4371-8cbc-e22967a99957}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[cfgPeriodic := _cfgPeriodic;]]></ST></Implementation>
+      </Get>
+      <Set Name="Set" Id="{80258e7f-b744-4f05-b40f-595732f9ba90}">
+        <Declaration><![CDATA[VAR END_VAR]]></Declaration>
+        <Implementation><ST><![CDATA[_cfgPeriodic := cfgPeriodic;]]></ST></Implementation>
+      </Set>
+    </Property>
+
+  </POU>
+</TcPlcObject>

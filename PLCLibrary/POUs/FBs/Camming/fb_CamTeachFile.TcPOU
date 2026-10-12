@@ -1,0 +1,518 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_CamTeachFile" Id="{b49450e8-bbc3-4c5c-bd81-4be0d7eb43a5}" SpecialFunc="None">
+    <Declaration><![CDATA[// fb_CamTeachFile - isolated async CSV persistence for ONE cam-teach table.
+//
+// Standalone library primitive: does NOT extend abs_fb_Device. It carries its own
+// error model (stsError / stsErrorId / stsErrorText) and is driven cyclically by
+// fb_CamTeach, which passes its working point array in via VAR_IN_OUT every scan.
+//
+// The body mirrors the Tc2_System FB_File* async pattern (see fb_WriteDataToFile):
+// FB_FileOpen -> FB_FilePuts / FB_FileGets -> FB_FileClose, sequenced by an nState
+// CASE machine. Every step is non-blocking (one line per scan pass) and the error
+// path (900..) ALWAYS closes the handle before halting.
+//
+// Operations are started ONLY from cmdSave / cmdLoad, and only when idle (nState = 0),
+// so the body never self-triggers. The file is the source of truth; store RAW points.
+//
+// CSV format (raw values):
+//   # slaveName=..  created=..  numPoints=..  periodic=0|1  interp=..  masterUnit=..
+//   <master>, <slave>
+//   ...
+FUNCTION_BLOCK fb_CamTeachFile
+VAR_IN_OUT
+    // Shared working buffer owned by fb_CamTeach (passed in every scan).
+    // Save reads points[1..numPoints]; Load overwrites points[1..stsNumPointsLoaded].
+    points : ARRAY[1..MAX_CAM_POINTS] OF ST_CamTeach_Point;
+END_VAR
+VAR_OUTPUT
+    stsBusy            : BOOL;    // an async save/load is in progress
+    stsDone            : BOOL;    // last operation finished OK (latched until next op / cmdReset)
+    stsError           : BOOL;    // last operation failed (latched until cmdReset)
+    stsErrorId         : UDINT;   // Tc2 file-FB error id (nErrId) of the failing step, else 0
+    stsErrorText       : STRING;  // human-readable failure description
+    stsNumPointsLoaded : INT;     // number of points loaded by the last cmdLoad
+END_VAR
+VAR
+    nState        : INT;          // 0 idle; 10.. save; 110.. load; 900.. error
+
+    // Tc2_System line-oriented file blocks (async; one line per FB_FilePuts/FB_FileGets)
+    fbFileOpen    : FB_FileOpen;
+    fbFilePuts    : FB_FilePuts;
+    fbFileGets    : FB_FileGets;
+    fbFileClose   : FB_FileClose;
+    hFile         : UINT := 0;    // open file handle (0 = closed)
+
+    // Operation parameters captured by cmdSave / cmdLoad
+    _dir          : STRING(255);
+    _fileName     : STRING(255);
+    _slaveName    : STRING;
+    _created      : STRING;
+    _interp       : STRING;
+    _masterUnit   : STRING;
+    _numPoints    : INT;          // points to save (from cmdSave)
+    _periodic     : BOOL;
+
+    // Working scratch
+    sFullFilePath : STRING(255);  // dir + '\' + fileName
+    sLine         : STRING(255);  // line buffer (built for puts / trimmed from gets)
+    _i            : INT;          // save row cursor
+    _n            : INT;          // load row count
+    _hdrNumPoints : INT;          // numPoints parsed from the '#' header (0 = not found)
+    rMaster       : LREAL;        // parseRow output scratch
+    rSlave        : LREAL;        // parseRow output scratch
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[CASE nState OF
+
+// ── 0. Idle ─────────────────────────────────────────────────────────────────────
+    0:
+        stsBusy := FALSE;
+        // stsDone / stsError latch until the next command / cmdReset (not cleared here).
+
+// ══ SAVE ═════════════════════════════════════════════════════════════════════════
+// ── 10. Build path, open file for writing ────────────────────────────────────────
+    10:
+        sFullFilePath := _dir;
+        IF RIGHT(sFullFilePath, 1) <> '\' THEN
+            sFullFilePath := CONCAT(sFullFilePath, '\');   // caller may or may not pass a trailing '\'
+        END_IF
+        sFullFilePath := CONCAT(sFullFilePath, _fileName);
+        fbFileOpen(
+            bExecute  := TRUE,
+            sNetId    := '',
+            sPathName := sFullFilePath,
+            nMode     := FOPEN_MODEWRITE OR FOPEN_MODETEXT,
+            ePath     := PATH_GENERIC,
+            tTimeout  := T#5S);
+        nState := 20;
+
+// ── 20. Wait for open ────────────────────────────────────────────────────────────
+    20:
+        fbFileOpen(bExecute := FALSE);
+        IF NOT fbFileOpen.bBusy THEN
+            IF fbFileOpen.bError THEN
+                stsErrorId   := fbFileOpen.nErrId;
+                stsErrorText := 'File open failed (save)';
+                nState       := 900;
+            ELSE
+                hFile  := fbFileOpen.hFile;
+                nState := 30;
+            END_IF
+        END_IF
+
+// ── 30. Write the '#' metadata header line ───────────────────────────────────────
+    30:
+        sLine := '# slaveName=';
+        sLine := CONCAT(sLine, _slaveName);
+        sLine := CONCAT(sLine, '  created=');
+        sLine := CONCAT(sLine, _created);
+        sLine := CONCAT(sLine, '  numPoints=');
+        sLine := CONCAT(sLine, INT_TO_STRING(_numPoints));
+        sLine := CONCAT(sLine, '  periodic=');
+        sLine := CONCAT(sLine, SEL(_periodic, '0', '1'));   // FALSE -> '0', TRUE -> '1'
+        sLine := CONCAT(sLine, '  interp=');
+        sLine := CONCAT(sLine, _interp);
+        sLine := CONCAT(sLine, '  masterUnit=');
+        sLine := CONCAT(sLine, _masterUnit);
+        sLine := CONCAT(sLine, '$N');
+        // VERIFY: FB_FilePuts line-ending behavior is TC-version-dependent. We append LF
+        // ('$N') so rows are never concatenated onto one line. If your Tc2_System FB_FilePuts
+        // already appends CR/LF, drop this '$N' to avoid blank lines between rows (the loader
+        // skips blank lines regardless, so a mismatch degrades cosmetics, not correctness).
+        fbFilePuts(bExecute := TRUE, sNetId := '', hFile := hFile, sLine := sLine, tTimeout := T#5S);
+        nState := 40;
+
+// ── 40. Wait for header write, arm the row loop ─────────────────────────────────
+    40:
+        fbFilePuts(bExecute := FALSE);
+        IF NOT fbFilePuts.bBusy THEN
+            IF fbFilePuts.bError THEN
+                stsErrorId   := fbFilePuts.nErrId;
+                stsErrorText := 'File write failed (header)';
+                nState       := 900;
+            ELSE
+                _i     := 1;
+                nState := 50;
+            END_IF
+        END_IF
+
+// ── 50. Write one data row (loops 50<->60 until all points written) ──────────────
+    50:
+        IF _i > _numPoints THEN
+            nState := 70;                       // all rows written -> close
+        ELSE
+            sLine := LREAL_TO_STRING(points[_i].rMaster);
+            sLine := CONCAT(sLine, ', ');
+            sLine := CONCAT(sLine, LREAL_TO_STRING(points[_i].rSlave));
+            sLine := CONCAT(sLine, '$N');       // see VERIFY note in state 30
+            fbFilePuts(bExecute := TRUE, sNetId := '', hFile := hFile, sLine := sLine, tTimeout := T#5S);
+            nState := 60;
+        END_IF
+
+// ── 60. Wait for row write, advance cursor ──────────────────────────────────────
+    60:
+        fbFilePuts(bExecute := FALSE);
+        IF NOT fbFilePuts.bBusy THEN
+            IF fbFilePuts.bError THEN
+                stsErrorId   := fbFilePuts.nErrId;
+                stsErrorText := 'File write failed (row)';
+                nState       := 900;
+            ELSE
+                _i     := _i + 1;
+                nState := 50;                   // next row
+            END_IF
+        END_IF
+
+// ── 70. Close file (save success) ───────────────────────────────────────────────
+    70:
+        fbFileClose(bExecute := TRUE, sNetId := '', hFile := hFile, tTimeout := T#5S);
+        nState := 80;
+
+// ── 80. Wait for close -> Done ──────────────────────────────────────────────────
+    80:
+        fbFileClose(bExecute := FALSE);
+        IF NOT fbFileClose.bBusy THEN
+            hFile := 0;
+            IF fbFileClose.bError THEN
+                stsErrorId   := fbFileClose.nErrId;
+                stsErrorText := 'File close failed (save)';
+                nState       := 900;
+            ELSE
+                stsBusy := FALSE;
+                stsDone := TRUE;
+                nState  := 0;
+            END_IF
+        END_IF
+
+// ══ LOAD ═════════════════════════════════════════════════════════════════════════
+// ── 110. Build path, open file for reading ───────────────────────────────────────
+    110:
+        sFullFilePath := _dir;
+        IF RIGHT(sFullFilePath, 1) <> '\' THEN
+            sFullFilePath := CONCAT(sFullFilePath, '\');
+        END_IF
+        sFullFilePath := CONCAT(sFullFilePath, _fileName);
+        fbFileOpen(
+            bExecute  := TRUE,
+            sNetId    := '',
+            sPathName := sFullFilePath,
+            nMode     := FOPEN_MODEREAD OR FOPEN_MODETEXT,
+            ePath     := PATH_GENERIC,
+            tTimeout  := T#5S);
+        nState := 120;
+
+// ── 120. Wait for open, init load counters ──────────────────────────────────────
+    120:
+        fbFileOpen(bExecute := FALSE);
+        IF NOT fbFileOpen.bBusy THEN
+            IF fbFileOpen.bError THEN
+                stsErrorId   := fbFileOpen.nErrId;
+                stsErrorText := 'File open failed (load)';
+                nState       := 900;
+            ELSE
+                hFile         := fbFileOpen.hFile;
+                _n            := 0;
+                _hdrNumPoints := 0;
+                nState        := 130;
+            END_IF
+        END_IF
+
+// ── 130. Read one line ──────────────────────────────────────────────────────────
+    130:
+        fbFileGets(bExecute := TRUE, sNetId := '', hFile := hFile, tTimeout := T#5S);
+        nState := 140;
+
+// ── 140. Classify line: EOF / blank / '#' header / data row (robust) ────────────
+    140:
+        fbFileGets(bExecute := FALSE);
+        IF NOT fbFileGets.bBusy THEN
+            IF fbFileGets.bError THEN
+                stsErrorId   := fbFileGets.nErrId;
+                stsErrorText := 'File read failed (load)';
+                nState       := 900;
+            ELSIF fbFileGets.bEOF THEN
+                nState := 150;                  // end of file -> close
+            ELSE
+                sLine := fbFileGets.sLine;
+                trimWs(sLine);                       // strip CR/LF and surrounding spaces (in place)
+                IF sLine = '' THEN
+                    nState := 130;              // skip blank lines
+                ELSIF LEFT(sLine, 1) = '#' THEN
+                    _hdrNumPoints := parseHeaderNumPoints(sLine);   // best-effort count hint
+                    nState := 130;              // skip/ignore '#' metadata lines
+                ELSE
+                    // data row "master, slave"
+                    IF parseRow(sLine := sLine, rMaster => rMaster, rSlave => rSlave) THEN
+                        IF _n < MAX_CAM_POINTS THEN
+                            _n := _n + 1;
+                            points[_n].rMaster := rMaster;
+                            points[_n].rSlave  := rSlave;
+                        END_IF
+                    END_IF
+                    // stop once the header count is satisfied or the buffer is full;
+                    // otherwise keep reading to EOF (robust to a missing/wrong header).
+                    IF (_hdrNumPoints > 0 AND _n >= _hdrNumPoints) OR _n >= MAX_CAM_POINTS THEN
+                        nState := 150;
+                    ELSE
+                        nState := 130;
+                    END_IF
+                END_IF
+            END_IF
+        END_IF
+
+// ── 150. Close file (load success) ──────────────────────────────────────────────
+    150:
+        fbFileClose(bExecute := TRUE, sNetId := '', hFile := hFile, tTimeout := T#5S);
+        nState := 160;
+
+// ── 160. Wait for close -> Done ─────────────────────────────────────────────────
+    160:
+        fbFileClose(bExecute := FALSE);
+        IF NOT fbFileClose.bBusy THEN
+            hFile := 0;
+            IF fbFileClose.bError THEN
+                stsErrorId   := fbFileClose.nErrId;
+                stsErrorText := 'File close failed (load)';
+                nState       := 900;
+            ELSE
+                stsNumPointsLoaded := _n;
+                stsBusy := FALSE;
+                stsDone := TRUE;
+                nState  := 0;
+            END_IF
+        END_IF
+
+// ══ ERROR PATH (always closes the handle) ════════════════════════════════════════
+// ── 900. Enter error, de-assert all file blocks ─────────────────────────────────
+    900:
+        stsError := TRUE;
+        stsBusy  := FALSE;
+        fbFileOpen(bExecute := FALSE);
+        fbFilePuts(bExecute := FALSE);
+        fbFileGets(bExecute := FALSE);
+        nState := 910;
+
+// ── 910. Close the handle if still open ─────────────────────────────────────────
+    910:
+        IF hFile <> 0 THEN
+            fbFileClose(bExecute := TRUE, sNetId := '', hFile := hFile, tTimeout := T#5S);
+            IF NOT fbFileClose.bBusy THEN
+                fbFileClose(bExecute := FALSE);
+                hFile  := 0;
+                nState := 920;
+            END_IF
+        ELSE
+            nState := 920;
+        END_IF
+
+// ── 920. Halt in error - wait for cmdReset ──────────────────────────────────────
+    920:
+        // latched: stsError stays TRUE until cmdReset() returns the FB to idle.
+
+END_CASE]]></ST>
+    </Implementation>
+    <Method Name="cmdSave" Id="{7c8392e8-2754-4d41-a678-fd0abafcd9da}">
+      <Declaration><![CDATA[// Start an async save of points[1..numPoints] to <dir>\<fileName>.
+// Guarded: only kicks off when fully idle (nState = 0, not busy, not errored).
+// Returns TRUE if accepted, FALSE if rejected (busy/errored - caller should retry
+// or cmdReset first). All metadata is copied for the CSV '#' header.
+METHOD PUBLIC cmdSave : BOOL
+VAR_INPUT
+    dir        : STRING(255); // directory (caller's cfgFileDir, e.g. 'C:\_MachineConfig\CamTables')
+    fileName   : STRING(255); // bare file name, e.g. '<pattern>_<slaveName>.csv'
+    numPoints  : INT;         // number of valid points in points[] to write
+    slaveName  : STRING;      // header: name of the slave this table teaches
+    created    : STRING;      // header: ISO timestamp supplied by caller/HMI
+    periodic   : BOOL;        // header: 0/1 - periodic table flag
+    interp     : STRING;      // header: interpolation label, e.g. 'cubicC1' / 'linear'
+    masterUnit : STRING;      // header: master unit label, e.g. 'mm' / 'deg'
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsBusy OR nState <> 0 THEN
+    cmdSave := FALSE;
+    RETURN;
+END_IF
+
+_dir        := dir;
+_fileName   := fileName;
+_numPoints  := numPoints;
+_slaveName  := slaveName;
+_created    := created;
+_periodic   := periodic;
+_interp     := interp;
+_masterUnit := masterUnit;
+
+// clamp the write count to the buffer bound
+IF _numPoints < 0 THEN
+    _numPoints := 0;
+ELSIF _numPoints > MAX_CAM_POINTS THEN
+    _numPoints := MAX_CAM_POINTS;
+END_IF
+
+stsBusy := TRUE;
+stsDone := FALSE;
+hFile   := 0;
+nState  := 10;      // enter SAVE branch
+cmdSave := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdLoad" Id="{50ac9cd6-8bd5-4c2b-a0fd-2e71ab1d5cec}">
+      <Declaration><![CDATA[// Start an async load of <dir>\<fileName> into points[]. Leading '#' header lines and
+// blank lines are skipped; the numPoints header (if present) caps the read, otherwise
+// rows are read to EOF. On completion stsNumPointsLoaded holds the count and stsDone
+// pulses TRUE. Guarded: only kicks off when idle. Returns TRUE if accepted.
+METHOD PUBLIC cmdLoad : BOOL
+VAR_INPUT
+    dir      : STRING(255);   // directory (caller's cfgFileDir)
+    fileName : STRING(255);   // bare file name to load
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF stsBusy OR nState <> 0 THEN
+    cmdLoad := FALSE;
+    RETURN;
+END_IF
+
+_dir      := dir;
+_fileName := fileName;
+
+stsNumPointsLoaded := 0;
+stsBusy := TRUE;
+stsDone := FALSE;
+hFile   := 0;
+nState  := 110;     // enter LOAD branch
+cmdLoad := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="cmdReset" Id="{21978997-c44e-49f1-9d1a-f7785eae2943}">
+      <Declaration><![CDATA[// Clear latched done/error state and return to idle. Intended for error recovery.
+// If an operation ended in error the handle was already closed by the 910 path, so
+// this only clears status. Rejected implicitly if called mid-op via the start guards.
+METHOD PUBLIC cmdReset : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stsBusy      := FALSE;
+stsDone      := FALSE;
+stsError     := FALSE;
+stsErrorId   := 0;
+stsErrorText := '';
+nState       := 0;
+cmdReset     := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="trimWs" Id="{77b7d458-5c9a-4a40-8821-2d066cdb4313}">
+      <Declaration><![CDATA[// Strip surrounding whitespace and CR/LF from a line. Base Tc2_Standard has no TRIM,
+// so this trims manually. Loops are bounded by the string length (<= 255).
+// TwinCAT rejects a length-parameterized STRING as a METHOD return type, so this trims the
+// string IN PLACE via a VAR_IN_OUT (keeps the full 255 capacity - no truncation to STRING(80)).
+METHOD PRIVATE trimWs : BOOL
+VAR_IN_OUT
+    str : STRING(255);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// trailing CR / LF / space / tab
+WHILE LEN(str) > 0 AND (RIGHT(str, 1) = '$R' OR RIGHT(str, 1) = '$L' OR RIGHT(str, 1) = ' ' OR RIGHT(str, 1) = '$T') DO
+    str := DELETE(str, 1, LEN(str));   // delete 1 char at the last position
+END_WHILE
+
+// leading space / tab
+WHILE LEN(str) > 0 AND (LEFT(str, 1) = ' ' OR LEFT(str, 1) = '$T') DO
+    str := DELETE(str, 1, 1);          // delete the first char
+END_WHILE
+
+trimWs := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="parseHeaderNumPoints" Id="{7f04cd80-0f08-409d-9f71-1bfa018bbe2d}">
+      <Declaration><![CDATA[// Best-effort parse of "numPoints=<n>" out of a '#' metadata header line.
+// Returns 0 if absent - the loader then reads rows until EOF, so 0 is safe.
+METHOD PRIVATE parseHeaderNumPoints : INT
+VAR_INPUT
+    sHeader : STRING(255);
+END_VAR
+VAR
+    nPos   : INT;
+    sRest  : STRING(255);
+    nSpace : INT;
+    sVal   : STRING(255);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[parseHeaderNumPoints := 0;
+
+nPos := FIND(sHeader, 'numPoints=');
+IF nPos = 0 THEN
+    RETURN;
+END_IF
+
+// drop chars 1..(nPos+9): the 10-char token 'numPoints=' ends with '=' at nPos+9
+sRest := DELETE(sHeader, nPos + 9, 1);
+trimWs(sRest);
+
+// value is the first whitespace-delimited token
+nSpace := FIND(sRest, ' ');
+IF nSpace > 1 THEN
+    sVal := LEFT(sRest, nSpace - 1);
+ELSE
+    sVal := sRest;
+END_IF
+
+trimWs(sVal);
+parseHeaderNumPoints := STRING_TO_INT(sVal);]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="parseRow" Id="{e90c9545-a779-451b-8593-9fd125fd3af0}">
+      <Declaration><![CDATA[// Parse one "master, slave" CSV data row into two LREALs. Whitespace around each
+// field is tolerated. Returns FALSE (and zeroes the outputs) if the line has no comma
+// or an empty field, so a malformed row is skipped rather than corrupting the table.
+METHOD PRIVATE parseRow : BOOL
+VAR_INPUT
+    sLine : STRING(255);
+END_VAR
+VAR_OUTPUT
+    rMaster : LREAL;
+    rSlave  : LREAL;
+END_VAR
+VAR
+    sWork  : STRING(255);
+    nComma : INT;
+    sM     : STRING(255);
+    sS     : STRING(255);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[parseRow := FALSE;
+rMaster  := 0;
+rSlave   := 0;
+
+sWork := sLine;
+trimWs(sWork);
+nComma := FIND(sWork, ',');
+IF nComma < 2 THEN
+    RETURN;                                         // no comma, or nothing before it
+END_IF
+
+sM := LEFT(sWork, nComma - 1);                      // text before the comma
+sS := MID(sWork, LEN(sWork) - nComma, nComma + 1);  // text after the comma
+trimWs(sM);
+trimWs(sS);
+IF sM = '' OR sS = '' THEN
+    RETURN;
+END_IF
+
+// VERIFY: string->LREAL conversion name against installed TwinCAT libs.
+// STRING_TO_LREAL is provided by Tc2_Standard/Tc2_Utilities on current TC3; if it is
+// unavailable, substitute the installed equivalent (e.g. STRING_TO_REAL, lower precision).
+rMaster := STRING_TO_LREAL(sM);
+rSlave  := STRING_TO_LREAL(sS);
+parseRow := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

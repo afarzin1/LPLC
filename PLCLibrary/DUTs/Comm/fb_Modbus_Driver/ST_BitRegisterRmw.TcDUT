@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.0">
+  <DUT Name="ST_BitRegisterRmw" Id="{f3d076db-8c2b-4d7a-a91d-abe516349f1a}">
+    <Declaration><![CDATA[TYPE ST_BitRegisterRmw :
+STRUCT
+    address             : UINT;
+    managedBitMask      : WORD;
+    arrSignalIndex      : ARRAY[0..15] OF UINT;
+    readValue           : WORD;
+    writeValue          : WORD;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

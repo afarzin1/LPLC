@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_MachineFlow_HMI_Status" Id="{27d63f74-8b4d-437e-bf62-162d5223fefd}">
+    <Declaration><![CDATA[// HMI status published by abs_fb_MachineFlow (member HMIflow / getFlowHMIdata()).
+// Complements the inherited ST_StateDevice_HMI_Interface (state/step/commands):
+// this struct carries what a flow-chart renderer needs. The token masks are two
+// UDINT halves (not one LWORD) so a JSON/JS transport never exceeds 2^53.
+// stsFlowDef is STATIC after startup - read it once, on demand, not cyclically.
+TYPE ST_MachineFlow_HMI_Status :
+STRUCT
+    stsActiveLo    : UDINT;   // token mask, steps 1..32 (bit = step id - 1)
+    stsActiveHi    : UDINT;   // token mask, steps 33..64 (bit = step id - 33)
+    stsDoneLo      : UDINT;   // done-and-waiting mask (subset of active), steps 1..32
+    stsDoneHi      : UDINT;   // done-and-waiting mask, steps 33..64
+    stsPermissiveLo : UDINT;   // permissive mask, transitions 1..32 (bit set = permissive MET)
+    stsPermissiveHi : UDINT;   // permissive mask, transitions 33..64
+    // HISTORY for this run, cleared on run/reset. Without these an HMI cannot tell a step that
+    // COMPLETED from one that never ran - both simply have no token - nor which transitions fired
+    // beyond the most recent one. The flow chart needs that distinction to colour progress:
+    // active / completed / never-reached are three different things to an operator.
+    stsVisitedLo   : UDINT;   // steps whose token was consumed by a firing transition, 1..32
+    stsVisitedHi   : UDINT;   // ditto, steps 33..64
+    stsFiredLo     : UDINT;   // transitions that have FIRED this run, 1..32 (stsLastFired is only the newest)
+    stsFiredHi     : UDINT;   // ditto, transitions 33..64
+    // Step id that owns the active fault, 0 = none. Covers BOTH routes: a step body calling
+    // setFault() on the inherited state device (the step is stateful, so the fault belongs to it),
+    // and a step timeout. First claim wins, so a later step in the same scan cannot steal it.
+    stsFaultedStep : INT;
+    stsFireCount   : INT;     // transition firings this run (mirrors the base stsStepNumber)
+    stsLastFired   : INT;     // last transition id fired; 0 = none
+    stsStepCount   : INT;
+    stsTransCount  : INT;
+    stsActiveNames : STRING(255);   // ' + '-joined names of the active steps
+    stsFlowDef     : STRING(4095);   // the graph as JSON: {"v":1,"steps":[{"i","n","d","init"}],"trans":[{"id","n","s":[],"t":[]}]}
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

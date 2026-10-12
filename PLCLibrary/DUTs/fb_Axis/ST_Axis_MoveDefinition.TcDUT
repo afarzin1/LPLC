@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Axis_MoveDefinition" Id="{c3d4e5f6-a7b8-9012-cd23-012345678902}">
+    <Declaration><![CDATA[// Move command struct. fb_Axis maintains a parallel ARRAY[1..20] OF fb_Interlock
+// fed from each move's interlock field - giving each move its own live interlock FB.
+TYPE ST_Axis_MoveDefinition :
+STRUCT
+    moveName     : STRING;             // display label - used in fault messages
+    mode         : E_Axis_Mode;        // selects which MC block executes
+    position     : LREAL;              // absolute position [unit] or relative distance [unit]
+    velocity     : LREAL;              // [unit/s] - in eTorque mode: software max-velocity limit (0 = no limit)
+    acceleration : LREAL;              // [unit/s²]
+    deceleration : LREAL;              // [unit/s²]
+    jerk         : LREAL;              // [unit/s³] - 0 = trapezoidal profile
+    torque       : LREAL;              // [Nm or %] - used in eTorque mode
+    torqueRamp   : LREAL;              // [torque unit/s] - used in eTorque mode, 0 = immediate
+    cfgTorqueLimit : LREAL;            // [Nm or %] max |actual torque| allowed during this move (0 = no limit).
+                                       //   Exceed → locked MC_Stop + fault 'Overtorque limit: <moveName>'.
+                                       //   Applies to ALL modes (jam/collision protection); same units as ActTorque.
+    direction    : MC_Direction;       // velocity/torque mode direction
+    bufferMode   : E_Axis_BufferMode;  // Phase 1: only eAborting honored
+    interlock    : ST_Interlock;       // move-level permissive - checked at execution
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

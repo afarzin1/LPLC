@@ -1,0 +1,926 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_MQTT_Connector" Id="{b2c3d4e5-5555-6666-7777-888899990000}" SpecialFunc="None">
+    <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// fb_MQTT_Connector
+// Generic MQTT signal connector with registration pattern
+//
+// Features:
+//   - Register signals at runtime with type information
+//   - Publish on change-of-state or periodic interval
+//   - Transaction group publishing (multiple signals as JSON)
+//   - Subscribe to topics and write values to PLC variables
+//   - Bidirectional signals supported
+//   - Separate publish/subscribe base topics
+//   - Online change detection with automatic re-registration prompt
+//   - Fault handling with configurable failure threshold
+//
+// Usage:
+//   1. Configure cfgClientID, cfgBrokerIP, cfgPublishBaseTopic, cfgSubscribeBaseTopic
+//   2. Call RegisterSignal() for each signal
+//   3. Call AcknowledgeOnlineChange() after registration complete
+//   4. Call Run() every scan cycle
+//   5. Handle stsOnlineChangeDetected by re-registering signals
+//
+// ═══════════════════════════════════════════════════════════════════════
+{attribute 'no_assign'}
+FUNCTION_BLOCK fb_MQTT_Connector
+VAR_INPUT
+    // Configuration (set once at startup)
+    cfgClientID             : STRING(80);       // MQTT client ID
+    cfgBrokerIP             : STRING(80);       // Broker hostname or IP
+    cfgPublishBaseTopic     : STRING(80);       // Base topic prefix for publishing
+    cfgSubscribeBaseTopic   : STRING(80);       // Base topic prefix for subscriptions
+    cfgPort                 : UINT := 1883;     // MQTT broker port
+    cfgMaxConsecFails       : UINT := 10;       // Fault after N consecutive publish failures
+    cfgPublishesPerScan     : UINT := 5;        // Max publishes per scan cycle
+    cfgSubscribeQoS         : TcIotMqttQos := TcIotMqttQos.AtLeastOnceDelivery;
+    cfgPublishQoS           : TcIotMqttQos := TcIotMqttQos.AtMostOnceDelivery;
+    cfgRetainPublish        : BOOL := TRUE;     // Retain flag for published messages
+
+    // Transaction group configuration
+    cfgTxGroup1Period       : TIME := T#100MS;  // Transaction group 1 publish period
+    cfgTxGroup2Period       : TIME := T#1S;     // Transaction group 2 publish period
+    cfgTxGroup3Period       : TIME := T#5S;     // Transaction group 3 publish period
+    cfgTxGroup1Topic        : STRING(80) := 'txgroup1'; // Transaction group 1 sub-topic
+    cfgTxGroup2Topic        : STRING(80) := 'txgroup2'; // Transaction group 2 sub-topic
+    cfgTxGroup3Topic        : STRING(80) := 'txgroup3'; // Transaction group 3 sub-topic
+
+    // Commands (dynamic inputs)
+    inpEnable               : BOOL;             // Enable MQTT connection
+    inpReset                : BOOL;             // Reset fault (rising edge)
+END_VAR
+
+VAR_OUTPUT
+    stsConnected            : BOOL;             // TRUE when connected to broker
+    stsSubscribed           : BOOL;             // TRUE when subscribed to base topic
+    stsFaulted              : BOOL;             // TRUE when faulted
+    stsFaultCode            : UINT;             // Fault code (see constants)
+    stsConsecFailures       : UINT;             // Current consecutive failure count
+    stsRegisteredCount      : UINT;             // Number of registered signals
+    stsRegistered           : BOOL;             // TRUE when registration complete
+    stsOnlineChangeDetected : BOOL;             // TRUE when online change detected - re-register!
+    stsTotalPublished       : UDINT;            // Lifetime published message count
+    stsTotalReceived        : UDINT;            // Lifetime received message count
+END_VAR
+
+VAR CONSTANT
+    MAX_SIGNALS             : UINT := 64;       // Maximum number of signals
+    MAX_TX_PAYLOAD          : UDINT := 4095;    // Max JSON payload size for transaction groups
+    FAULT_NONE              : UINT := 0;
+    FAULT_CONNECTION        : UINT := 1;
+    FAULT_PUBLISH           : UINT := 2;
+    FAULT_POINTER_INVALID   : UINT := 3;
+END_VAR
+
+VAR
+    // Signal registry
+    _signals                : ARRAY[1..64] OF ST_MQTT_Signal;
+    _signalCount            : UINT;
+
+    // Publish engine state
+    _publishIndex           : UINT := 1;        // Round-robin index
+    _currentTime            : TIME;
+
+    // Transaction group state
+    _txGroupLastTime        : ARRAY[1..3] OF TIME;
+    _txPayload              : STRING(4095);     // JSON build buffer
+    _txLen                  : UDINT;            // running length of _txPayload (LEN() caps at 255)
+    _txFirst                : BOOL;
+
+    // MQTT client (FB instances - no underscore per convention)
+    mqttClient              : FB_IotMqtt5Client;
+    mqttMessage             : FB_IotMqtt5Message;
+
+    // Connection state
+    _mqttExecute            : BOOL;
+    _subscribeTopicWildcard : STRING(255);
+    _hasSubscribed          : BOOL;
+
+    // Fault handling
+    _consecFailures         : UINT;
+    _resetTrig              : R_TRIG;
+
+    // Receive buffer
+    _receivedTopic          : STRING(255);
+    _receivedPayload        : STRING(4095);
+
+    // JSON parser
+    fbJsonParser            : FB_JsonDomParser;
+    _jsonDoc                : SJsonValue;
+    _jsonRoot               : SJsonValue;
+    _jsonParent             : SJsonValue;
+    _jsonValue              : SJsonValue;
+    _jsonParsed             : BOOL;
+    _jsonValueStr           : STRING(255);
+
+    // Working variables
+    _fullTopic              : STRING(255);
+    _publishPayload         : STRING(255);
+    _i                      : UINT;
+    _publishResult          : BOOL;
+    _currentValue           : STRING(255);
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// FB body is empty - all logic is in Run() method
+// Call Run() every scan cycle after registration is complete
+]]></ST>
+    </Implementation>
+    <Method Name="AcknowledgeOnlineChange" Id="{c3d4e5f6-0001-0001-0001-000000000001}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD AcknowledgeOnlineChange
+// Call after re-registration is complete to clear the flag
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PUBLIC AcknowledgeOnlineChange : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[stsOnlineChangeDetected := FALSE;
+stsRegistered := (_signalCount > 0);
+
+AcknowledgeOnlineChange := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="AppendToPayload" Id="{c3d4e5f6-0009-0009-0009-000000000009}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD PRIVATE AppendToPayload
+// Append a string to the _txPayload buffer using MEMCPY
+// Handles strings larger than 255 chars (bypasses CONCAT limitation)
+// Returns: TRUE if successful, FALSE if buffer would overflow
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PRIVATE AppendToPayload : BOOL
+VAR_INPUT
+    inpStr : STRING(255);
+END_VAR
+VAR
+    _curLen     : UDINT;
+    _addLen     : UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Use the tracked running length — LEN(_txPayload) caps at 255 and would truncate the group JSON.
+_curLen := _txLen;
+_addLen := INT_TO_UDINT(LEN(inpStr));
+
+IF (_curLen + _addLen) > MAX_TX_PAYLOAD THEN
+    AppendToPayload := FALSE;
+    RETURN;
+END_IF
+
+MEMCPY(ADR(_txPayload) + _curLen, ADR(inpStr), _addLen);
+// Null-terminate
+MEMSET(ADR(_txPayload) + _curLen + _addLen, 0, 1);
+_txLen := _curLen + _addLen;
+
+AppendToPayload := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="ClearRegistration" Id="{c3d4e5f6-0002-0002-0002-000000000002}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD ClearRegistration
+// Clear all registered signals (call before re-registering)
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PUBLIC ClearRegistration : BOOL
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[MEMSET(ADR(_signals), 0, SIZEOF(_signals));
+MEMSET(ADR(_txGroupLastTime), 0, SIZEOF(_txGroupLastTime));
+_signalCount := 0;
+stsRegisteredCount := 0;
+stsRegistered := FALSE;
+_publishIndex := 1;
+
+ClearRegistration := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="ExtractJsonValue" Id="{c3d4e5f6-000a-000a-000a-00000000000a}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD PRIVATE ExtractJsonValue
+// Extract a value from the already-parsed JSON DOM by key
+// If inpJsonParentKey is non-empty, navigates to parent object first
+// Returns: value as STRING(255), or empty string if key not found
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PRIVATE ExtractJsonValue : STRING(255)
+VAR_INPUT
+    inpJsonKey       : STRING(255);
+    inpJsonParentKey : STRING(80);
+END_VAR
+VAR
+    _searchNode : SJsonValue;
+    _targetNode : SJsonValue;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[ExtractJsonValue := '';
+
+// Start from the document root
+_searchNode := _jsonRoot;
+
+// If parent key specified, navigate into it first
+IF LEN(inpJsonParentKey) > 0 THEN
+    IF NOT fbJsonParser.HasMember(_searchNode, inpJsonParentKey) THEN
+        RETURN;
+    END_IF
+    _searchNode := fbJsonParser.FindMember(_searchNode, inpJsonParentKey);
+    IF NOT fbJsonParser.IsObject(_searchNode) THEN
+        RETURN;
+    END_IF
+END_IF
+
+// Find the target key
+IF NOT fbJsonParser.HasMember(_searchNode, inpJsonKey) THEN
+    RETURN;
+END_IF
+_targetNode := fbJsonParser.FindMember(_searchNode, inpJsonKey);
+
+// Extract value based on JSON type
+IF fbJsonParser.IsString(_targetNode) THEN
+    ExtractJsonValue := fbJsonParser.GetString(_targetNode);
+ELSIF fbJsonParser.IsNumber(_targetNode) THEN
+    ExtractJsonValue := LREAL_TO_STRING(fbJsonParser.GetDouble(_targetNode));
+ELSIF fbJsonParser.IsBool(_targetNode) THEN
+    IF fbJsonParser.GetBool(_targetNode) THEN
+        ExtractJsonValue := 'true';
+    ELSE
+        ExtractJsonValue := 'false';
+    END_IF
+ELSIF fbJsonParser.IsNull(_targetNode) THEN
+    ExtractJsonValue := '';
+END_IF
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="FindSignalByTopic" Id="{c3d4e5f6-0003-0003-0003-000000000003}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD PRIVATE FindSignalByTopic
+// Find signal index by matching full topic against subscribe base topic
+// Returns: Signal index (1-based), or 0 if not found
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PRIVATE FindSignalByTopic : UINT
+VAR_INPUT
+    inpFullTopic : STRING(255);
+END_VAR
+VAR
+    _idx            : UINT;
+    _expectedTopic  : STRING(255);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FindSignalByTopic := 0;
+
+FOR _idx := 1 TO _signalCount DO
+    IF _signals[_idx].bRegistered THEN
+        _expectedTopic := CONCAT(CONCAT(cfgSubscribeBaseTopic, '/'), _signals[_idx].sSubTopic);
+
+        IF _expectedTopic = inpFullTopic THEN
+            FindSignalByTopic := _idx;
+            RETURN;
+        END_IF
+    END_IF
+END_FOR
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="IsPointerValid" Id="{c3d4e5f6-0004-0004-0004-000000000004}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD PRIVATE IsPointerValid
+// Basic validation that pointer is non-null and in valid memory range
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PRIVATE IsPointerValid : BOOL
+VAR_INPUT
+    inpPCheck : PVOID;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Null check + basic range check
+// Valid data memory in TwinCAT typically starts above 0x10000
+IsPointerValid := (inpPCheck <> 0) AND (inpPCheck > 16#10000);
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="RegisterSignal" Id="{c3d4e5f6-0005-0005-0005-000000000005}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD RegisterSignal
+// Add a signal to the registry
+// Returns: Signal index (1-based), or 0 if registry full or invalid input
+//
+// For TRANSACTION_GROUP_x modes:
+//   - inpPublishInterval is ignored (group period used instead)
+//   - Signal's sSubTopic becomes the JSON key
+//   - All signals in a group are published together as a JSON object
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PUBLIC RegisterSignal : UINT
+VAR_INPUT
+    inpSubTopic         : STRING(80);           // Topic suffix (appended to base topic)
+    inpPValue           : PVOID;                // ADR(yourVariable)
+    inpType             : E_MQTT_SignalType;    // Data type
+    inpPublishMode      : E_MQTT_PublishMode := E_MQTT_PublishMode.CHANGE_OF_STATE;
+    inpDirection        : E_MQTT_Direction := E_MQTT_Direction.PUBLISH;
+    inpPublishInterval  : TIME := T#1S;         // Only used for PERIODIC mode
+    inpJsonKey          : STRING(255) := '';    // JSON key to extract (empty = raw payload)
+    inpJsonParentKey    : STRING(80) := '';     // Parent object key (e.g. 'signals')
+END_VAR
+VAR
+    _nextSlot : UINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// Validate inputs
+IF inpPValue = 0 THEN
+    RegisterSignal := 0;
+    RETURN;
+END_IF
+
+IF inpType = E_MQTT_SignalType.NONE THEN
+    RegisterSignal := 0;
+    RETURN;
+END_IF
+
+// Check for space in registry
+IF _signalCount >= MAX_SIGNALS THEN
+    RegisterSignal := 0;
+    RETURN;
+END_IF
+
+_nextSlot := _signalCount + 1;
+
+// Populate signal descriptor
+_signals[_nextSlot].sSubTopic        := inpSubTopic;
+_signals[_nextSlot].pValue           := inpPValue;
+_signals[_nextSlot].eType            := inpType;
+_signals[_nextSlot].ePublishMode     := inpPublishMode;
+_signals[_nextSlot].eDirection       := inpDirection;
+_signals[_nextSlot].tPublishInterval := inpPublishInterval;
+_signals[_nextSlot].sJsonKey         := inpJsonKey;
+_signals[_nextSlot].sJsonParentKey   := inpJsonParentKey;
+_signals[_nextSlot].sLastPublished   := '';
+_signals[_nextSlot].tLastPublishTime := T#0S;
+_signals[_nextSlot].bRegistered      := TRUE;
+_signals[_nextSlot].nConsecFails     := 0;
+
+_signalCount := _nextSlot;
+stsRegisteredCount := _signalCount;
+
+RegisterSignal := _nextSlot;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="Run" Id="{c3d4e5f6-0006-0006-0006-000000000006}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD Run
+// Call every scan cycle to process MQTT communication
+// Returns: TRUE if running normally, FALSE if faulted or waiting
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PUBLIC Run : BOOL
+VAR_INPUT
+END_VAR
+VAR
+    _publishCount   : UINT;
+    _needsPublish   : BOOL;
+    _signalIndex    : UINT;
+    _txGroupIdx     : UINT;
+    _txGroupPeriod  : TIME;
+    _txGroupMode    : E_MQTT_PublishMode;
+    _txHasSignals   : BOOL;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// ─────────────────────────────────────────────────────────────────────
+// Reset handling (rising edge)
+// ─────────────────────────────────────────────────────────────────────
+_resetTrig(CLK := inpReset);
+IF _resetTrig.Q THEN
+    stsFaulted := FALSE;
+    stsFaultCode := FAULT_NONE;
+    _consecFailures := 0;
+    stsConsecFailures := 0;
+END_IF
+
+// ─────────────────────────────────────────────────────────────────────
+// Online change detection — REMOVED. It read _AppInfo.OnlineChangeCnt, a system global the CX7000
+// target does not expose (compile errors C0046 '_AppInfo' not defined / C0032). Registered signals
+// point at GLOBAL (GVL) variables whose addresses are stable across an online change, so automatic
+// re-registration isn't needed here. If a caller ever DOES need to re-register (e.g. after moving a
+// registered variable), it can call ClearRegistration() + RegisterSignal() itself; stsOnlineChange-
+// Detected remains an output for API compatibility (it is simply never asserted now).
+// ─────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────
+// If faulted, do nothing until reset
+// ─────────────────────────────────────────────────────────────────────
+IF stsFaulted THEN
+    Run := FALSE;
+    RETURN;
+END_IF
+
+// ─────────────────────────────────────────────────────────────────────
+// If online change detected, wait for re-registration
+// ─────────────────────────────────────────────────────────────────────
+IF stsOnlineChangeDetected THEN
+    Run := FALSE;
+    RETURN;
+END_IF
+
+// ─────────────────────────────────────────────────────────────────────
+// MQTT connection management
+// ─────────────────────────────────────────────────────────────────────
+mqttClient.sClientId := cfgClientID;
+mqttClient.sHostName := cfgBrokerIP;
+mqttClient.nHostPort := cfgPort;
+
+_mqttExecute := inpEnable;
+mqttClient.Execute(_mqttExecute);
+
+stsConnected := mqttClient.bConnected;
+
+IF NOT stsConnected THEN
+    _hasSubscribed := FALSE;
+    stsSubscribed := FALSE;
+    Run := FALSE;
+    RETURN;
+END_IF
+
+// ─────────────────────────────────────────────────────────────────────
+// Subscribe to base topic wildcard (once after connection)
+// ─────────────────────────────────────────────────────────────────────
+IF NOT _hasSubscribed THEN
+    _subscribeTopicWildcard := CONCAT(cfgSubscribeBaseTopic, '/#');
+    _hasSubscribed := mqttClient.Subscribe(
+        sTopic := _subscribeTopicWildcard,
+        eQoS := cfgSubscribeQoS
+    );
+    stsSubscribed := _hasSubscribed;
+END_IF
+
+// ─────────────────────────────────────────────────────────────────────
+// Get current time for interval checking
+// ─────────────────────────────────────────────────────────────────────
+_currentTime := TIME();
+
+// ─────────────────────────────────────────────────────────────────────
+// PUBLISH ENGINE - Round robin through registered signals
+// Handles CHANGE_OF_STATE and PERIODIC modes
+// (Transaction group signals are skipped here, handled below)
+// ─────────────────────────────────────────────────────────────────────
+_publishCount := 0;
+
+WHILE _publishCount < cfgPublishesPerScan AND _signalCount > 0 DO
+
+    // Wrap index back to start
+    IF _publishIndex > _signalCount THEN
+        _publishIndex := 1;
+    END_IF
+
+    _signalIndex := _publishIndex;
+    _publishIndex := _publishIndex + 1;
+    _publishCount := _publishCount + 1;
+
+    // Skip if not registered
+    IF NOT _signals[_signalIndex].bRegistered THEN
+        CONTINUE;
+    END_IF
+
+    // Skip subscribe-only signals
+    IF _signals[_signalIndex].eDirection = E_MQTT_Direction.SUBSCRIBE THEN
+        CONTINUE;
+    END_IF
+
+    // Skip disabled publish mode
+    IF _signals[_signalIndex].ePublishMode = E_MQTT_PublishMode.DISABLED THEN
+        CONTINUE;
+    END_IF
+
+    // Skip transaction group signals (handled in TX group engine below)
+    IF _signals[_signalIndex].ePublishMode = E_MQTT_PublishMode.TRANSACTION_GROUP_1
+       OR _signals[_signalIndex].ePublishMode = E_MQTT_PublishMode.TRANSACTION_GROUP_2
+       OR _signals[_signalIndex].ePublishMode = E_MQTT_PublishMode.TRANSACTION_GROUP_3 THEN
+        CONTINUE;
+    END_IF
+
+    // Validate pointer before dereferencing
+    IF NOT IsPointerValid(_signals[_signalIndex].pValue) THEN
+        stsFaulted := TRUE;
+        stsFaultCode := FAULT_POINTER_INVALID;
+        Run := FALSE;
+        RETURN;
+    END_IF
+
+    // Get current value as string
+    _currentValue := ValueToString(
+        inpPValue := _signals[_signalIndex].pValue,
+        inpType := _signals[_signalIndex].eType
+    );
+
+    // Determine if publish is needed based on mode
+    _needsPublish := FALSE;
+
+    CASE _signals[_signalIndex].ePublishMode OF
+
+        E_MQTT_PublishMode.CHANGE_OF_STATE:
+            // Publish only when value changes
+            IF _currentValue <> _signals[_signalIndex].sLastPublished THEN
+                _needsPublish := TRUE;
+            END_IF
+
+        E_MQTT_PublishMode.PERIODIC:
+            // Publish on change OR when interval elapsed
+            IF _currentValue <> _signals[_signalIndex].sLastPublished THEN
+                _needsPublish := TRUE;
+            ELSIF (_currentTime - _signals[_signalIndex].tLastPublishTime) >= _signals[_signalIndex].tPublishInterval THEN
+                _needsPublish := TRUE;
+            END_IF
+
+    END_CASE
+
+    // Execute publish if needed
+    IF _needsPublish THEN
+        _fullTopic := CONCAT(CONCAT(cfgPublishBaseTopic, '/'), _signals[_signalIndex].sSubTopic);
+        _publishPayload := _currentValue;
+
+        _publishResult := mqttClient.Publish(
+            sTopic := _fullTopic,
+            pPayload := ADR(_publishPayload),
+            nPayloadSize := INT_TO_UDINT(LEN(_publishPayload)),
+            eQoS := cfgPublishQoS,
+            bRetain := cfgRetainPublish
+        );
+
+        IF _publishResult THEN
+            // Success - update state
+            _signals[_signalIndex].sLastPublished := _currentValue;
+            _signals[_signalIndex].tLastPublishTime := _currentTime;
+            _signals[_signalIndex].nConsecFails := 0;
+            _consecFailures := 0;
+            stsTotalPublished := stsTotalPublished + 1;
+        ELSE
+            // Failure - track consecutive failures
+            _signals[_signalIndex].nConsecFails := _signals[_signalIndex].nConsecFails + 1;
+            _consecFailures := _consecFailures + 1;
+            stsConsecFailures := _consecFailures;
+
+            // Check fault threshold
+            IF _consecFailures >= cfgMaxConsecFails THEN
+                stsFaulted := TRUE;
+                stsFaultCode := FAULT_PUBLISH;
+                Run := FALSE;
+                RETURN;
+            END_IF
+        END_IF
+    END_IF
+
+END_WHILE
+
+// ─────────────────────────────────────────────────────────────────────
+// TRANSACTION GROUP ENGINE - Publish grouped signals as JSON
+// Each group collects all assigned signals and publishes a single
+// JSON object: {"subtopic1":value1,"subtopic2":value2,...}
+// ─────────────────────────────────────────────────────────────────────
+FOR _txGroupIdx := 1 TO 3 DO
+
+    // Get period and matching mode for this group
+    CASE _txGroupIdx OF
+        1:  _txGroupPeriod := cfgTxGroup1Period;
+            _txGroupMode := E_MQTT_PublishMode.TRANSACTION_GROUP_1;
+        2:  _txGroupPeriod := cfgTxGroup2Period;
+            _txGroupMode := E_MQTT_PublishMode.TRANSACTION_GROUP_2;
+        3:  _txGroupPeriod := cfgTxGroup3Period;
+            _txGroupMode := E_MQTT_PublishMode.TRANSACTION_GROUP_3;
+    END_CASE
+
+    // Check if period has elapsed
+    IF (_currentTime - _txGroupLastTime[_txGroupIdx]) < _txGroupPeriod THEN
+        CONTINUE;
+    END_IF
+
+    // Build JSON payload
+    MEMSET(ADR(_txPayload), 0, SIZEOF(_txPayload));
+    _txLen := 0;
+    AppendToPayload('{');
+    _txFirst := TRUE;
+    _txHasSignals := FALSE;
+
+    FOR _i := 1 TO _signalCount DO
+        IF NOT _signals[_i].bRegistered THEN
+            CONTINUE;
+        END_IF
+        IF _signals[_i].ePublishMode <> _txGroupMode THEN
+            CONTINUE;
+        END_IF
+        // Skip subscribe-only signals
+        IF _signals[_i].eDirection = E_MQTT_Direction.SUBSCRIBE THEN
+            CONTINUE;
+        END_IF
+
+        // Validate pointer
+        IF NOT IsPointerValid(_signals[_i].pValue) THEN
+            stsFaulted := TRUE;
+            stsFaultCode := FAULT_POINTER_INVALID;
+            Run := FALSE;
+            RETURN;
+        END_IF
+
+        _txHasSignals := TRUE;
+
+        // Add comma separator between entries
+        IF NOT _txFirst THEN
+            AppendToPayload(',');
+        END_IF
+        _txFirst := FALSE;
+
+        // Add "key":value
+        AppendToPayload('"');
+        AppendToPayload(_signals[_i].sSubTopic);
+        AppendToPayload('":');
+
+        // Get value as string
+        _currentValue := ValueToString(
+            inpPValue := _signals[_i].pValue,
+            inpType := _signals[_i].eType
+        );
+
+        // Quote string and time values for valid JSON
+        IF _signals[_i].eType = E_MQTT_SignalType.TYPE_STRING
+           OR _signals[_i].eType = E_MQTT_SignalType.TYPE_TIME THEN
+            AppendToPayload('"');
+            AppendToPayload(_currentValue);
+            AppendToPayload('"');
+        ELSE
+            AppendToPayload(_currentValue);
+        END_IF
+
+        // Update last published value (for bidirectional re-publish suppression)
+        _signals[_i].sLastPublished := _currentValue;
+    END_FOR
+
+    AppendToPayload('}');
+
+    // Publish if there are signals in this group
+    IF _txHasSignals THEN
+        // Build full topic: cfgPublishBaseTopic/cfgTxGroupNTopic
+        CASE _txGroupIdx OF
+            1: _fullTopic := CONCAT(CONCAT(cfgPublishBaseTopic, '/'), cfgTxGroup1Topic);
+            2: _fullTopic := CONCAT(CONCAT(cfgPublishBaseTopic, '/'), cfgTxGroup2Topic);
+            3: _fullTopic := CONCAT(CONCAT(cfgPublishBaseTopic, '/'), cfgTxGroup3Topic);
+        END_CASE
+
+        _publishResult := mqttClient.Publish(
+            sTopic := _fullTopic,
+            pPayload := ADR(_txPayload),
+            nPayloadSize := _txLen,
+            eQoS := cfgPublishQoS,
+            bRetain := cfgRetainPublish
+        );
+
+        IF _publishResult THEN
+            _txGroupLastTime[_txGroupIdx] := _currentTime;
+            _consecFailures := 0;
+            stsTotalPublished := stsTotalPublished + 1;
+        ELSE
+            _consecFailures := _consecFailures + 1;
+            stsConsecFailures := _consecFailures;
+            IF _consecFailures >= cfgMaxConsecFails THEN
+                stsFaulted := TRUE;
+                stsFaultCode := FAULT_PUBLISH;
+                Run := FALSE;
+                RETURN;
+            END_IF
+        END_IF
+    END_IF
+
+END_FOR
+
+// ─────────────────────────────────────────────────────────────────────
+// SUBSCRIBE ENGINE - Process incoming messages from queue
+// Supports raw payloads and JSON key extraction
+// Multiple signals can share a topic (each extracts a different JSON key)
+// ─────────────────────────────────────────────────────────────────────
+WHILE mqttClient.fbMessageQueue.nQueuedMessages > 0 DO
+
+    // Clear receive buffers
+    MEMSET(ADR(_receivedTopic), 0, SIZEOF(_receivedTopic));
+    MEMSET(ADR(_receivedPayload), 0, SIZEOF(_receivedPayload));
+
+    // Dequeue next message
+    IF NOT mqttClient.fbMessageQueue.Dequeue(fbMessage := mqttMessage) THEN
+        EXIT;
+    END_IF
+
+    // Extract topic and payload
+    mqttMessage.GetTopic(pTopic := ADR(_receivedTopic), nTopicSize := SIZEOF(_receivedTopic));
+    mqttMessage.GetPayload(pPayload := ADR(_receivedPayload), nPayloadSize := SIZEOF(_receivedPayload), bSetNullTermination := TRUE);
+
+    stsTotalReceived := stsTotalReceived + 1;
+
+    // Parse JSON once per message if payload starts with '{'
+    _jsonParsed := FALSE;
+    IF LEN(_receivedPayload) > 0 AND_THEN _receivedPayload[0] = 16#7B THEN // 0x7B = '{'
+        _jsonDoc := fbJsonParser.ParseDocument(_receivedPayload);
+        _jsonRoot := fbJsonParser.GetDocumentRoot();
+        _jsonParsed := fbJsonParser.IsObject(_jsonRoot);
+    END_IF
+
+    // Iterate ALL registered signals (multiple signals can share a topic)
+    FOR _i := 1 TO _signalCount DO
+        IF NOT _signals[_i].bRegistered THEN
+            CONTINUE;
+        END_IF
+
+        // Check if direction allows subscribe/write
+        IF _signals[_i].eDirection <> E_MQTT_Direction.SUBSCRIBE
+           AND _signals[_i].eDirection <> E_MQTT_Direction.BIDIRECTIONAL THEN
+            CONTINUE;
+        END_IF
+
+        // Match topic
+        _fullTopic := CONCAT(CONCAT(cfgSubscribeBaseTopic, '/'), _signals[_i].sSubTopic);
+        IF _fullTopic <> _receivedTopic THEN
+            CONTINUE;
+        END_IF
+
+        // Validate pointer before writing
+        IF NOT IsPointerValid(_signals[_i].pValue) THEN
+            stsFaulted := TRUE;
+            stsFaultCode := FAULT_POINTER_INVALID;
+            Run := FALSE;
+            RETURN;
+        END_IF
+
+        IF LEN(_signals[_i].sJsonKey) > 0 AND _jsonParsed THEN
+            // JSON mode: extract specific key from parsed document
+            _jsonValueStr := ExtractJsonValue(
+                inpJsonKey := _signals[_i].sJsonKey,
+                inpJsonParentKey := _signals[_i].sJsonParentKey
+            );
+
+            // Only write if key was found (non-empty result)
+            IF LEN(_jsonValueStr) > 0 THEN
+                StringToValue(
+                    inpPayload := _jsonValueStr,
+                    inpPValue := _signals[_i].pValue,
+                    inpType := _signals[_i].eType
+                );
+                _signals[_i].sLastPublished := _jsonValueStr;
+            END_IF
+
+        ELSIF LEN(_signals[_i].sJsonKey) = 0 THEN
+            // Raw mode: use entire payload as value (original behavior)
+            StringToValue(
+                inpPayload := _receivedPayload,
+                inpPValue := _signals[_i].pValue,
+                inpType := _signals[_i].eType
+            );
+            _signals[_i].sLastPublished := _receivedPayload;
+        END_IF
+        // If sJsonKey is set but JSON didn't parse, silently skip
+
+    END_FOR
+
+END_WHILE
+
+Run := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="StringToValue" Id="{c3d4e5f6-0007-0007-0007-000000000007}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD PRIVATE StringToValue
+// Write string payload to pointer based on type
+// Returns: TRUE if successful, FALSE if type not supported
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PRIVATE StringToValue : BOOL
+VAR_INPUT
+    inpPayload  : STRING(255);
+    inpPValue   : PVOID;
+    inpType     : E_MQTT_SignalType;
+END_VAR
+VAR
+    _pBool      : POINTER TO BOOL;
+    _pByte      : POINTER TO BYTE;
+    _pInt       : POINTER TO INT;
+    _pDint      : POINTER TO DINT;
+    _pReal      : POINTER TO REAL;
+    _pLreal     : POINTER TO LREAL;
+    _pString    : POINTER TO STRING(255);
+    _pTime      : POINTER TO TIME;
+    _upperPayload: STRING(255);
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[StringToValue := TRUE;
+
+CASE inpType OF
+
+    E_MQTT_SignalType.TYPE_BOOL:
+        _pBool := inpPValue;
+        _upperPayload := F_ToUCase(inpPayload);
+        _pBool^ := (_upperPayload = 'TRUE') OR (_upperPayload = '1') OR (_upperPayload = 'ON');
+
+    E_MQTT_SignalType.TYPE_BYTE:
+        _pByte := inpPValue;
+        _pByte^ := STRING_TO_BYTE(inpPayload);
+
+    E_MQTT_SignalType.TYPE_INT:
+        _pInt := inpPValue;
+        _pInt^ := STRING_TO_INT(inpPayload);
+
+    E_MQTT_SignalType.TYPE_DINT:
+        _pDint := inpPValue;
+        _pDint^ := STRING_TO_DINT(inpPayload);
+
+    E_MQTT_SignalType.TYPE_REAL:
+        _pReal := inpPValue;
+        _pReal^ := STRING_TO_REAL(inpPayload);
+
+    E_MQTT_SignalType.TYPE_LREAL:
+        _pLreal := inpPValue;
+        _pLreal^ := STRING_TO_LREAL(inpPayload);
+
+    E_MQTT_SignalType.TYPE_STRING:
+        _pString := inpPValue;
+        _pString^ := inpPayload;
+
+    E_MQTT_SignalType.TYPE_TIME:
+        _pTime := inpPValue;
+        _pTime^ := STRING_TO_TIME(inpPayload);
+
+ELSE
+    StringToValue := FALSE;
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="ValueToString" Id="{c3d4e5f6-0008-0008-0008-000000000008}">
+      <Declaration><![CDATA[// ═══════════════════════════════════════════════════════════════════════
+// METHOD PRIVATE ValueToString
+// Convert pointer value to string based on type
+// ═══════════════════════════════════════════════════════════════════════
+METHOD PRIVATE ValueToString : STRING(255)
+VAR_INPUT
+    inpPValue   : PVOID;
+    inpType     : E_MQTT_SignalType;
+END_VAR
+VAR
+    _pBool      : POINTER TO BOOL;
+    _pByte      : POINTER TO BYTE;
+    _pInt       : POINTER TO INT;
+    _pDint      : POINTER TO DINT;
+    _pReal      : POINTER TO REAL;
+    _pLreal     : POINTER TO LREAL;
+    _pString    : POINTER TO STRING(255);
+    _pTime      : POINTER TO TIME;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE inpType OF
+
+    E_MQTT_SignalType.TYPE_BOOL:
+        _pBool := inpPValue;
+        IF _pBool^ THEN
+            ValueToString := 'true';
+        ELSE
+            ValueToString := 'false';
+        END_IF
+
+    E_MQTT_SignalType.TYPE_BYTE:
+        _pByte := inpPValue;
+        ValueToString := BYTE_TO_STRING(_pByte^);
+
+    E_MQTT_SignalType.TYPE_INT:
+        _pInt := inpPValue;
+        ValueToString := INT_TO_STRING(_pInt^);
+
+    E_MQTT_SignalType.TYPE_DINT:
+        _pDint := inpPValue;
+        ValueToString := DINT_TO_STRING(_pDint^);
+
+    E_MQTT_SignalType.TYPE_REAL:
+        _pReal := inpPValue;
+        ValueToString := REAL_TO_STRING(_pReal^);
+
+    E_MQTT_SignalType.TYPE_LREAL:
+        _pLreal := inpPValue;
+        ValueToString := LREAL_TO_STRING(_pLreal^);
+
+    E_MQTT_SignalType.TYPE_STRING:
+        _pString := inpPValue;
+        ValueToString := _pString^;
+
+    E_MQTT_SignalType.TYPE_TIME:
+        _pTime := inpPValue;
+        ValueToString := TIME_TO_STRING(_pTime^);
+
+ELSE
+    ValueToString := '';
+END_CASE
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_ITECH_HMI_DeviceSignals" Id="{9334b030-ebca-45c5-9e24-9231bd8e37f3}">
+    <Declaration><![CDATA[TYPE ST_ITECH_HMI_DeviceSignals :
+STRUCT
+	deviceSignals_read	: ST_ITECH_DeviceSignals;
+	deviceSignals_write	: ST_ITECH_DeviceSignals;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

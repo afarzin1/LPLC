@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Axis_HMI_Commands" Id="{d4e5f6a7-b8c9-0123-de34-123456789003}">
+    <Declaration><![CDATA[// HMI → PLC operator commands.
+// Move selection is a two-step operation:
+//   1. Write ocmdSelectMove (1-20) → stsConfirmPending goes TRUE
+//   2. Write ocmdRunMove := TRUE to execute, or ocmdCancelSelect to cancel
+TYPE ST_Axis_HMI_Commands :
+STRUCT
+    ocmdEnable          : BOOL;   // enable axis (power on)
+    ocmdDisable         : BOOL;   // disable axis (power off)
+    ocmdReset           : BOOL;   // clear faults and release MC_Stop
+    ocmdStop            : BOOL;   // forced standstill - locked until reset
+    ocmdHome            : BOOL;   // call MC_Home with MC_Direct using HMI.Config.homePosition
+    ocmdSelectMove      : INT;    // 1-20: stage a move for confirmation; 0 = no-op
+    ocmdRunMove         : BOOL;   // run the staged move (requires a prior ocmdSelectMove)
+    ocmdCancelSelect    : BOOL;   // cancel pending selection without executing
+    ocmdReloadMoveConfig: BOOL;   // copy persistent live moves -> HMI.Config.moves, discarding un-applied edits
+    ocmdApplyMoveConfig : BOOL;   // validate/copy HMI.Config.moves -> persistent live moves when axis is idle
+    ocmdJogPositive     : BOOL;   // jog positive direction (level-triggered, hold = continuous)
+    ocmdJogNegative     : BOOL;   // jog negative direction (level-triggered, hold = continuous)
+    ocmdJogVelocity     : LREAL;  // jog velocity override [unit/s] - 0 = use cfgJogVelocity
+    ocmdJogAcceleration : LREAL;  // jog accel override [unit/s²] - 0 = use cfgJogAcceleration
+    ocmdVelocityOverride: LREAL;  // velocity override [%] 0-100 - 0 = no change
+    // Torque jog: interactive manual torque (dead-man). HOLD ocmdTorqueJog → apply
+    // ocmdTorqueJogValue live; release → torque ramps to 0 and the axis stays enabled
+    // (free at 0 torque, no MC_Stop). Mutually exclusive with jog/moves/homing.
+    ocmdTorqueJog       : BOOL;   // hold = apply torque (level-triggered dead-man)
+    ocmdTorqueJogValue  : LREAL;  // live torque setpoint while held [% rated torque]
+    ocmdTorqueJogMaxVel : LREAL;  // safety: max |velocity| during torque-jog [unit/s]; 0 = no trip.
+                                  // Persistent: retained across restart; FB seeds this field with the
+                                  // retained value on the first scan after (re)start (read stsTorqueJogMaxVel).
+    // Position jog ("go to position") - a jog subvariant. Write ocmdJogGotoPos with the target
+    // (angle or mm), then pulse ocmdJogGoto to run a discrete absolute move at the jog velocity/accel.
+    // Mutually exclusive with speed-jog / torque-jog / configured moves / homing.
+    ocmdJogGoto         : BOOL;   // run: one-shot, moves to ocmdJogGotoPos (self-cleared by the FB)
+    ocmdJogGotoPos      : LREAL;  // [unit] absolute target position (angle or mm)
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_MBDataType" Id="{610641d5-177b-4292-a8fe-cea258ced114}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+{attribute 'to_string'}
+TYPE E_MBDataType :
+(
+    mbNone      := 0,
+    mbReal32    := 1,
+    mbInt32     := 2,
+    mbUInt32    := 3,
+    mbInt16     := 4,
+    mbUInt16    := 5,
+    mbWord16    := 6,
+    mbBit       := 7
+) UINT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

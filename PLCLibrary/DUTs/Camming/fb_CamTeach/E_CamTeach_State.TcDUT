@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="E_CamTeach_State" Id="{acd8bb1e-34cc-43ea-b1ea-9909bfddbb53}">
+    <Declaration><![CDATA[// Lifecycle state of one fb_CamTeach instance. Order/values are a CONTRACT:
+// fb_CamTeach and any HMI depend on this exact ordering - do not reorder.
+//   eIdle -cmdRecord-> eTeaching -cmdConvert-> eConverted -cmdDownload-> eDownloading -> eVerifying -> eVerified
+//   save/load transition through eSaving/eLoading and return to the prior working state
+//   any step error -> eError (stsErrorText); inpReset -> eIdle
+TYPE E_CamTeach_State :
+(
+    eIdle        := 0,   // no operation in progress; working set may be empty or taught
+    eTeaching    := 1,   // recording / editing raw points (working set is being built)
+    eConverted   := 2,   // raw points post-processed and built into _mfPoints[], not yet downloaded
+    eSaving      := 3,   // async file write in progress (fb_CamTeachFile)
+    eLoading     := 4,   // async file read in progress (fb_CamTeachFile)
+    eDownloading := 5,   // MC_WriteMotionFunction pushing _mfPoints[] to the NC table
+    eVerifying   := 6,   // reading the table back and comparing to _mfPoints[]
+    eVerified    := 7,   // table downloaded AND read-back-verified; stsVerified TRUE (gates coupling)
+    eError       := 8    // last operation failed; see stsErrorText. inpReset returns to eIdle
+) INT;
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

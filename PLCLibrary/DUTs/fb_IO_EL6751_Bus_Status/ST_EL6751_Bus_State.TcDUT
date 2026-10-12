@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_EL6751_Bus_State" Id="{b3da6fca-442a-4ec8-9fa4-66c4d60c8e12}">
+    <Declaration><![CDATA[TYPE ST_EL6751_Bus_State :
+STRUCT
+	GlobalState0	:	UINT;
+	GlobalState2	:	U_UINT16;
+	GlobalState3	:	UINT;
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

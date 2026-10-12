@@ -1,0 +1,19 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="F_AnalogToEngUnit" Id="{754c32c2-8cb1-4acd-8139-f0ef6fb6f60e}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION F_AnalogToEngUnit : LREAL
+VAR_INPUT
+	inpRawSignal	:	LREAL;
+	IO_min			:	LREAL;
+	IO_max			: 	LREAL;
+	engMin			:   LREAL;
+	engMax			:	LREAL;
+END_VAR
+
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[F_AnalogToEngUnit	:= engMin + (inpRawSignal - IO_min) * ((engmax - engmin) / (IO_max - IO_min));
+]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

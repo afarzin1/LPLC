@@ -1,0 +1,73 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Interlock" Id="{877c3e5e-7bbf-45a5-8cca-b774db927e90}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK fb_Interlock
+VAR_INPUT
+	inpConfig 		: ST_Interlock;
+	inpGlobalBypass	: BOOL;
+END_VAR
+
+VAR
+	i	: INT;
+	HMI : ST_Interlock_HMI_Interface;
+END_VAR
+
+VAR_OUTPUT
+	outInterlockOK	: BOOL;
+	stsFirstOut		: STRING;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[
+outInterlockOK := TRUE;
+stsFirstOut := '';
+IF NOT(inpGlobalBypass) THEN
+	FOR i:= 1 TO 10 DO
+		IF NOT inpConfig.conditions[i] THEN
+			outInterlockOK := FALSE;
+			// FIRST-out, not last: only take the text while it is still empty. This assigned on
+			// EVERY failing iteration until 2026-07-26, so despite the name it reported the LAST
+			// failing condition. An interlock trips the instant one condition drops, and the point of
+			// a first-out readout is to name the condition that CAUSED the trip - slot order is
+			// authored upstream-first, so slot 1 is the root cause and slot 10 is usually a
+			// consequence of it. Reporting the last one pointed the operator at the symptom.
+			IF stsFirstOut = '' THEN
+				stsFirstOut := inpConfig.descriptions[i];
+			END_IF
+		END_IF
+	END_FOR
+END_IF
+
+HMI.stsInterlockOK := outInterlockOK;
+HMI.stsConditions := inpConfig.conditions;
+HMI.stsInterlockDescriptions := inpConfig.descriptions;]]></ST>
+    </Implementation>
+    <Method Name="getHMIdata" Id="{3151d52b-ddb8-4a8f-b9d9-fabc48c74cfa}">
+      <Declaration><![CDATA[METHOD PUBLIC getHMIdata : ST_Interlock_HMI_Interface
+VAR_INPUT
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[getHMIdata := HMI;]]></ST>
+      </Implementation>
+    </Method>
+    <Property Name="name" Id="{57736647-6a4a-49c6-aac0-6ddbe0045db9}">
+      <Declaration><![CDATA[PROPERTY PUBLIC name : string]]></Declaration>
+      <Get Name="Get" Id="{a2ee931a-d0be-4794-a627-119475be490f}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[name := HMI.stsInterlockName;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{e3fdd376-553b-4285-b4cd-e73422cde2bc}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[hmi.stsInterlockName := name;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+  </POU>
+</TcPlcObject>

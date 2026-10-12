@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <DUT Name="ST_Permissive" Id="{aaae7e4e-a755-4431-90d2-e25df6dfe6be}">
+    <Declaration><![CDATA[// Configuration for fb_Permissive: the conditions that must ALL be true, plus the operator-
+// facing text for each. Mirrors ST_Interlock deliberately — same shape, same bound, same defaults,
+// spelled the same literal way — so the two are interchangeable to read and a set of conditions can
+// move between them.
+//
+// TEN SLOTS, HARDCODED. The bound is a literal here and in every FOR loop that walks it, per
+// CONVENTIONS §5: a library DUT cannot reference a GVL for its sizing, because a DUT is a type and
+// has no interface to receive one through. Raising the capacity means editing this bound and
+// fb_Permissive's loops together — visible in review, which a GVL edit three files away is not.
+//
+// conditions DEFAULT TO TRUE. That is the load-bearing default: a permissive with only three
+// of its ten slots wired must be satisfied by those three, not blocked forever by seven unwired
+// FALSEs. Wire what applies and leave the rest.
+//
+// descriptions default to 'N/A' so an unwired slot never renders as blank on the HMI. Write real
+// text for every slot you DO wire — that text is the operator's answer to "why won't it start",
+// and an unnamed unmet condition is a dead end for them.
+TYPE ST_Permissive :
+STRUCT
+    conditions      : ARRAY[1..10] OF BOOL := [1,1,1,1,1,1,1,1,1,1];
+    descriptions    : ARRAY[1..10] OF STRING := ['N/A','N/A','N/A','N/A','N/A','N/A','N/A','N/A','N/A','N/A'];
+END_STRUCT
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>

@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="fb_Dev_StripLight_BannerWLS15Pro" Id="{ad93a26b-5dd4-49b6-a050-826f05454307}" SpecialFunc="None">
+    <Declaration><![CDATA[(*
+    fb_Dev_StripLight_BannerWLS15Pro
+    ================================
+    Drives a Banner WLS15 Pro RGB LED strip light (WLS15PXRGB<length>DSKQP)
+    over IO-Link with the device in Run Mode -- Operating Mode Selection
+    (index 0x40) = 1, which is how the light ships and how it is configured on
+    this machine. Run Mode drives the WHOLE strip as one; use Segment Mode if
+    independently addressable zones are ever needed.
+
+    Run Mode carries one enumerated BYTE per parameter, so there is no
+    sub-byte packing to do here -- unlike the TL50 Pro, whose fields are 1-4
+    bits wide and share octets.
+
+    The device's process data out is 32 bytes and Run Mode uses only the odd
+    octets 13, 15, 17, 19, 21, 23, 25, 27, 29 and 31; the even octets are
+    unused padding. A TwinCAT IO-Link port configured from the IODD publishes
+    those ten as individually named port variables, so the PLC sees ten
+    contiguous bytes and TwinCAT places them in the process image. That is why
+    ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs is ten bytes and not
+    thirty-two.
+
+    Usage
+    -----
+        // IO.TcGVL -- link each member to the matching IO-Link port variable
+        FIO2109_BannerLight AT %Q* : ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs;
+
+        // Devices.TcGVL
+        StripLight : fb_Dev_StripLight_BannerWLS15Pro(
+                         cfgDeviceName     := 'Cell Strip Light',
+                         cfgEnable         := TRUE,
+                         cfgInitEventClass := TRUE);
+
+        // MAIN -- steady green while running
+        StripLight(refPDO       := ADR(IO.FIO2109_BannerLight),
+                   inpAnimation := E_BannerWLS15Pro_Animation.eSteady,
+                   inpColor1    := E_BannerWLS15Pro_Color.eGreen);
+
+    The struct members are declared in the order TwinCAT lists the port
+    variables, so they link straight down the list:
+        Direction, Percent Width of Color 1, Scroll/Bounce Style,
+        Color 2 Intensity, Color 2, Pulse Pattern, Speed,
+        Color 1 Intensity, Color 1, Animation
+
+    Reference: Banner "WLS15 Pro IO-Link Data Reference Guide", 219132 Rev. A,
+    section 1.3.2 Run Mode.
+*)
+FUNCTION_BLOCK fb_Dev_StripLight_BannerWLS15Pro EXTENDS abs_fb_Device
+VAR_INPUT
+    // Process data out of the IO-Link port the light hangs off.
+    refPDO                  : POINTER TO ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs;
+
+    inpAnimation            : E_BannerWLS15Pro_Animation        := E_BannerWLS15Pro_Animation.eOff;
+    inpColor1               : E_BannerWLS15Pro_Color            := E_BannerWLS15Pro_Color.eGreen;
+    inpColor1Intensity      : E_BannerWLS15Pro_Intensity        := E_BannerWLS15Pro_Intensity.eHigh;
+    inpColor2               : E_BannerWLS15Pro_Color            := E_BannerWLS15Pro_Color.eGreen;
+    inpColor2Intensity      : E_BannerWLS15Pro_Intensity        := E_BannerWLS15Pro_Intensity.eHigh;
+    inpSpeed                : E_BannerWLS15Pro_Speed            := E_BannerWLS15Pro_Speed.eMedium;
+    // Only read by the flashing animations.
+    inpPulsePattern         : E_BannerWLS15Pro_PulsePattern     := E_BannerWLS15Pro_PulsePattern.eNormal;
+    // Only read by Scroll and Bounce.
+    inpScrollBounceStyle    : E_BannerWLS15Pro_ScrollBounceStyle := E_BannerWLS15Pro_ScrollBounceStyle.eSolid;
+    // Share of the strip lit with Color 1, in percent. The device accepts
+    // 1..100 only, so this is clamped. Read by the Ends, Scroll and Bounce
+    // animations; ignored by the rest.
+    inpPercentWidthColor1   : BYTE                              := 50;
+    inpDirection            : E_BannerWLS15Pro_Direction        := E_BannerWLS15Pro_Direction.eUp;
+END_VAR
+
+VAR_OUTPUT
+    // FALSE means refPDO was never wired and nothing is reaching the light.
+    stsLinked   : BOOL;
+    // The value set last written, for readback and commissioning.
+    stsShowing  : ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs;
+END_VAR
+
+VAR
+    _out : ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs;
+END_VAR
+
+VAR CONSTANT
+    cPERCENT_WIDTH_MIN : BYTE := 1;
+    cPERCENT_WIDTH_MAX : BYTE := 100;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[DeviceLogic();
+
+// One enumerated byte per parameter -- the whole appearance is a value copy.
+_out.Animnation             := TO_BYTE(inpAnimation);
+_out.Color_1                := TO_BYTE(inpColor1);
+_out.Color_1_Intensity      := TO_BYTE(inpColor1Intensity);
+_out.Speed                  := TO_BYTE(inpSpeed);
+_out.Pulse_Pattern          := TO_BYTE(inpPulsePattern);
+_out.Color_2                := TO_BYTE(inpColor2);
+_out.Color_2_Intensity      := TO_BYTE(inpColor2Intensity);
+_out.Scroll_Bounce_Style    := TO_BYTE(inpScrollBounceStyle);
+_out.Direction              := TO_BYTE(inpDirection);
+
+// 0 and >100 are outside what the device accepts for the Color 1 width.
+_out.Percent_Width_Of_Color_1 := LIMIT(cPERCENT_WIDTH_MIN, inpPercentWidthColor1, cPERCENT_WIDTH_MAX);
+
+// A disabled or faulted light goes dark rather than holding its last pattern,
+// so a stale display is never mistaken for a live one.
+IF NOT _enabled OR stsFaulted THEN
+    _out.Animnation := TO_BYTE(E_BannerWLS15Pro_Animation.eOff);
+END_IF
+
+stsLinked := (refPDO <> 0);
+
+IF stsLinked THEN
+    writeToPDO(inpValues := _out, inpTarget := refPDO);
+END_IF
+
+stsShowing := _out;
+]]></ST>
+    </Implementation>
+    <Method Name="writeToPDO" Id="{40593f97-c13d-4b1b-acbd-52ae4044df2a}">
+      <Declaration><![CDATA[// Copies one Run Mode value set into the light's process data out.
+METHOD PRIVATE writeToPDO : BOOL
+VAR_INPUT
+    inpValues : ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs;
+    inpTarget : POINTER TO ST_Banner_WLS15PXRGB0220DSKQP_RunMode_Outputs;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// The octet numbers below are positions in the device's 32-byte Run Mode
+// process image (219132 Rev. A, section 1.3.2). TwinCAT publishes each one as
+// its own IO-Link port variable, so these members are linked one-to-one and
+// the unused even octets never reach the PLC. Assigned member by member
+// rather than as a whole-struct copy so a mis-ordered link is visible here.
+inpTarget^.Direction                := inpValues.Direction;                 // octet 13
+inpTarget^.Percent_Width_Of_Color_1 := inpValues.Percent_Width_Of_Color_1;  // octet 15
+inpTarget^.Scroll_Bounce_Style      := inpValues.Scroll_Bounce_Style;       // octet 17
+inpTarget^.Color_2_Intensity        := inpValues.Color_2_Intensity;         // octet 19
+inpTarget^.Color_2                  := inpValues.Color_2;                   // octet 21
+inpTarget^.Pulse_Pattern            := inpValues.Pulse_Pattern;             // octet 23
+inpTarget^.Speed                    := inpValues.Speed;                     // octet 25
+inpTarget^.Color_1_Intensity        := inpValues.Color_1_Intensity;         // octet 27
+inpTarget^.Color_1                  := inpValues.Color_1;                   // octet 29
+inpTarget^.Animnation               := inpValues.Animnation;                // octet 31
+
+writeToPDO := TRUE;
+]]></ST>
+      </Implementation>
+    </Method>
+  </POU>
+</TcPlcObject>
