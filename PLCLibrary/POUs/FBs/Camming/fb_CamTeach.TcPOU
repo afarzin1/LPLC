@@ -52,12 +52,12 @@ VAR
     // VERIFY against installed Tc2_MC2_Camming / TF5050: the struct name MC_MotionFunctionPoint
     // and ALL of its field names/types are library-version dependent (see cmdConvert).
     _mfPoints  : ARRAY[1..MAX_CAM_POINTS] OF MC_MotionFunctionPoint;   // VERIFY (struct name)
-    _mcWrite   : MC_WriteMotionFunction;         // VERIFY (block name + I/O) - bulk table download
+    _mcSelect  : Tc2_MC2_Camming.MC_CamTableSelect; // download: CREATES the NC table and fills it from _mfPoints
     _mcRead    : MC_ReadMotionFunctionPoint;     // VERIFY (block name + I/O) - per-point read-back
     _mcWritePt : MC_WriteMotionFunctionPoint;    // VERIFY (block name + I/O) - online single-point edit
     _mcOnline  : MC_SetCamOnlineChangeMode;      // VERIFY (block name + I/O + mode enum) - online change timing
     _readPt    : MC_MotionFunctionPoint;         // read-back target for MC_ReadMotionFunctionPoint (VAR_IN_OUT Point)
-    _camWriteRef : MC_CAM_REF;                   // table descriptor for MC_WriteMotionFunction (pArray -> _mfPoints)
+    _camWriteRef : MC_CAM_REF;                   // table descriptor for MC_CamTableSelect (pArray -> _mfPoints)
 
     _file : fb_CamTeachFile;          // isolated async CSV persistence sub-FB
 
@@ -203,9 +203,9 @@ CASE _state OF
         END_IF
 
     eDownloading:
-        IF _mcWrite.Error THEN
-            setError(CONCAT('Table write error: ', UDINT_TO_STRING(_mcWrite.ErrorID)));
-        ELSIF _mcWrite.Done THEN
+        IF _mcSelect.Error THEN
+            setError(CONCAT('Table create error: ', UDINT_TO_STRING(_mcSelect.ErrorID)));
+        ELSIF _mcSelect.Done THEN
             _verifyIdx := 1;
             _dlStep    := 0;
             _state     := eVerifying;
@@ -269,22 +269,25 @@ CASE _onlineStep OF
 END_CASE
 
 // ── 4c. Drive the Tc2_MC2_Camming blocks (called every scan; Execute gated by state) ─────
-// Download: bulk-write _mfPoints[1.._n] to the pre-created NC table.
-// VERIFY against installed Tc2_MC2_Camming / TF5050: block name, input names (CamTableID /
-// points pointer / size) and whether the size is BYTES (SIZEOF) or a point COUNT.
-// MC_CAM_REF must FULLY describe the source buffer, not just pArray (an unset TableType -> write
-// error 19249). Motion function = 1 column; NoOfRows = point count; ArraySize = buffer bytes.
+// Download: MC_CamTableSelect CREATES NC table _tableId and fills it with _mfPoints[1.._n] (TF5050
+// manual 5.1: "creates a new table and simultaneously fills it with data provided by the PLC").
+// NOT MC_WriteMotionFunction: that only rewrites points of a table already loaded in the NC - on a
+// table that does not exist yet (or an empty System Manager table) the NC answers ADS 0x701
+// "service not supported" (seen on a test rig, 2026-10-18). The table id must NOT also be a table defined in the
+// System Manager. Periodicity is fixed here, at creation (MC_CamIn has no periodic input).
+// MC_CAM_REF must FULLY describe the source buffer (an unset TableType -> 19249). Motion function =
+// 1 column; NoOfRows = point count; ArraySize = the bytes of those points, so size, rows and columns
+// agree.
 _camWriteRef.pArray      := ADR(_mfPoints[1]);
-_camWriteRef.ArraySize   := SIZEOF(_mfPoints);
+_camWriteRef.ArraySize   := INT_TO_UDINT(_n) * SIZEOF(_mfPoints[1]);
 _camWriteRef.TableType   := MC_TABLETYPE_MOTIONFUNCTION;
 _camWriteRef.NoOfColumns := 1;
 _camWriteRef.NoOfRows    := INT_TO_UDINT(_n);
-_mcWrite(
+_mcSelect(
     Execute    := (_state = eDownloading),
-    CamTableID := _tableId,                                              // VERIFY: MC_CAM_ID type
-    PointID    := 0,                                                     // start at the first point
-    NumPoints  := INT_TO_UDINT(_n),                                     // number of points to write
-    CamTable   := _camWriteRef                                          // fully-described MC_CAM_REF
+    Periodic   := _periodic,
+    CamTableID := _tableId,
+    CamTable   := _camWriteRef                                          // VAR_IN_OUT: fully-described MC_CAM_REF
 );
 
 // Verify: per-point read-back of point _verifyIdx (Execute pulses low between points).
@@ -611,18 +614,25 @@ IF _smoothWindow >= 3 THEN
 END_IF
 
 // ── Build the NC motion function (C1-smooth cubic from position-only teaching) ──
-// VERIFY every field name + enum below against the installed Tc2_MC2_Camming / TF5050 version.
+// Field names and enums checked against TF5050 manual 1.9.2 (section 9.7-9.10), 2026-10-18.
+// PointType MUST be set: its default 0 is MOTIONPOINTTYPE_IGNORE, and a table of ignored points is
+// rejected (NC 0x4A23 'Motion Function has too few points'). Segments are POLYNOM3_VV (velo <-> velo:
+// a cubic through each point's position AND slope) - plain POLYNOM3 is rest <-> rest, i.e. the slave
+// would stop at every taught point whatever SlaveVelo says.
 FOR i := 1 TO _n DO
-    _mfPoints[i].PointIndex        := INT_TO_UDINT(i);       // VERIFY: MC_MotionFunctionPoint.PointIndex
-    _mfPoints[i].RelIndexNextPoint := 1;                     // VERIFY: MC_MotionFunctionPoint.RelIndexNextPoint
-    _mfPoints[i].MasterPos         := _points[i].rMaster;    // VERIFY: MC_MotionFunctionPoint.MasterPos
-    _mfPoints[i].SlavePos          := _points[i].rSlave;     // VERIFY: MC_MotionFunctionPoint.SlavePos
-    _mfPoints[i].SlaveVelo         := slaveSlope(i);         // VERIFY: MC_MotionFunctionPoint.SlaveVelo
-    _mfPoints[i].SlaveAcc          := 0.0;                   // VERIFY: MC_MotionFunctionPoint.SlaveAcc
+    _mfPoints[i].PointIndex        := INT_TO_UDINT(i);       // 1, 2, 3 ... (> 0, consecutive, no gaps)
+    _mfPoints[i].PointType         := MOTIONPOINTTYPE_MOTION;
+    _mfPoints[i].RelIndexNextPoint := 1;
+    _mfPoints[i].MasterPos         := _points[i].rMaster;
+    _mfPoints[i].SlavePos          := _points[i].rSlave;
+    _mfPoints[i].SlaveVelo         := slaveSlope(i);         // dSlave/dMaster at this point
+    _mfPoints[i].SlaveAcc          := 0.0;
+    _mfPoints[i].SlaveJerk         := 0.0;
     IF i = _n THEN
-        _mfPoints[i].FunctionType := MOTIONFUNCTYPE_NOTDEF;        // VERIFY: terminator enum (last point)
+        _mfPoints[i].FunctionType      := MOTIONFUNCTYPE_NOTDEF; // last point: no segment after it
+        _mfPoints[i].RelIndexNextPoint := 0;                     // ... and no next point (1 -> index _n+1, NC 0x4A13?)
     ELSE
-        _mfPoints[i].FunctionType := MOTIONFUNCTYPE_POLYNOM3;    // VERIFY: cubic-segment enum
+        _mfPoints[i].FunctionType := MOTIONFUNCTYPE_POLYNOM3_VV; // segment to the next point
     END_IF
 END_FOR
 
@@ -633,7 +643,7 @@ cmdConvert := TRUE;
     </Method>
 
     <Method Name="cmdDownload" Id="{ecdae21f-c80e-4ed9-9c41-f4b204389c71}">
-      <Declaration><![CDATA[// Start the async download -> verify state machine (MC_WriteMotionFunction, then per-point
+      <Declaration><![CDATA[// Start the async download -> verify state machine (MC_CamTableSelect creates the table, then per-point
 // MC_ReadMotionFunctionPoint read-back). On success -> eVerified + stsVerified := TRUE. Requires
 // eConverted and a bound cfgTableId. Rejected QUIETLY while busy/errored.
 METHOD PUBLIC cmdDownload : BOOL

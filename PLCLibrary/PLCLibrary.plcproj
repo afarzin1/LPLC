@@ -21,7 +21,7 @@
     <POUsForPropertyAccessIncluded>false</POUsForPropertyAccessIncluded>
     <GlobalVersionStructureIncluded>true</GlobalVersionStructureIncluded>
     <Title>LPLC</Title>
-    <ProjectVersion>2.1.0</ProjectVersion>
+    <ProjectVersion>2.2.0</ProjectVersion>
     <Author>Arya Farzin</Author>
     <DefaultNamespace>LPLC</DefaultNamespace>
     <Description>LPLC - standardized TwinCAT 3 device, motion and machine function blocks (companion PLC library to lhmi). MIT License.</Description>

@@ -2,7 +2,7 @@
 <TcPlcObject Version="1.1.0.1">
   <POU Name="fb_CamCoupler" Id="{ea8177e1-9738-4633-8012-50aca4eaf09b}" SpecialFunc="None">
     <Declaration><![CDATA[// Reusable, machine-agnostic coupler: synchronizes ONE slave axis to a master axis via a verified
-// NC cam table. Wraps MC_CamTableSelect / MC_CamIn / MC_CamOut, gates engagement on the incoming
+// NC cam table. Wraps MC_CamIn / MC_CamOut, gates engagement on the incoming
 // 'verified' flag (from fb_CamTeach.stsVerified), coordinates the fb_Axis yield hook so the slave
 // stops issuing its own motion while cammed, and decouples cleanly on fault/interlock loss.
 //
@@ -16,6 +16,10 @@
 // inpDecouple to avoid an identifier collision - a method and a variable cannot share a name in
 // TwinCAT. This matches the fb_Axis convention (inp* = wired inputs, cmd* = methods; cf. inpReset /
 // cmdReset). Semantics are identical to the design skeleton. See report/deviations.
+//
+// THE TABLE: fb_CamTeach's download CREATES NC table 'tableId' (MC_CamTableSelect from the PLC
+// points, periodicity fixed there) and verifies it; this coupler only engages that id with MC_CamIn.
+// It does not select a table itself (an earlier MC_CamTableSelect here had no table data to give).
 FUNCTION_BLOCK fb_CamCoupler
 VAR_IN_OUT
     Master : AXIS_REF;                 // shared master (driven elsewhere)
@@ -25,7 +29,7 @@ END_VAR
 VAR_INPUT
     verified     : BOOL;               // from fb_CamTeach.stsVerified for this slave - REQUIRED to couple
     tableId      : UDINT;              // NC cam table id (same one fb_CamTeach downloaded); 0 = use cfgTableId
-    periodic     : BOOL;               // MC_CamTableSelect periodicity for this slave
+    periodic     : BOOL;               // informational (HMI echo): periodicity is set when fb_CamTeach creates the table
     masterOffset : LREAL;              // engage offsets to match current pose at master start
     slaveOffset  : LREAL;
     masterScale  : LREAL := 1.0;
@@ -50,17 +54,10 @@ VAR
     HMI        : ST_CamCoupler_HMI_Interface;
 
     // MC camming / stop function blocks (Tc2_MC2 / Tc2_MC2_Camming)
-    _camSelect : MC_CamTableSelect;    // VERIFY against installed Tc2_MC2 / TF5050 version
     _camIn     : MC_CamIn;             // VERIFY against installed Tc2_MC2 / TF5050 version
     _camOut    : MC_CamOut;            // VERIFY against installed Tc2_MC2 / TF5050 version
     _mcHalt    : MC_Halt;              // stop the freed slave after CamOut
     _superImp  : MC_MoveSuperImposed;  // VERIFY against installed Tc2_MC2 / TF5050 version (live trim)
-
-    // Cam-table reference passed to MC_CamTableSelect. VERIFY: in Tc2_MC2, MC_CamTableSelect takes a
-    // CamTable:MC_CAM_REF (VAR_IN_OUT) linked to the NC cam-table object fb_CamTeach populated and
-    // OUTPUTS CamTableID:MC_CAM_ID. The design doc models tableId (UDINT) as the id passed directly;
-    // confirm how your fb_CamTeach registers the table and wire _camTableRef / _tableId accordingly.
-    _camTableRef : MC_CAM_REF;         // VERIFY against installed Tc2_MC2 / TF5050 version
 
     _state : E_CamCoupler_State;       // working state (mirrored to stsState)
 
@@ -244,15 +241,10 @@ CASE _state OF
         END_IF
 
     eYielding:
-        // Wait for the slave to reach standstill (the fb_Axis entry cmdHalt completes) before selecting/
-        // engaging, so the halt and the coupling never overlap (design coupler note).
+        // Wait for the slave to reach standstill (the fb_Axis entry cmdHalt completes) before engaging,
+        // so the halt and the coupling never overlap (design coupler note). The table already exists
+        // (fb_CamTeach created + verified it), so engage straight away.
         IF Slave.Status.Standstill THEN
-            _state := eSelecting;
-        END_IF
-
-    eSelecting:
-        // MC_CamTableSelect driven Execute:=TRUE by state gate (section 6).
-        IF _camSelect.Done THEN
             // Latch engage parameters from the inputs at engage time (so later live trim persists).
             _masterOffset := masterOffset;
             _slaveOffset  := slaveOffset;
@@ -260,11 +252,6 @@ CASE _state OF
             IF slaveScale  <> 0.0 THEN _slaveScale  := slaveScale;  ELSE _slaveScale  := 1.0; END_IF
             _camInExec := TRUE;        // begin engaging
             _state     := eCoupling;
-        ELSIF _camSelect.Error THEN
-            raiseError(CONCAT('CamTableSelect error: ', UDINT_TO_STRING(_camSelect.ErrorID)));
-            _faultDecouple := TRUE;
-            _haltExec      := TRUE;    // not cammed - stop & release yield -> E_CamCoupler_State.eError
-            _state         := eStopping;
         END_IF
 
     eCoupling:
@@ -328,19 +315,7 @@ CASE _state OF
 
 END_CASE
 
-// ── 6. MC_CamTableSelect (register the verified table) ───────────────────────
-// VERIFY against installed Tc2_MC2 / TF5050 version: block signature, that MasterAbsolute/SlaveAbsolute
-// are BOOL (some versions use an enum), and how CamTable/CamTableID map to the numeric _tableId that
-// fb_CamTeach produced (see _camTableRef note in the declaration).
-_camSelect(
-    Master         := Master,
-    Slave          := Slave,
-    CamTable       := _camTableRef,
-    Execute        := (_state = eSelecting),
-    Periodic       := _periodic,
-    MasterAbsolute := TRUE,                    // VERIFY: enum vs BOOL, and absolute vs relative choice
-    SlaveAbsolute  := TRUE                     // VERIFY: enum vs BOOL, and absolute vs relative choice
-);
+// ── 6. (no table select - fb_CamTeach created the table; see the header) ─────
 
 // ── 7. MC_CamIn (engage - RampIn, offset/scaling) ────────────────────────────
 // Live offset trim re-issues MC_CamIn: drop Execute for one scan, then re-execute with the new offsets.
@@ -364,7 +339,7 @@ _camIn(
     MasterScaling := _masterScale,
     SlaveScaling  := _slaveScale,
     StartMode     := MC_STARTMODE_ABSOLUTE,    // absolute: cam CS congruent with axis CS (no RampIn member in this TF5050)
-    CamTableID    := _camSelect.CamTableID      // VERIFY: MC_CAM_ID assigned by MC_CamTableSelect
+    CamTableID    := _tableId                   // the table fb_CamTeach created and verified
 );
 
 // ── 8. MC_CamOut (disengage) ─────────────────────────────────────────────────

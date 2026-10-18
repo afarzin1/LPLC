@@ -8,6 +8,11 @@ engagement on the [`fb_CamTeach`](fb_CamTeach_Design.md) `stsVerified` flag,
 coordinates the [`fb_Axis`](fb_Axis_Design.md) yield hook so the slave stops issuing its
 own motion while coupled, and decouples cleanly on fault.
 
+> **2.2.0:** `fb_CamCoupler` no longer calls `MC_CamTableSelect`. `fb_CamTeach`'s download creates
+> and verifies the NC table, and the coupler engages `tableId` directly with `MC_CamIn`; the
+> `eSelecting` state is no longer entered and `periodic` is informational. The select step described
+> below is the original design.
+
 Instantiate **one per slave**. The machine layer (e.g. a winder's `fb_Winder`) owns N of these plus the
 run sequence. This block contains no machine-specific logic and does not move the master — the
 master is driven independently (typically by its own `fb_Axis` velocity move).

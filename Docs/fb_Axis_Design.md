@@ -59,6 +59,16 @@ Torque mode requires the EtherCAT drive terminal and NC axis to support cyclic t
 
 This is a hardware/NC configuration requirement, not FB logic. fb_Axis supplies `ContinuousUpdate := TRUE`, `Torque`, `TorqueRamp`, and `Direction` to `MC_TorqueControl`; the NC/drive configuration must map those commands to the terminal's supported CST PDO/CoE objects.
 
+### Retained home (2.2.0)
+
+A taught home (`cmdHome`, MC_Direct) is kept until it is taught again — through PLC/NC restarts, configuration activations and power cycles. MC_Direct only shifts the position inside the running NC, so fb_Axis stores the teach as a `VAR PERSISTENT` offset from the raw encoder position. Once per PLC start, after the axis IO has been valid for 1 s, it checks the NC: not homed means the NC restarted and dropped the offset, so it re-applies it (`MC_SetPosition` to raw + offset, then `MC_ForceCalibration`) with no motion and no enable; homed means only the PLC restarted, so it does nothing. Requirements: an **absolute** encoder, and an NC encoder config that does not set the calibration flag by itself at startup. `cfgRetainHome := FALSE` turns it off for an incremental encoder. `HMI.Status.stsHomeRetained` reports a stored home.
+
+Operator jog velocity / jog acceleration / velocity override are retained the same way (`VAR PERSISTENT`), applied over the `FB_Init` defaults once per start, and saved as soon as an operator edits them. Persistent data is written on a clean TwinCAT stop (activation included); a power cut without UPS loses edits since the last clean stop.
+
+### Teach-pendant ownership (2.2.0)
+
+`inpPendantMode` (pendant selected) locks out the HMI jog, torque-jog and go-to from the moment the pendant is selected; `inpPendantEnable` is the dead-man, required for pendant motion. Either one makes the pendant the jog owner (`stsJogSource = ePendant`). `HMI.Status.stsPendantMode` and `stsPendantDeadman` report them separately so the HMI can grey out its jog controls and show the dead-man state. Machines that only wire `inpPendantEnable` behave as before.
+
 ---
 
 ## Reserved Functions / Hooks (interface now, implement as needed)

@@ -6,6 +6,8 @@ causing rename churn. Where old code deviates, the rule below is the CURRENT int
 follow the rule, don't imitate the deviation (§10 lists the known legacy offenders).
 **§5** (FBs reach out to nothing) and **§12** (one PROGRAM; sequences under `MachineGlobal`) are
 the two structural rules — read those even if you skip the naming tables.
+Starting a new machine PLC project? **§13** is the layout: folders, the five GVLs, `MAIN`, axis
+wiring, sequences and the HMI contract.
 
 ## 1. Type names
 
@@ -234,3 +236,352 @@ INSTANCE prefix, which is why it is not in the §2 table — that table covers F
 normal and is not what §5 forbids: §5 stops a *library* FB or DUT from reaching out to a GVL for
 state or sizing. A machine's own `Devices` / `IO` / `MachineGlobal` GVLs are where its instances
 live, and `MAIN` wires them together.
+
+## 13. Machine project structure — GVLs, `MAIN`, axes, sequences
+
+§1–12 are the rules; this section is how a **machine project** that uses LPLC is laid out so it
+follows them. `<Machine>` is the machine's PascalCase name; everything in `<...>` is a placeholder.
+
+### 13.1 Repo and PLC project
+
+```
+<Machine>-PLC/
+  <Machine>.sln
+  <Machine>.tsproj                   system project - edited by XAE, never by hand
+  _Config/                           the tsproj's split-out config (IO/, NC/, PLC/) - XAE only
+  PLC/
+    PLC.plcproj                      the machine PLC project (ADS port 851)
+    DUTs/  GVLs/  POUs/
+  LPLC/                              the library, as a git submodule pinned to a release tag
+  docs/
+```
+
+- One PLC project, named `PLC`, on ADS port **851**. Its task (`PlcTask`, e.g. 10 ms) calls
+  **only `MAIN`** (§12).
+- The machine uses the library through its **placeholder** (`LPLC`, namespace `LPLC`), never a
+  project reference. Install the library from the pinned submodule before the first build; a `*`
+  resolution picks the newest *installed* version.
+- Pin the submodule to a release and say in the commit which library version the machine needs.
+
+```
+PLC/DUTs/    ST_Recipe_<Kind>          one recipe DUT per recipe type
+             E_<Domain>_<Purpose>      machine enums
+PLC/GVLs/    IO  Devices  MachineGlobal  MachineParameters  DAQ_Channels      (always these five)
+PLC/POUs/    MAIN                      the ONE program
+             fb_SEQ_<Name>             one per sequence
+             fb_<Process>              process building blocks (control loops, measurements)
+```
+
+- Every file is registered in `PLC.plcproj` (§9); new files follow §8.
+- Every GVL starts with `{attribute 'qualified_only'}`, so every reference reads
+  `Devices.Axis_X`, never a bare `Axis_X`.
+- Machine-specific FBs live in the machine project. Only genuinely reusable blocks go into the
+  library, following §11.
+- A dev or test harness gets its own GVL and never drives real axes.
+
+### 13.2 The five GVLs
+
+#### 13.2.1 `IO` — hardware, nothing else
+
+Raw I/O only, named after the EtherCAT box and channel. **No logic, no scaling.**
+
+```
+{attribute 'qualified_only'}
+VAR_GLOBAL
+    RIO1000_AI_2            AT %I* : REAL;      // <what is wired here, units>
+    RIO1001_DI_1            AT %I* : BOOL;      // <pedal / button / sensor>
+    RIO1001_DO_1            AT %Q* : BOOL;      // <lamp / valve>
+
+    RIO1005_<Drive>_SafetySet AT %Q* : BOOL;    // drive safety set (pulsed with Machine reset)
+    RIO1005_<Drive>_Axis1          : AXIS_REF;  // <axis function> - NC Axis1_<Function>
+END_VAR
+```
+
+Name boxes by remote-IO number in the system project (`RIO1000`, `RIO1001`, …) and follow them
+here: `RIO<box>_<signal>_<n>` for I/O, `RIO<box>_<drive>_Axis<n>` for `AXIS_REF`s. Comment every
+used channel with what is wired to it.
+
+#### 13.2.2 `Devices` — the machine and its device FBs
+
+```
+{attribute 'qualified_only'}
+VAR_GLOBAL
+    Machine         : LPLC.fb_Machine(hasUPS := TRUE);      // modes, start/stop/reset, safety, fault monitor, event log
+
+    Axis_<Name>     : LPLC.fb_Axis(cfgDeviceName := '<Name>', cfgEnable := TRUE, cfgInitEventClass := TRUE,
+                              cfgIsModulo := FALSE, cfgJogVelocity := 50, cfgJogAcceleration := 150,
+                              cfgStopDecel := 150, cfgHaltDecel := 200,
+                              cfgAxisType := eRotary, cfgUnit := 'Deg');   // linear: cfgAxisType := 0, 'mm'
+
+    <Sensor>_Sensor : REAL;                                  // the engineering value everything downstream reads
+    Inst_<Sensor>   : LPLC.fb_Dev_AnalogSensor(cfgDeviceName := '<Sensor Name>', cfgEnable := TRUE,
+                              cfgInitEventClass := TRUE, cfgAlarmEnable := TRUE, cfgEngUnit := '<unit>',
+                              cfgAlarmH := .., cfgAlarmHH := .., cfgAlarmL := .., cfgAlarmLL := ..,
+                              cfgCalOffset := 0, cfgCalGain := 1);
+
+    teachPendant    : LPLC.fb_Dev_XPendant(cfgDeviceName := 'XPendant', cfgEnable := TRUE,
+                              cfgInitEventClass := TRUE);   // only if the machine has a pendant
+END_VAR
+```
+
+- **Instance names are a contract**: the HMI binds `Devices.<instance>.HMI.*` (§13.6). Pick them
+  once.
+- Axis instances are `Axis_<Name>`, where `<Name>` is the operator's name for the axis with `-`
+  turned into `_` (`'Arm-Z'` → `Axis_Arm_Z`). Sensors are `Inst_<Sensor>`.
+- Alarm limits are part of the process: when a sequence relies on one, say which in a comment.
+
+#### 13.2.3 `MachineGlobal` — safety bits, HMI requests, sequences, process blocks
+
+```
+{attribute 'qualified_only'}
+VAR_GLOBAL
+    SafetyRun           AT %Q* : BOOL := TRUE;   // -> safety PLC Run
+    SafetyErrAck        AT %Q* : BOOL;           // -> safety PLC error acknowledge  (= Machine.outReset)
+    SafetyReset         AT %Q* : BOOL;           // -> safety PLC reset              (= Machine.outReset)
+    SafetyESTOP_OK      AT %I* : BOOL;           // <- safety PLC: E-stop OK (STO released on every axis)
+
+    EnableTeachPendant          : BOOL;          // HMI toggle; MAIN forces it FALSE in Auto
+    ServoGlobalOverrideEnable   : BOOL;
+    ServoGlobalOverrideSP       : INT;
+
+    // HMI requests: one-shot BOOLs the HMI sets, MAIN consumes and clears.
+    HMI_AutoFn_<Func>           : BOOL;          // buttons that start a sequence
+    HMI_<Action>                : BOOL;          // page actions (capture, tare, reset ...)
+    HMI_<Value>                 : LREAL;         // values that go with an action
+
+    // Sequences - type fb_SEQ_*, instance seq*, all here (§12).
+    seqHoming   : fb_SEQ_MachineHoming(cfgDeviceName := 'Homing Sequence');
+    seqAuto     : fb_SEQ_<MainCycle>(cfgDeviceName := '<Main Cycle> Sequence');
+
+    // Process building blocks the sequences switch on.
+    <Block>     : fb_<Block>;
+END_VAR
+```
+
+The safety bits are the standard program's view of the safety PLC. The safety logic itself lives
+in the safety project (e.g. TwinSAFE); nothing here is a safety function.
+
+#### 13.2.4 `MachineParameters` — `VAR_GLOBAL PERSISTENT`
+
+Everything that must survive a restart: tuning (gains, limits, ramp times), calibration, the
+**active recipe** and its name.
+
+```
+{attribute 'qualified_only'}
+VAR_GLOBAL PERSISTENT
+    <Loop>Kp            : REAL := ..;   // [units] what it does, which way to move it
+    <Sensor>CalReading1 : LREAL;        // calibration
+    Recipe              : ST_Recipe_<Kind>;   // written by the HMI on activate
+    ActiveRecipeName    : STRING(80);         // written by the HMI after a clean activation; '' = none
+END_VAR
+```
+
+- Every member gets a units-and-meaning comment; the HMI settings page can show it to the operator.
+- A setpoint that comes from the recipe is an **effective copy**: `MAIN` overwrites it from
+  `Recipe` every scan, and its comment says so.
+- `ST_Recipe_<Kind>` is a flat STRUCT with units comments and sensible defaults. Its member names
+  are the keys of saved recipe files, so renaming one breaks every saved recipe.
+- Delete parameters the code no longer reads instead of leaving dead tuning knobs.
+
+#### 13.2.5 `DAQ_Channels` — chart / historian signals
+
+Flat `REAL`s with units comments, filled **only** in `MAIN.runDAQ`. An HMI chart lists this
+namespace by name, so a signal that should be charted goes here, and its name is what the operator
+sees.
+
+### 13.3 Axis wiring
+
+Per servo axis:
+
+1. An NC axis `Axis<n>_<Function>`, linked to its drive channel and to
+   `IO.RIO<box>_<drive>_Axis<n>`. Make it modulo only when it really turns endlessly, and then pass
+   `cfgIsModulo := TRUE` as well.
+2. `Devices.Axis_<Name> : LPLC.fb_Axis(...)`.
+3. In `MAIN.runDevices`, every scan:
+   - **Interlock slot 1** `'No faults present'` = `NOT Devices.Machine.faultMonitor^.stsFaultActive`,
+     set **before** the axis call, so one fault anywhere stops every axis and a Reset clears it.
+   - The drive's `SafetySet := Devices.Machine.outReset`.
+   - The axis call:
+     ```
+     Devices.Axis_<Name>(inpAuto := Devices.Machine.stsAuto, inpReset := Devices.Machine.outReset,
+         inpInterlockBypass := Devices.Machine.stsInterlocksBypassed, faultMonitor := Devices.Machine.faultMonitor,
+         inpSTO := MachineGlobal.SafetyESTOP_OK, Axis := IO.RIO<box>_<drive>_Axis<n>,
+         inpPendantMode := MachineGlobal.EnableTeachPendant, inpPendantEnable := _pendantEnable,
+         inpPendantJogPos := <pad control>, inpPendantJogNeg := <pad control>,
+         inpPendantJogFraction := <deflection 0..1>,
+         inpGlobalOverrideEnable := MachineGlobal.ServoGlobalOverrideEnable,
+         inpGlobalOverride := MachineGlobal.ServoGlobalOverrideSP);
+     ```
+4. **Re-enable after an E-stop.** On the E-stop NOK → OK edge, arm a pending enable (start the
+   "previous" flag TRUE so a PLC start is not an edge). Fire `cmdEnable()` on every axis on the
+   first scan with no active fault; drop the request if the E-stop opens again first. Enabling
+   while anything is faulted would trip every axis's 'No faults present' interlock.
+5. **External control.** A process block that drives an axis directly (a velocity loop, say):
+   - takes it with `cmdSetExternalControl`;
+   - waits until it is NC-ready (standstill and no error, with a timeout);
+   - drives it with its own `MC_MoveVelocity` / `MC_Halt` on the **same** `AXIS_REF`;
+   - on release, **halts first, then hands it back**.
+
+   Tc2_MC2 `MC_MoveVelocity` has no ContinuousUpdate, so re-trigger Execute (one scan low) on a
+   speed or direction change, rate-limited. One owner at a time.
+
+Pendant: `_pendantEnable := EnableTeachPendant AND teachPendant.stsActive AND <dead-man input>`.
+
+### 13.4 `MAIN` — the one program
+
+```
+PROGRAM MAIN
+VAR
+    _<seq>Request   : BOOL;     // one per HMI-startable sequence
+    _safetyOkPrev   : BOOL := TRUE;
+    _enablePending  : BOOL;
+END_VAR
+
+Devices.Machine(inpReset := <reset button>, inpStop := .., inpStart := .., inpAuto := ..,
+                inpStartedFeedback := MachineGlobal.seqAuto.stsRunning,
+                inpSafetyPowerOn := MachineGlobal.SafetyESTOP_OK, inpSafetyFaultActive := MachineGlobal.SafetyESTOP_OK,
+                inpSafetyFaultDelay := MachineGlobal.SafetyESTOP_OK, inpSafetyResetButton := <reset button>);
+IF Devices.Machine.stsAuto THEN MachineGlobal.EnableTeachPendant := FALSE; END_IF
+MachineGlobal.SafetyErrAck := Devices.Machine.outReset;
+MachineGlobal.SafetyReset  := Devices.Machine.outReset;
+
+runDevices();       // I/O -> devices -> axes
+runSequences();     // recipe copy, measurements, HMI requests, sequences, process blocks
+runDAQ();           // DAQ_Channels
+```
+
+**`runDevices`**, in order:
+
+1. Simple I/O mappings (potentiometers via `F_AnalogToEngUnit`, pedals).
+2. Pendant.
+3. Axis interlocks, then the axis calls (§13.3).
+4. Re-enable after an E-stop.
+5. Lamps and outputs.
+6. Analog sensors (`inpScaledIOChannel` when the terminal already scales, else `inpRawIOChannel`
+   with `cfgScalingNeeded := TRUE` and the channel / sensor / engineering ranges), then their
+   `<Sensor>_Sensor` copies.
+7. Timed outputs (e.g. a 500 ms tare pulse).
+
+**`runSequences`**, in order:
+
+1. Recipe → effective setpoints (`MachineParameters.X := MachineParameters.Recipe.X`).
+2. Measurement blocks the sequences read (so they see this scan's values), and their HMI commands.
+3. **HMI request handling**, the same shape for every startable sequence:
+   ```
+   IF MachineGlobal.HMI_AutoFn_<Func> THEN
+       MachineGlobal.HMI_AutoFn_<Func> := FALSE;
+       IF NOT MachineGlobal.seq<Func>.stsRunning AND NOT MachineGlobal.seq<Func>.stsAborting THEN
+           MachineGlobal.seq<Func>.setStateLogicReset();     // back to Idle from Done / Faulted / Aborted
+           _<func>Request := TRUE;
+       END_IF
+   END_IF
+   ...
+   IF Devices.Machine.outStart AND Devices.Machine.stsAuto THEN <same for seqAuto> END_IF
+   IF NOT Devices.Machine.stsAuto THEN <clear every _xxxRequest> END_IF
+   IF _<func>Request AND MachineGlobal.seq<Func>.stsIdle THEN
+       _<func>Request := FALSE;
+       MachineGlobal.seq<Func>.setStateLogicRun();
+   END_IF
+   ```
+   If one sequence must stop another first, abort it here and gate the start on the other having
+   stopped.
+4. Every sequence call:
+   ```
+   MachineGlobal.seqX(inpReset := Devices.Machine.outReset, inpAuto := Devices.Machine.stsAuto,
+                      faultMonitor := Devices.Machine.faultMonitor, refMachine := ADR(Devices.Machine));
+   ```
+5. Process blocks **after** the sequences, so they act on what the sequences asked for this scan:
+   `Axis := IO.<AXIS_REF>, refAxis := ADR(Devices.Axis_X)`, with parameters from
+   `MachineParameters`.
+
+**`runDAQ`**: `DAQ_Channels.X := LREAL_TO_REAL(...)` lines, nothing else.
+
+Use methods, not ACTIONs. No second PROGRAM unless it needs a different task or cycle (§12).
+
+### 13.5 Sequences
+
+Every sequence is `fb_SEQ_<Name> EXTENDS LPLC.abs_fb_stateDevice`:
+
+```
+(* fb_SEQ_<Name> - <what it does, how it is started, what Done leaves behind>
+       0    <step>
+       10   <step>
+       999  done
+   Interlocks: <list>. Abort: <what it stops>. Faults: <list>. *)
+FUNCTION_BLOCK fb_SEQ_<Name> EXTENDS LPLC.abs_fb_stateDevice
+VAR_INPUT
+    refMachine  : POINTER TO LPLC.fb_Machine;
+END_VAR
+VAR
+    _state<Name> : INT;
+    _haltSent    : BOOL;
+END_VAR
+VAR CONSTANT
+    c<LIMIT>     : <type> := ..;     // [units]
+END_VAR
+
+// --- body ---
+stateLogic(ADR(_state<Name>));
+cmdSetInterlock(1, 'Machine in Auto', _inAuto);
+cmdSetInterlock(2, 'E-stop OK', MachineGlobal.SafetyESTOP_OK);
+cmdSetInterlock(3, 'Teach pendant off', NOT MachineGlobal.EnableTeachPendant);
+cmdSetInterlock(4, '<Other seq> not running', NOT MachineGlobal.seq<Other>.stsRunning);
+IF stsRunning AND refMachine^.outStop THEN setStateLogicAbort(); END_IF
+
+METHOD PROTECTED actionsRun     : BOOL   -> run<Name>();
+METHOD PROTECTED actionsAbort   : BOOL   -> halt what it moves; setStateDoneAborting();
+METHOD PROTECTED actionsFaulted : BOOL   -> IF NOT _haltSent THEN _haltSent := TRUE; <halt>; END_IF
+METHOD PROTECTED actionsReset   : BOOL   -> clear latches (_haltSent := FALSE, owned blocks off)
+METHOD PROTECTED actionsDone    : BOOL
+METHOD PRIVATE   run<Name>      : BOOL   -> the CASE
+```
+
+Inside the `CASE`:
+
+- Every step sets `stsStepDescription` (the operator reads it on the HMI), and a step that waits on
+  hardware sets `setStateLogicStepTimeout(T#..)`.
+- Step 0 resets the axes it needs. Step 5 waits for `faultMonitor^.stsFaultActive` to read FALSE
+  (fault after ~3 s with "press Reset"), **then** `cmdEnable`.
+- Faults: `setStateLogicFault('<Axis>: ' + text, FALSE, 0)`, as short operator sentences. A
+  repeated advisory uses `sendWarning` (deduplicated).
+- `cmdJogGoto` and move commands may refuse while an axis settles, so retry until they return TRUE.
+- 999: `setStateLogicDone()`.
+
+Rules:
+
+- **Interlocks are simple global conditions** (mode, E-stop, pendant, other sequences, a sensor OK,
+  "recipe active"). Anything that needs an explanation (recipe values against machine limits) is a
+  **step that faults with a specific message**. Start-only conditions use `cmdSetStartPermissive`;
+  only interlocks abort a running sequence.
+- Sequences own policy (timeouts, "too far off", what faults). Process blocks own none.
+- A process block has one owner at a time. The sequence that switched it on is the one that
+  switches it off, in abort, fault and done.
+- Build up from small sequences that are blocks of the main cycle, each startable on its own from
+  an HMI request while commissioning.
+
+### 13.6 HMI contract
+
+An HMI (e.g. [lhmi](https://github.com/afarzin1/LHMI)) binds symbols **by name**, so renaming an
+instance or a member breaks the binding. Bound by convention:
+
+- `Devices.Machine.HMI.*`, `Devices.Axis_*.HMI.*`, `Devices.Inst_*.HMI.*`,
+  `Devices.teachPendant.HMI.*`: the faceplates.
+- `MachineGlobal.seq*`: sequence faceplates.
+- `MachineGlobal.HMI_*`, `EnableTeachPendant`, `ServoGlobalOverride*`: buttons and requests.
+- `MachineParameters.*`: settings, `Recipe`, `ActiveRecipeName`.
+- `DAQ_Channels.*`: charts and historian.
+
+### 13.7 New-project checklist
+
+1. Repo, `.gitignore`, LPLC submodule pinned to a release, `docs/`.
+2. XAE solution `<Machine>`: target, PlcTask, and NC tasks for servo machines.
+3. EtherCAT scan; boxes renamed `RIO1000…`.
+4. Drive commissioning; NC axes `Axis<n>_<Function>` with scaling, limits and soft limits.
+5. PLC project `PLC` with the `LPLC` placeholder; library installed from the submodule.
+6. GVLs `IO`, `Devices`, `MachineGlobal`, `MachineParameters`, `DAQ_Channels` (`qualified_only`).
+7. `MAIN` with `runDevices` / `runSequences` / `runDAQ`; axes wired per §13.3.
+8. Link `IO` ↔ terminals, `AXIS_REF` ↔ NC, safety bits ↔ the safety PLC.
+9. Sequences, smallest first, each startable from an HMI request; then the main cycle on Machine
+   Start in Auto.
+10. Recipe DUT, `MachineParameters.Recipe` / `ActiveRecipeName`, and the HMI bindings against the
+    final symbol names.

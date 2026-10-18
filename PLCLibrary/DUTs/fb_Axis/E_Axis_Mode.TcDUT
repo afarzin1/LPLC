@@ -11,7 +11,7 @@
     eStop        := 5,  // MC_Stop (forced standstill)
     eHome        := 6,  // reserved Phase 2
     eSetPosition := 7,  // reserved Phase 2
-    eModulo      := 8,  // reserved Phase 2
+    eModulo      := 8,  // absolute target within one modulo period, forced direction (MC_MoveModulo)
     eExternal    := 9   // coordination hook - yields axis to external owner
 ) INT;
 END_TYPE

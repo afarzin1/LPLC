@@ -203,6 +203,16 @@ central-difference at the seam so velocity is continuous across the period bound
 
 ## Download & Verify (inside cmdDownload)
 
+> **2.2.0 (unverified on hardware):** the download now **creates** the NC table with
+> `MC_CamTableSelect` instead of writing a pre-created one with `MC_WriteMotionFunction`.
+> `MC_WriteMotionFunction` only rewrites points of a table already loaded in the NC; on a table that
+> does not exist yet (or an empty System Manager table) the NC answers ADS 0x701 "service not
+> supported". The table id must therefore **not** also be a table defined in the System Manager, and
+> periodicity is fixed at creation. Each point sets `PointType := MOTIONPOINTTYPE_MOTION` (the
+> default `IGNORE` gives NC 0x4A23 "too few points"), segments are `MOTIONFUNCTYPE_POLYNOM3_VV`
+> (plain `POLYNOM3` is rest ↔ rest, so the slave would stop at every point), and the last point has
+> `RelIndexNextPoint := 0`. The steps below are the original design and are kept for reference.
+
 Tables are **pre-created** under Motion → Tables as motion-function type, sized ≥ `MAX_CAM_POINTS`.
 1. `MC_WriteMotionFunction` — bulk-write `_mfPoints[1.._n]` to `_tableId`.
 2. Read back a sample (or all) with `MC_ReadMotionFunctionPoint`; compare to `_mfPoints`.

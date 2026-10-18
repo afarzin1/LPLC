@@ -27,7 +27,13 @@ predate the conventions. The roadmap is ordered to fix that first.
 - [ ] ⬜ **Hardware validation of the never-run blocks.** `abs_fb_MachineFlow` and `fb_Permissive`
       are documented as "compiled, never run"; `fb_CamTeach`, `fb_CamTeachFile` and
       `fb_CamCoupler` carry `VERIFY` markers against the installed Tc2_MC2 / TF5050 version. Run
-      each on a test rig, resolve the markers, and record the result in its design note.
+      each on a test rig, resolve the markers, and record the result in its design note. 🟡 2.2.0
+      reworked the cam download (`MC_CamTableSelect` creates the table) and checked the motion
+      function fields against the TF5050 manual; a full teach → download → verify → couple run on
+      hardware is still open.
+- [ ] ⬜ **Hardware test of the 2.2.0 `fb_Axis` changes:** retained home across an NC restart
+      (absolute encoder), live pendant jog (`MC_MoveVelocity` re-trigger and `MC_Halt` release),
+      the NC-max jog clamp, and `eModulo` moves in each direction.
 - [ ] ⬜ **Hardware test of the reworked comms.** `fb_Dev_PSU_ITECH` (latch on first failure,
       baseline before write) on an IT6000 and an IT6600C, and `fb_Modbus_Driver`'s reconnect /
       Faulted / `cmdReset()` path on an ABB ACS580 and a DuraPulse drive. Confirm the ITECH ON/OFF
@@ -117,6 +123,10 @@ and saying which module.
       rewrite. Keep as utilities or remove.
 
 ## Done
+
+- [x] ✅ **2.2.0** (see `CHANGELOG.md`): `fb_Axis` retained home and operator settings, pendant
+      mode and live pendant jog, NC-max jog clamp, `eModulo` moves and halt / jog-error fixes; cam
+      download rework; CONVENTIONS §13 machine project structure.
 
 - [x] ✅ **2.1.0 — first open-source release** (see `CHANGELOG.md`): renamed to LPLC, test-stand
       blocks removed, TwinCAT HMI leftovers and dead types removed, `fb_` naming throughout,

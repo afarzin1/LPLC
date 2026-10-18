@@ -42,6 +42,7 @@ STRUCT
     stsHomeError        : BOOL;   // MC_Home.Error
     stsHomeErrorID      : UDINT;  // MC_Home.ErrorID
     stsHomePosition     : LREAL;  // last/direct home position command [unit]
+    stsHomeRetained     : BOOL;   // a taught home is stored and re-applied after restarts (cfgRetainHome)
 
     // Move status
     stsCurrentMoveIndex : INT;    // 1-20 index of last executed move (0 = none)
@@ -67,6 +68,8 @@ STRUCT
     stsJogVelocity      : LREAL;  // [unit/s]  active jog velocity
     stsJogAcceleration  : LREAL;  // [unit/s²] active jog acceleration
     stsJogSource        : E_Axis_JogSource;  // which input owns the jog: eNone / eHMI / ePendant
+    stsPendantMode      : BOOL;   // teach pendant selected - it owns the jog, HMI jog / torque-jog / go-to locked out
+    stsPendantDeadman   : BOOL;   // pendant dead-man held - the pendant can move the axis
     stsJogTorqueLimit   : LREAL;  // [Nm or %] global overtorque trip for position jog (0 = no limit)
 
     // Torque jog (interactive manual torque, dead-man)
